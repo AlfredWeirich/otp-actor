@@ -1,5 +1,5 @@
 [package]
-name = "actor"
+name = "aixtor"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
@@ -9,29 +9,14 @@ license = "MIT OR Apache-2.0"
 keywords = ["actor", "supervision", "tokio", "cache", "resilience"]
 categories = ["asynchronous", "concurrency"]
 
-[features]
-default = ["cli"]
-cli = ["dep:tracing-subscriber"]
-
 [dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
 thiserror = "2.0.21"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-[[bin]]
-name = "actor"
-path = "src/bin/actor.rs"
-required-features = ["cli"]
-
-[[bin]]
-name = "simple"
-path = "src/bin/simple.rs"
-required-features = ["cli"]
 
 [profile.release]
 opt-level = 3
