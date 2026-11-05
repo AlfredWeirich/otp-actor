@@ -1,15 +1,17 @@
-//! # Hierarchical OTP Supervision Tree & Generic Resource Actor System
+//! # Hierarchical OTP Supervision Tree & Actor System
 //!
 //! Provides a resilient, multi-level actor framework modeled after Erlang/OTP principles:
 //! - **Control Plane**: [`RootSupervisor`] and [`ServiceSupervisor`] managing lifecycle,
 //!   supervision strategies ([`SupervisionStrategy::OneForOne`], [`SupervisionStrategy::OneForAll`],
-//!   [`SupervisionStrategy::RestForOne`]), rate-limited backoff, and hierarchical subtree recovery.
-//! - **Data Plane**: [`ResourceClient`] communicating directly with [`GenericResourceActor`]
-//!   (1-hop channel) with zero supervisor overhead, transparent channel rebinding across
-//!   actor and supervisor restarts, proactive refreshes, and zero-cost worker execution
-//!   via the [`Worker`] trait.
+//!   [`SupervisionStrategy::RestForOne`]), restart rules ([`RestartType`]), bounded shutdown policies
+//!   ([`ShutdownPolicy`]), rate-limited exponential backoff ([`RestartPolicy`], [`RestartTracker`]),
+//!   and hierarchical subtree recovery.
+//! - **Data Plane**: [`ResourceClient`] and [`ActorClient`] communicating directly with
+//!   [`GenericResourceActor`] and [`StatefulActor`] over 1-hop bounded channels with zero
+//!   supervisor overhead in the hot path, transparent channel rebinding across actor and supervisor
+//!   restarts, proactive cache refreshes, and zero-cost worker execution via native `impl Future`.
 //!
-//! ## Example
+//! ## Example: Generic Resource Actor
 //! ```rust
 //! use std::time::Duration;
 //! use otp_actor::actor::{
@@ -17,11 +19,9 @@
 //! };
 //!
 //! # #[tokio::main(flavor = "current_thread")]
-//! # async fn main() {
+//! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let root = RootSupervisor::new();
-//! let service = ServiceSupervisor::spawn_and_register("auth-service", &root)
-//!     .await
-//!     .unwrap();
+//! let service = ServiceSupervisor::spawn_and_register("auth-service", &root).await?;
 //!
 //! let client = GenericResourceActor::builder("api-token")
 //!     .worker(|ctx: WorkerContext| async move {
@@ -31,11 +31,67 @@
 //!         ))
 //!     })
 //!     .spawn(&service)
-//!     .await
-//!     .unwrap();
+//!     .await?;
 //!
-//! assert_eq!(client.get().await.unwrap(), "token-gen-1");
-//! root.shutdown().await.unwrap();
+//! assert_eq!(client.get().await?, "token-gen-1");
+//! root.shutdown().await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## Example: Stateful Actor (`gen_server` style)
+//! ```rust
+//! use otp_actor::actor::{
+//!     ActorContext, RestartType, RootSupervisor, ServiceSupervisor,
+//!     StatefulActor, StatefulActorBuilder,
+//! };
+//!
+//! #[derive(Clone, Default)]
+//! struct RegistryActor {
+//!     items: Vec<String>,
+//! }
+//!
+//! enum RegistryMsg {
+//!     Insert(String),
+//!     Count,
+//! }
+//!
+//! impl StatefulActor for RegistryActor {
+//!     type Message = RegistryMsg;
+//!     type Response = usize;
+//!     type Error = String;
+//!
+//!     async fn handle(
+//!         &mut self,
+//!         msg: Self::Message,
+//!         _ctx: &mut ActorContext,
+//!     ) -> Result<Self::Response, Self::Error> {
+//!         match msg {
+//!             RegistryMsg::Insert(item) => {
+//!                 self.items.push(item);
+//!                 Ok(self.items.len())
+//!             }
+//!             RegistryMsg::Count => Ok(self.items.len()),
+//!         }
+//!     }
+//! }
+//!
+//! # #[tokio::main(flavor = "current_thread")]
+//! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let root = RootSupervisor::new();
+//! let service = ServiceSupervisor::spawn_and_register("registry-service", &root).await?;
+//!
+//! let client = StatefulActorBuilder::from_default::<RegistryActor>("registry")
+//!     .restart_type(RestartType::Permanent)
+//!     .spawn(&service)
+//!     .await?;
+//!
+//! client.cast(RegistryMsg::Insert("node-1".into())).await?;
+//! let count = client.call(RegistryMsg::Count).await?;
+//! assert_eq!(count, 1);
+//!
+//! root.shutdown().await?;
+//! # Ok(())
 //! # }
 //! ```
 
