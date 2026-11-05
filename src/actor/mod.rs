@@ -12,7 +12,7 @@
 //! ## Example
 //! ```rust
 //! use std::time::Duration;
-//! use actor::actor::{
+//! use aixtor::actor::{
 //!     GenericResourceActor, RootSupervisor, ServiceSupervisor, TimedResource, WorkerContext,
 //! };
 //!

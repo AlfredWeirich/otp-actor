@@ -18,7 +18,7 @@
 use std::time::Duration;
 use tokio::time::Instant;
 
-use actor::actor::{
+use aixtor::actor::{
     ActorContext, GenericResourceActor, RestartType, RootSupervisor, ServiceSupervisor,
     StatefulActor, StatefulActorBuilder, TimedResource, WorkerContext,
 };

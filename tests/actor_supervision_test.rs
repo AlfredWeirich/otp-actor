@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::time::Instant;
 
-use actor::actor::{
+use aixtor::actor::{
     ActorContext, ChildSpec, GenericResourceActor, ResourceError, RestartPolicy, RestartTracker,
     RestartType, RootError, RootSupervisor, ServiceError, ServiceSupervisor, ShutdownPolicy,
     StatefulActor, StatefulActorBuilder, SupervisionStrategy, TimedResource, Worker, WorkerContext,
@@ -2662,7 +2662,7 @@ async fn test_stateful_actor_handler_timeout_fails_fast_and_restarts_cleanly() {
     // 3. Supervisor spawns fresh instance #2 with `corrupted = false`!
     let timeout_res = client.call(Duration::from_millis(200)).await;
     assert!(
-        matches!(timeout_res, Err(actor::actor::ActorError::Timeout(_))),
+        matches!(timeout_res, Err(aixtor::actor::ActorError::Timeout(_))),
         "Expected ActorError::Timeout when handler_timeout expires, got {:?}",
         timeout_res
     );
@@ -2684,7 +2684,7 @@ async fn test_stateful_actor_handler_timeout_fails_fast_and_restarts_cleanly() {
         .await;
     assert!(matches!(
         client_timeout_res,
-        Err(actor::actor::ActorError::Timeout(_))
+        Err(aixtor::actor::ActorError::Timeout(_))
     ));
 
     let _ = root.shutdown().await;
@@ -2988,7 +2988,7 @@ async fn test_rest_for_one_overlapping_backoffs_and_failed_downstream_recovery()
     tokio::time::sleep(Duration::from_millis(20)).await;
     assert!(matches!(
         client_c.call_retry(CounterMsg::GetWithInstance).await,
-        Err(actor::ActorError::Service(ServiceError::MaxRestartsExceeded(_, _, _)))
+        Err(aixtor::ActorError::Service(ServiceError::MaxRestartsExceeded(_, _, _)))
     ));
 
     client_b.simulate_crash().await.unwrap();
@@ -3172,7 +3172,7 @@ async fn test_resource_client_rebinds_on_actor_unavailable_and_propagates_actor_
     assert!(
         matches!(
             state_err,
-            Err(actor::ActorError::Service(ServiceError::ActorNotFound(_)))
+            Err(aixtor::ActorError::Service(ServiceError::ActorNotFound(_)))
         ),
         "Expected ActorError::Service(ServiceError::ActorNotFound), got {:?}",
         state_err

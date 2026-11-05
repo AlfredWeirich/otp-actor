@@ -1,4 +1,4 @@
-# actor — Hierarchical Supervision Tree, Generic Resource Actor & Stateful Actor for Tokio
+# Aixtor — Hierarchical Supervision Tree, Generic Resource Actor & Stateful Actor for Tokio
 
 A **fault-tolerant actor framework** for [Tokio](https://tokio.rs), inspired by Erlang/OTP supervision trees. It combines three pillars:
 
@@ -128,8 +128,8 @@ flowchart LR
 | `GenericResourceActor`, `ActorBuilder`, `GenericResourceActorBuilder`, `ResourceClient`, `Worker`, `TimedResource`, `WorkerContext`, `ResourceError` | [`src/actor/generic_actor.rs`](src/actor/generic_actor.rs) | The cache/refresh actor, its fluent builders, the worker abstraction and the direct client. |
 | `StatefulActor`, `StatefulActorBuilder`, `ActorClient`, `ActorContext`, `ActorControl`, `ActorError` | [`src/actor/stateful_actor.rs`](src/actor/stateful_actor.rs) | Zero-cost general-purpose stateful actor (`gen_server` style) with `call`/`cast` messaging, lifecycle hooks, and self-healing `ActorClient`. |
 | `SupervisionStrategy`, `RestartPolicy`, `RestartTracker`, `RestartType`, `ShutdownPolicy`, `ServiceError`, `RootError`, `TaskResult`, `EXPIRY_BUFFER`, `DEFAULT_SHUTDOWN_TIMEOUT` | [`src/actor/model.rs`](src/actor/model.rs) | Shared domain model: strategies, policies, restart types, shutdown policies, backoff computation, task exit results, error types. |
-| Demo | [`src/bin/actor.rs`](src/bin/actor.rs) | Eight-phase walkthrough with simulated GCP tokens and a database secret. |
-| Simple / Educational | [`src/bin/simple.rs`](src/bin/simple.rs) | Minimal, step-by-step example highlighting core usages, self-healing, and graceful shutdown. |
+| Demo | [`examples/aixtor.rs`](examples/aixtor.rs) | Eight-phase walkthrough with simulated GCP tokens and a database secret. |
+| Simple / Educational | [`examples/simple.rs`](examples/simple.rs) | Minimal, step-by-step example highlighting core usages, self-healing, and graceful shutdown. |
 | Integration tests | [`tests/actor_supervision_test.rs`](tests/actor_supervision_test.rs) | 58 tests covering supervision, caching, stateful actors, restart types, graceful shutdown, timeouts, backpressure, and more. |
 
 ---
@@ -139,23 +139,22 @@ flowchart LR
 ### Requirements
 
 - **Rust 1.88 or newer** (the crate uses `edition = "2024"` and `let`-chains).
-- No system dependencies. Runtime library dependencies are only:
+- No system dependencies. Runtime library dependencies are minimal:
   - [`tokio`](https://crates.io/crates/tokio) 1 (`rt`, `rt-multi-thread`, `sync`, `time`, `macros`)
   - [`thiserror`](https://crates.io/crates/thiserror) 2
   - [`tracing`](https://crates.io/crates/tracing) 0.1
-  - [`tracing-subscriber`](https://crates.io/crates/tracing-subscriber) 0.3 *(optional, enabled by the default `cli` feature for the demo binaries; disable via `default-features = false`)*
 
 ### Build, run, test
 
 ```bash
-# Build the library and the demo binary
+# Build the library
 cargo build
 
 # Run the simple educational example (core usages only)
-cargo run --bin simple
+cargo run --example simple
 
 # Run the full interactive demo (8 phases: chaos engineering, crash loops, etc.)
-cargo run --bin actor
+cargo run --example aixtor
 
 # Run the complete integration test-suite
 cargo test
@@ -167,17 +166,17 @@ cargo build --release
 RUSTFLAGS="-C target-cpu=native" cargo build --release
 ```
 
-To use the crate from another project in the same workspace, add a path dependency (the package is named `actor`, and its public API is re-exported from the crate root as well as the `actor` module):
+To use the crate from another project in the same workspace, add a path dependency (the package is named `aixtor`, and its public API is re-exported from the crate root as well as the `actor` module):
 
 ```toml
 [dependencies]
-actor = { path = "../261102_actor" }
+aixtor = { path = "../261102_actor" }
 tokio = { version = "1", features = ["full"] }
 ```
 
 ```rust
-use actor::{GenericResourceActor, RootSupervisor, ServiceSupervisor, TimedResource, WorkerContext};
-// (or via `actor::actor::{...}`)
+use aixtor::{GenericResourceActor, RootSupervisor, ServiceSupervisor, TimedResource, WorkerContext};
+// (or via `aixtor::actor::{...}`)
 ```
 
 ---
@@ -188,7 +187,7 @@ A complete example: a supervised actor that "fetches" a token which is valid for
 
 ```rust
 use std::time::Duration;
-use actor::actor::{
+use aixtor::actor::{
     GenericResourceActor, RootSupervisor, ServiceSupervisor, TimedResource, WorkerContext,
 };
 
@@ -390,7 +389,7 @@ Alongside `GenericResourceActor` (which is specialized for caching and refreshin
 Like `Worker`, `StatefulActor` uses native `impl Future` return types (zero `#[async_trait]` / `Box::pin` heap allocations):
 
 ```rust
-use actor::actor::{ActorContext, RestartType, StatefulActor, StatefulActorBuilder};
+use aixtor::actor::{ActorContext, RestartType, StatefulActor, StatefulActorBuilder};
 
 #[derive(Clone, Default)]
 struct CounterActor {
@@ -787,7 +786,7 @@ Each worker run is tagged with a generation. When `force_refresh()` supersedes a
 
 ## Demo Application
 
-`cargo run --bin actor` runs an end-to-end scenario built around simulated Google Cloud tokens and a database secret rotator:
+`cargo run --example aixtor` runs an end-to-end scenario built around simulated Google Cloud tokens and a database secret rotator:
 
 | Phase | What it shows |
 | --- | --- |
@@ -846,17 +845,17 @@ The integration suite in [`tests/actor_supervision_test.rs`](tests/actor_supervi
 │   │   ├── model.rs                # SupervisionStrategy, RestartType, ShutdownPolicy, RestartPolicy, errors
 │   │   ├── root_supervisor.rs      # RootSupervisor + handle
 │   │   └── service_supervisor.rs   # ServiceSupervisor + builder + handle, ChildSpec
-│   └── bin
-│       ├── actor.rs                # full 8-phase demo application
-│       └── simple.rs               # minimal step-by-step educational example
+├── examples
+│   ├── aixtor.rs                   # full 8-phase demo walkthrough
+│   └── simple.rs                   # minimal step-by-step educational example
 └── tests
     └── actor_supervision_test.rs   # 58 integration tests
 ```
 
-The public API is re-exported from the crate root and `actor::actor`:
+The public API is re-exported from the crate root and `aixtor::actor`:
 
 ```rust
-use actor::{
+use aixtor::{
     // resource actors & clients
     ActorBuilder, ActorConfig, GenericResourceActor, GenericResourceActorBuilder, ResourceClient,
     ResourceError, TimedResource, Worker, WorkerContext, DEFAULT_WORKER_TIMEOUT,
@@ -896,7 +895,7 @@ use actor::{
 - **Secret redaction in `Debug`.** `TimedResource<T>` redacts its inner `value` (`"<redacted>"`) in `fmt::Debug` output so cached tokens or credentials are never accidentally leaked into logs.
 - **Hybrid failure signaling (`TaskResult` + panic isolation).** Supervision is triggered both by controlled error exits (`TaskResult::Err`, such as `max_consecutive_failures`, `handler_timeout`, `ctx.fail()`, `escalate_on_failure`, or `simulate_crash()`) and by uncaught task/factory panics (`JoinError::is_panic()` / `catch_unwind`) when compiled with `panic = "unwind"`.
 - **Restarts reset in-memory actor state (by design).** Actors and supervisors are re-created from their configured factories with clean initial state to prevent crash loops caused by corrupted state (see [State lifecycle on restart & persistence patterns](#state-lifecycle-on-restart--persistence-patterns)). Use `on_start` to rehydrate state from external persistence if durable state is needed.
-- **Structured logging with `tracing`.** All actors and supervisors emit structured tracing events (`info!`, `warn!`, `error!`, `debug!`). The demo binary configures `tracing-subscriber` for formatted console output.
+- **Structured logging with `tracing`.** All actors and supervisors emit structured tracing events (`info!`, `warn!`, `error!`, `debug!`). The examples configure `tracing-subscriber` for formatted console output.
 - **Graceful & hard shutdown.** `root.shutdown()` and `service.shutdown()` sequentially terminate services and child actors in reverse registration order via watch shutdown signals and `ShutdownPolicy` deadlines; dropping all handles to the `RootSupervisor` aborts remaining supervised tasks via `JoinSet` / `AbortHandle`.
 - **Demo-friendly defaults.** `EXPIRY_BUFFER` is 2 seconds so the effects are visible quickly; in production you'd typically use a value such as 5 minutes.
 - **Mock backends.** The demo's "GCP" and "database" workers are simulated — no network access or credentials are needed or used.

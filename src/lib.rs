@@ -1,4 +1,4 @@
-//! # Actor Library
+//! # Aixtor
 //!
 //! High-performance, fault-tolerant concurrent actor and supervision tree framework.
 
