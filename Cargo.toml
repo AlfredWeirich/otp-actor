@@ -1,11 +1,12 @@
 [package]
-name = "aixtor"
+name = "otp-actor"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
-description = "Actor OTP framework for Tokio with supervision tree and resilent resource actor"
+description = "High-performance resilient resource actor and supervision tree framework in Tokio"
 readme = "README.md"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/AlfredWeirich/otp-actor"
 keywords = ["actor", "supervision", "tokio", "cache", "resilience"]
 categories = ["asynchronous", "concurrency"]
 

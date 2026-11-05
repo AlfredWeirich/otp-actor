@@ -1,4 +1,4 @@
-# Aixtor — Hierarchical Supervision Tree, Generic Resource Actor & Stateful Actor for Tokio
+# otp-actor — Hierarchical Supervision Tree, Generic Resource Actor & Stateful Actor for Tokio
 
 A **fault-tolerant actor framework** for [Tokio](https://tokio.rs), inspired by Erlang/OTP supervision trees. It combines three pillars:
 
@@ -128,7 +128,7 @@ flowchart LR
 | `GenericResourceActor`, `ActorBuilder`, `GenericResourceActorBuilder`, `ResourceClient`, `Worker`, `TimedResource`, `WorkerContext`, `ResourceError` | [`src/actor/generic_actor.rs`](src/actor/generic_actor.rs) | The cache/refresh actor, its fluent builders, the worker abstraction and the direct client. |
 | `StatefulActor`, `StatefulActorBuilder`, `ActorClient`, `ActorContext`, `ActorControl`, `ActorError` | [`src/actor/stateful_actor.rs`](src/actor/stateful_actor.rs) | Zero-cost general-purpose stateful actor (`gen_server` style) with `call`/`cast` messaging, lifecycle hooks, and self-healing `ActorClient`. |
 | `SupervisionStrategy`, `RestartPolicy`, `RestartTracker`, `RestartType`, `ShutdownPolicy`, `ServiceError`, `RootError`, `TaskResult`, `EXPIRY_BUFFER`, `DEFAULT_SHUTDOWN_TIMEOUT` | [`src/actor/model.rs`](src/actor/model.rs) | Shared domain model: strategies, policies, restart types, shutdown policies, backoff computation, task exit results, error types. |
-| Demo | [`examples/aixtor.rs`](examples/aixtor.rs) | Eight-phase walkthrough with simulated GCP tokens and a database secret. |
+| Demo | [`examples/otp_actor.rs`](examples/otp_actor.rs) | Eight-phase walkthrough with simulated GCP tokens and a database secret. |
 | Simple / Educational | [`examples/simple.rs`](examples/simple.rs) | Minimal, step-by-step example highlighting core usages, self-healing, and graceful shutdown. |
 | Integration tests | [`tests/actor_supervision_test.rs`](tests/actor_supervision_test.rs) | 58 tests covering supervision, caching, stateful actors, restart types, graceful shutdown, timeouts, backpressure, and more. |
 
@@ -154,7 +154,7 @@ cargo build
 cargo run --example simple
 
 # Run the full interactive demo (8 phases: chaos engineering, crash loops, etc.)
-cargo run --example aixtor
+cargo run --example otp_actor
 
 # Run the complete integration test-suite
 cargo test
@@ -166,17 +166,17 @@ cargo build --release
 RUSTFLAGS="-C target-cpu=native" cargo build --release
 ```
 
-To use the crate from another project in the same workspace, add a path dependency (the package is named `aixtor`, and its public API is re-exported from the crate root as well as the `actor` module):
+To use the crate from another project in the same workspace, add a path dependency (the package is named `otp-actor`, and its public API is re-exported from the crate root as well as the `actor` module):
 
 ```toml
 [dependencies]
-aixtor = { path = "../261102_actor" }
+otp-actor = { path = "../261102_actor" }
 tokio = { version = "1", features = ["full"] }
 ```
 
 ```rust
-use aixtor::{GenericResourceActor, RootSupervisor, ServiceSupervisor, TimedResource, WorkerContext};
-// (or via `aixtor::actor::{...}`)
+use otp_actor::{GenericResourceActor, RootSupervisor, ServiceSupervisor, TimedResource, WorkerContext};
+// (or via `otp_actor::actor::{...}`)
 ```
 
 ---
@@ -187,7 +187,7 @@ A complete example: a supervised actor that "fetches" a token which is valid for
 
 ```rust
 use std::time::Duration;
-use aixtor::actor::{
+use otp_actor::actor::{
     GenericResourceActor, RootSupervisor, ServiceSupervisor, TimedResource, WorkerContext,
 };
 
@@ -389,7 +389,7 @@ Alongside `GenericResourceActor` (which is specialized for caching and refreshin
 Like `Worker`, `StatefulActor` uses native `impl Future` return types (zero `#[async_trait]` / `Box::pin` heap allocations):
 
 ```rust
-use aixtor::actor::{ActorContext, RestartType, StatefulActor, StatefulActorBuilder};
+use otp_actor::actor::{ActorContext, RestartType, StatefulActor, StatefulActorBuilder};
 
 #[derive(Clone, Default)]
 struct CounterActor {
@@ -786,7 +786,7 @@ Each worker run is tagged with a generation. When `force_refresh()` supersedes a
 
 ## Demo Application
 
-`cargo run --example aixtor` runs an end-to-end scenario built around simulated Google Cloud tokens and a database secret rotator:
+`cargo run --example otp_actor` runs an end-to-end scenario built around simulated Google Cloud tokens and a database secret rotator:
 
 | Phase | What it shows |
 | --- | --- |
@@ -846,16 +846,16 @@ The integration suite in [`tests/actor_supervision_test.rs`](tests/actor_supervi
 │   │   ├── root_supervisor.rs      # RootSupervisor + handle
 │   │   └── service_supervisor.rs   # ServiceSupervisor + builder + handle, ChildSpec
 ├── examples
-│   ├── aixtor.rs                   # full 8-phase demo walkthrough
+│   ├── otp_actor.rs                # full 8-phase demo walkthrough
 │   └── simple.rs                   # minimal step-by-step educational example
 └── tests
     └── actor_supervision_test.rs   # 58 integration tests
 ```
 
-The public API is re-exported from the crate root and `aixtor::actor`:
+The public API is re-exported from the crate root and `otp_actor::actor`:
 
 ```rust
-use aixtor::{
+use otp_actor::{
     // resource actors & clients
     ActorBuilder, ActorConfig, GenericResourceActor, GenericResourceActorBuilder, ResourceClient,
     ResourceError, TimedResource, Worker, WorkerContext, DEFAULT_WORKER_TIMEOUT,

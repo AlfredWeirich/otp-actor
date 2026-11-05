@@ -10,7 +10,7 @@
 use std::time::Duration;
 use tokio::time::Instant;
 
-use aixtor::actor::{
+use otp_actor::actor::{
     GenericResourceActor, RestartPolicy, RootSupervisor, ServiceSupervisor, SupervisionStrategy,
     TimedResource, Worker, WorkerContext,
 };
