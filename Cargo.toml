@@ -1,6 +1,6 @@
 [package]
 name = "otp-actor"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 rust-version = "1.88"
 description = "OTP Actor framework for Tokio with supervision tree and resilient resource actor inspired by Erlang/OTP"
