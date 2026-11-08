@@ -7,7 +7,7 @@ A **fault-tolerant actor framework** for [Tokio](https://tokio.rs), inspired by 
 3. **A zero-cost stateful actor (`StatefulActor`)** (modeled after Erlang's `gen_server`) for general-purpose state machines with typed `call` (request/response) and `cast` (fire-and-forget) messaging, `on_start` / `on_stop` lifecycle hooks, and the same self-healing 1-hop client architecture (`ActorClient`).
 4. **Remote actors over gRPC (`RemoteActorClient`, `ActorNodeServer`, `AnyActorClient`)** (optional `--features remote`) providing complete location transparency, universal Protobuf envelopes (`proto/actor_node.proto`), Serde serialization, network self-healing across actor crashes without connection drops, and coordinated 2-phase graceful shutdown.
 
-Clients talk **directly** to the actors over their own channel (the *data plane*). Supervisors are only involved in lifecycle management (the *control plane*), so they are never a bottleneck, and clients transparently re-bind to a replacement actor after a crash.
+In-process clients talk **directly** to actors over their own 1-hop Tokio channel (the *data plane*), while remote clients communicate over multiplexed HTTP/2 gRPC into server-side endpoints. In both modes, supervisors are strictly confined to lifecycle management (the *control plane*), so they are never a messaging bottleneck, and actors transparently self-heal and re-bind after a crash.
 
 ---
 
@@ -113,21 +113,26 @@ flowchart TD
 ### Control plane vs. data plane
 
 ```mermaid
-flowchart LR
-    Client["ResourceClient&lt;T, E&gt;"]
-    Actor["GenericResourceActor"]
-    Sup["ServiceSupervisor"]
-    Root["RootSupervisor"]
+flowchart TD
+    subgraph DataPlane["Data Plane (Zero Supervisor Bottleneck)"]
+        LocalClient["Local Client<br/>(ActorClient / ResourceClient)"] -- "direct in-memory<br/>1-hop mpsc channel" --> Mailbox["Actor Mailbox<br/>(Task)"]
+        RemoteClient["Remote Client<br/>(RemoteActorClient)"] -- "HTTP/2 gRPC<br/>(proto/actor_node.proto)" --> ServerNode["ActorNodeServer<br/>(ByteEndpoint Bridge)"]
+        ServerNode -- "forward payload via<br/>local client channel" --> Mailbox
+    end
 
-    Client -- "data plane:<br/>direct 1-hop channel<br/>get() / force_refresh()" --> Actor
-    Sup -. "control plane:<br/>spawn / monitor / restart" .-> Actor
-    Root -. "control plane:<br/>spawn / monitor / restart" .-> Sup
-    Client -. "only on broken channel:<br/>resolve replacement" .-> Sup
-    Sup -. "only if supervisor itself was replaced" .-> Root
+    subgraph ControlPlane["Control Plane (Supervision Tree)"]
+        Root["RootSupervisor"] -. "spawn / monitor / restart" .-> Sup["ServiceSupervisor"]
+        Sup -. "spawn / monitor / restart" .-> Mailbox
+        LocalClient -. "on crash: re-bind via watch channel" .-> Sup
+        ServerNode -. "on crash: re-bind via watch channel" .-> Sup
+    end
 ```
 
-- **Data plane** — `ResourceClient::get()` sends a message straight to the actor's mailbox. No supervisor is in the request path.
-- **Control plane** — Supervisors own the actors' `JoinHandle`s, detect exits/panics, decide what to restart, and keep the registry (name → current channel). Clients consult it only when their direct channel is broken.
+- **Data plane** —
+  - **In-process:** `ResourceClient::get()` and `ActorClient::call()` send messages straight to the actor's mailbox over a private 1-hop Tokio `mpsc` channel.
+  - **Remote (`--features remote`):** `RemoteActorClient` sends requests over multiplexed HTTP/2 gRPC to the host `ActorNodeServer`, where a type-erased `ByteEndpoint` forwards the payload directly into the local actor's mailbox.
+  - In both cases, **no supervisor is ever in the message request path**.
+- **Control plane** — Supervisors own the actors' `JoinHandle`s, detect exits/panics, execute restart strategies (`OneForOne`, `OneForAll`, `RestForOne`), and maintain the channel registry. Clients (or server-side `ByteEndpoint`s in remote setups) consult the control plane only when their direct channel is broken to re-bind to the replacement actor.
 
 ### Component overview
 
