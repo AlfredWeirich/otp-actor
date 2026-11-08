@@ -40,7 +40,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
 
     let local_client = StatefulActorBuilder::from_instance("account-9876", initial_account)
-        .restart_type(RestartType::Permanent)
+        .restart_type(RestartType::Transient)
         .spawn(&service)
         .await?;
 
@@ -113,10 +113,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     assert_eq!(resurrected_balance, 1250);
 
     // ------------------------------------------------------------------------
-    // Step 5: Coordinated 2-Phase Graceful Shutdown
+    // Step 5: Controlled Domain Termination via ctx.stop()
     // ------------------------------------------------------------------------
     println!("------------------------------------------------------------");
-    println!("  Graceful Shutdown: Coordinating gRPC drainage & actor tree");
+    println!("  Controlled Domain Termination: Client closes account");
+    println!("------------------------------------------------------------");
+
+    println!("[Client] Sending CloseAccount request to remote actor...");
+    let final_balance = remote_client.call(AccountMsg::CloseAccount).await?;
+    println!("[Client] Account closed with final payout balance: {final_balance} EUR.");
+    assert_eq!(final_balance, 1250);
+
+    // Wait a brief tick for actor exit event to be processed by supervisor
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Verify actor is now dead and ServiceSupervisor (RestartType::Transient) did not resurrect it!
+    match remote_client.call(AccountMsg::GetBalance).await {
+        Err(RemoteActorError::ActorNotFound(_) | RemoteActorError::ActorUnavailable) => {
+            println!(
+                "[Client] ✅ Verified: Subsequent call fails because Transient actor stopped cleanly!\n"
+            );
+        }
+        other => panic!("Expected ActorNotFound or ActorUnavailable, got {other:?}"),
+    }
+
+    // ------------------------------------------------------------------------
+    // Step 6: Coordinated 2-Phase Graceful Server Shutdown
+    // ------------------------------------------------------------------------
+    println!("------------------------------------------------------------");
+    println!("  Graceful Shutdown: Coordinating gRPC drainage & node shutdown");
     println!("------------------------------------------------------------");
 
     server_node.shutdown().await?;

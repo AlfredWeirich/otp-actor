@@ -21,6 +21,8 @@ pub enum AccountMsg {
     GetBalance,
     /// Simulates an unhandled crash inside the actor handler.
     SimulateCrash,
+    /// Requests graceful domain termination of this actor via `ctx.stop()`.
+    CloseAccount,
 }
 
 impl StatefulActor for BankAccountActor {
@@ -83,6 +85,15 @@ impl StatefulActor for BankAccountActor {
                 );
                 ctx.fail("Fatal panic/crash simulation in actor handler");
                 Err("Actor crashed".into())
+            }
+            AccountMsg::CloseAccount => {
+                tracing::info!(
+                    account = %self.account_id,
+                    final_balance = self.balance,
+                    "🔒 Client requested account closure. Stopping actor gracefully via ctx.stop()..."
+                );
+                ctx.stop();
+                Ok(self.balance)
             }
         }
     }

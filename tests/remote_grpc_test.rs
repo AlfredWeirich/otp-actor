@@ -36,6 +36,7 @@ enum CalcMsg {
     Get,
     Reset,
     Crash,
+    Stop,
 }
 
 impl StatefulActor for CalculatorActor {
@@ -76,6 +77,10 @@ impl StatefulActor for CalculatorActor {
             CalcMsg::Crash => {
                 ctx.fail("Intentional crash for resilience test");
                 Err("Crashing".into())
+            }
+            CalcMsg::Stop => {
+                ctx.stop();
+                Ok(self.value)
             }
         }
     }
@@ -387,5 +392,63 @@ async fn test_remote_grpc_2phase_graceful_shutdown_drains_inflight_call()
         "Actor on_stop must be invoked during Phase 2 after gRPC drainage"
     );
 
+    Ok(())
+}
+
+// ----------------------------------------------------------------------------
+// Test 6: Client-Initiated Graceful Termination (ctx.stop with RestartType::Transient)
+// ----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_remote_grpc_client_initiated_graceful_stop_transient()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let root = RootSupervisor::new();
+    let service = ServiceSupervisor::spawn_and_register("transient-service", &root).await?;
+
+    let stop_counter = Arc::new(AtomicUsize::new(0));
+    let local_actor = CalculatorActor {
+        value: 100,
+        stop_counter: stop_counter.clone(),
+    };
+
+    let local_client = StatefulActorBuilder::from_instance("calc-transient", local_actor)
+        .restart_type(RestartType::Transient)
+        .spawn(&service)
+        .await?;
+
+    let registry = ActorNodeRegistry::new();
+    registry.register_client(local_client);
+
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let node = ActorNodeHandle::start(bind_addr, registry, Some(root)).await?;
+    let node_addr = node.local_addr();
+
+    let remote_client = RemoteActorClient::<CalculatorActor>::connect(
+        format!("http://{node_addr}"),
+        "transient-service",
+        "calc-transient",
+    )
+    .await?;
+
+    // 1. Regular call works
+    assert_eq!(remote_client.call(CalcMsg::Add(50)).await?, 150);
+
+    // 2. Client initiates graceful stop
+    assert_eq!(remote_client.call(CalcMsg::Stop).await?, 150);
+
+    // Give supervisor brief moment to observe clean termination
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Verify on_stop was invoked
+    assert_eq!(stop_counter.load(Ordering::SeqCst), 1);
+
+    // Verify actor is not restarted (Transient policy)
+    let err = remote_client.call(CalcMsg::Get).await;
+    match err {
+        Err(RemoteActorError::ActorNotFound(_) | RemoteActorError::ActorUnavailable) => (),
+        other => panic!("Expected ActorNotFound or ActorUnavailable, got {other:?}"),
+    }
+
+    node.shutdown().await?;
     Ok(())
 }

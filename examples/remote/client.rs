@@ -73,6 +73,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let balance = client.call(AccountMsg::Deposit(250)).await?;
     println!("   ↳ ✅ Transparent recovery successful! Replacement actor balance: {balance} EUR");
 
+    // 6. Controlled Domain Termination via ctx.stop()
+    println!(
+        "\n6️⃣ [Controlled Termination] Client closing account via AccountMsg::CloseAccount..."
+    );
+    let final_balance = client.call(AccountMsg::CloseAccount).await?;
+    println!("   ↳ Account closed with final payout balance: {final_balance} EUR.");
+    println!("   ↳ Remote actor drained its queue and stopped gracefully (on_stop executed).");
+    println!(
+        "   ↳ ServiceSupervisor (RestartType::Transient) honors clean shutdown and leaves actor dead."
+    );
+
+    // Verify actor is truly stopped and no longer available
+    match client.call(AccountMsg::GetBalance).await {
+        Err(RemoteActorError::ActorNotFound(_) | RemoteActorError::ActorUnavailable) => {
+            println!("   ↳ ✅ Verified: Follow-up call correctly reports actor no longer active!");
+        }
+        other => panic!("Expected ActorNotFound or ActorUnavailable after shutdown, got {other:?}"),
+    }
+
     println!("\n🎉 All remote actor calls completed successfully!\n");
     Ok(())
 }

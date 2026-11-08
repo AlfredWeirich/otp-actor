@@ -42,8 +42,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         balance: 1000,
     };
 
+    // Use RestartType::Transient:
+    // - Recovers and re-spawns on unexpected crash (SimulateCrash -> ctx.fail)
+    // - Stays gracefully terminated when closed normally by client (CloseAccount -> ctx.stop)
     let local_client = StatefulActorBuilder::from_instance("account-9876", initial_account)
-        .restart_type(RestartType::Permanent)
+        .restart_type(RestartType::Transient)
         .spawn(&service)
         .await?;
 
