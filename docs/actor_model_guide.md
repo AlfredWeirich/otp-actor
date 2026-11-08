@@ -40,6 +40,7 @@
    - [5.1 Summary & Industry Perspective](#51-summary--industry-perspective)
    - [5.2 Production Best-Practice Checklist](#52-production-best-practice-checklist)
    - [5.3 Outlook: The Evolution of Concurrent Systems](#53-outlook-the-evolution-of-concurrent-systems)
+   - [5.4 Distributed Actors: Remote Communication over gRPC in `otp-actor`](#54-distributed-actors-remote-communication-over-grpc-in-otp-actor)
 
 ---
 
@@ -986,3 +987,209 @@ The Actor Model continues to expand across modern computing:
 * **WebAssembly & Edge Sandboxing:** In isolated WASM runtimes, the Actor Model provides the ideal abstraction for executing thousands of secure, multi-tenant stateful micro-services with negligible memory footprint.
 
 Ultimately, the Actor Model demonstrates that: **True resilience is not achieved by frantically attempting to prevent all failures, but by building an architecture designed from the ground up to recover from them.**
+
+---
+
+## 5.4 Distributed Actors: Remote Communication over gRPC in `otp-actor`
+
+While the core of the Actor Model thrives on intra-process message passing via lock-free Tokio channels, the full power of Carl Hewitt's original vision and Erlang/OTP's design lies in **Location Transparency**: the caller should not need to know or care whether an actor resides on the local CPU core, inside a different operating system process, or on a remote machine across a data center network.
+
+In the Rust ecosystem, crossing process and network boundaries poses a unique architectural challenge: Rust's type system relies on compile-time static types and zero-cost in-memory moves. Passing a message over a network requires serialization, network transport negotiation, error mapping, connection pooling, and DoS mitigation—all while preserving the developer-friendly semantics of `call`, `cast`, and supervisory self-healing.
+
+Starting with version `0.2.0`, the [`otp-actor`](https://crates.io/crates/otp-actor) crate bridges this divide through an optional, high-performance distributed subsystem activated via `--features remote`. Built on top of **HTTP/2 gRPC** (`tonic` and `prost`), it extends OTP principles seamlessly across the network.
+
+---
+
+### 5.4.1 Architectural Topology: Bridging Local Mailboxes and Remote Nodes
+
+The remote subsystem decouples the network wire protocol from individual actor domain logic by introducing a three-tier architecture:
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                        Node A: The Remote Client                       │
+│                                                                        │
+│   ┌──────────────────────────────────────────────────────────────┐     │
+│   │                 Location-Agnostic Application                │     │
+│   └──────────────────────────────┬───────────────────────────────┘     │
+│                                  │                                     │
+│                let client: AnyActorClient<BankActor>                   │
+│                                  │                                     │
+│         ┌────────────────────────┴────────────────────────┐            │
+│         ▼                                                 ▼            │
+│  AnyActorClient::Local(ActorClient<A>)     AnyActorClient::Remote(...) │
+│         │ (In-process Tokio mpsc)                         │            │
+│         ▼                                                 │            │
+│  [Local Mailbox]                                          ▼            │
+│                                            RemoteActorClient<A>        │
+│                                            (JSON Serializer)           │
+│                                                           │            │
+│                                                           ▼            │
+│                                                    Tonic gRPC Client   │
+└───────────────────────────────────────────────────────────┬────────────┘
+                                                            │
+                                                            │ HTTP/2 gRPC Stream
+                                                            │ Envelope: [service, actor,
+                                                            │            payload, deadline]
+                                                            ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│                        Node B: The Actor Host                          │
+│                                                                        │
+│   ActorNodeServer (0.0.0.0:50051)                                      │
+│     │                                                                  │
+│     ├── gRPC Service (`ActorNodeService`)                              │
+│     │     │                                                            │
+│     │     ├── Enforces Payload Limits (≤ 4 MiB DoS Protection)         │
+│     │     ├── Maps gRPC Deadlines to Tokio Timeouts                    │
+│     │     │                                                            │
+│     │     ▼                                                            │
+│     ├── ActorRegistry                                                  │
+│     │     │ Resolves "bank-service"                                    │
+│     │     ▼                                                            │
+│     ├── Box<dyn ByteEndpoint> (Type-Erased Bridge)                     │
+│     │     │ Deserializes raw binary payload into BankMsg               │
+│     │     ▼                                                            │
+│     └── ServiceSupervisor (Supervision Strategy: OneForOne)            │
+│           │                                                            │
+│           ├── Transparent 1-Hop Re-Binding Mailbox                     │
+│           ▼                                                            │
+│         BankActor Task ("account-42")                                  │
+│           ├── Process Message                                          │
+│           ├── Execute Domain State Mutations                           │
+│           └── Reply via oneshot ──► [ByteEndpoint serializes] ──► gRPC │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 5.4.2 Core Architectural Principles
+
+#### 1. The Universal Binary Envelope (`actor_node.proto`)
+Traditional RPC systems (like vanilla gRPC or Thrift) require developers to define every domain entity and message variant in `.proto` files, compile them via build scripts, and re-deploy whenever a message field changes.
+
+`otp-actor` eliminates this friction through a **Universal Binary Envelope** ([`proto/actor_node.proto`](file:///Users/fredi/Data/Projekte/Rust/261102_actor/proto/actor_node.proto)). A single, invariant wire contract serves the entire actor system:
+
+```protobuf
+syntax = "proto3";
+package otp_actor.v1;
+
+service ActorNode {
+  // Synchronous request-response with propagated error strings
+  rpc Call   (Envelope)    returns (CallReply);
+  // Asynchronous fire-and-forget messaging
+  rpc Cast   (Envelope)    returns (CastAck);
+  // Administrative or remote actor termination
+  rpc Stop   (StopRequest) returns (StopAck);
+  // Node health, uptime, and active actor telemetry
+  rpc Health (HealthRequest) returns (HealthReply);
+}
+
+message Envelope {
+  string service_name               = 1;
+  string instance_id                = 2;
+  bytes  payload                    = 3; // Serialized actor message
+  uint64 deadline_ms                = 4; // Absolute request deadline
+  map<string, string> trace_context = 5; // Distributed tracing context
+}
+
+message CallReply {
+  bytes  payload = 1; // Serialized actor reply
+  string error   = 2; // Server-side or actor error message (if any)
+}
+```
+
+Because the message payload is treated as opaque binary data on the wire, actor developers use standard Rust serialization frameworks (`serde_json`, `bincode`, or `postcard`) without modifying or recompiling the underlying gRPC schema.
+
+#### 2. Type-Erased Bridging via `ByteEndpoint`
+Inside the host node, the gRPC handler receives untyped `bytes::Bytes`. The server cannot know at compile time what Rust struct or enum corresponds to `"bank-service"`.
+
+`otp-actor` solves this through the `ByteEndpoint` trait:
+* When an actor is spawned, its typed `ActorClient<A>` is registered into an `ActorRegistry` using `registry.register_client("service_name", client)`.
+* `register_client` automatically wraps the client in an internal `TypeErasedEndpoint<A>` that implements `ByteEndpoint`.
+* Upon receiving a gRPC call, `ByteEndpoint::call_bytes` dynamically deserializes the payload into `A::Message`, forwards it into the actor's Tokio mailbox channel, awaits the actor's typed `A::Response`, and serializes the result back into raw bytes for the gRPC response envelope.
+* **DoS Protection:** To defend against malicious or corrupted network traffic, the endpoint enforces a strict payload limit (`MAX_REMOTE_PAYLOAD_BYTES = 4 MiB`), rejecting oversized requests before memory allocation occurs.
+
+#### 3. Complete Location Transparency with `AnyActorClient<A>`
+In large-scale distributed architectures, components frequently migrate between monolithic co-location and separate microservice pods. If client code had to change its invocation style depending on where an actor runs, architectural refactoring would be cumbersome.
+
+`otp-actor` resolves this with `AnyActorClient<A>`:
+
+```rust
+pub enum AnyActorClient<A: StatefulActor> {
+    Local(ActorClient<A>),
+    Remote(RemoteActorClient<A>),
+}
+```
+
+Both local and remote variants implement identical methods:
+* `.call(msg, timeout)` $\rightarrow$ Sends a message and awaits the typed response.
+* `.cast(msg)` $\rightarrow$ Dispatches a fire-and-forget message without waiting.
+* `.stop(timeout)` $\rightarrow$ Initiates a controlled lifecycle shutdown of the target actor.
+
+A caller can accept an `AnyActorClient<MyActor>` and invoke `.call(...)` completely oblivious to whether the request traverses a fast in-memory Tokio channel (sub-microsecond latency) or an HTTP/2 TCP connection across availability zones.
+
+---
+
+### 5.4.3 Distributed Fault Tolerance: Over-the-Wire Self-Healing
+
+What happens when an actor crashes in the middle of a distributed session?
+
+In an un-supervised distributed system, a remote process crash results in severed sockets, broken state, and manual reconnection logic. In `otp-actor`, the host node's **Supervision Tree** (`ServiceSupervisor`) isolates and recovers the failure locally:
+
+```
+[ Remote Client ]                         [ Actor Node Server ]               [ Supervised Actor ]
+       │                                            │                                  │
+       ├─ 1. gRPC Call(Deposit(100)) ──────────────►│                                  │
+       │                                            ├─ Routes to Mailbox ─────────────►│
+       │                                            │◄─ Reply: Ok(100) ────────────────┤
+       │◄─ gRPC Reply: Ok(100) ─────────────────────┤                                  │
+       │                                            │                                  │
+       ├─ 2. gRPC Call(CrashTrigger) ──────────────►│                                  │
+       │                                            ├─ Routes to Mailbox ─────────────►│
+       │                                            │                                  X (PANIC / CRASH!)
+       │                                            │                                  │
+       │                                            ├── Supervisor detects crash       │
+       │                                            ├── Executes OneForOne strategy    │
+       │                                            ├── Enforces Backoff/Rate-Limit    │
+       │                                            └── Spawns clean Replacement ─────►[ New Actor ]
+       │                                            │                                  │
+       │ (Client encounters error or brief wait)   │                                  │
+       │                                            │                                  │
+       ├─ 3. gRPC Call(Deposit(50)) ───────────────►│                                  │
+       │                                            ├─ Routes to new Mailbox ─────────►│
+       │                                            │◄─ Reply: Ok(150) ────────────────┤
+       │◄─ gRPC Reply: Ok(150) ─────────────────────┤                                  │
+       ▼                                            ▼                                  ▼
+```
+
+1. **Failure Containment:** The crash of a supervised actor does not kill the `ActorNodeServer` or sever the HTTP/2 gRPC channel.
+2. **Supervisor Recovery:** The supervisor's restart strategy (`OneForOne`, `OneForAll`, or `RestForOne`) restarts the failed actor with fresh in-memory state.
+3. **Transparent Re-Binding:** Because the `ByteEndpoint` wraps an `ActorClient` holding an internal watch channel to the supervisor, the server-side endpoint automatically re-binds to the newly spawned actor's mailbox.
+4. **Resilient Client Experience:** The next call issued by the remote client succeeds immediately against the resurrected actor without requiring the client to reconnect or re-resolve the target endpoint.
+
+---
+
+### 5.4.4 Controlled Termination & Lifecycle Semantics (`RestartType`)
+
+A critical challenge in distributed actor systems is distinguishing between **unexpected crashes** (which must be repaired) and **deliberate domain shutdowns** (such as closing a user session, completing an order, or terminating a worker).
+
+In `otp-actor`, this distinction is governed by the actor's `RestartType`:
+
+| `RestartType` | Behavior on Panic / Failure (`ctx.fail()`) | Behavior on Normal Exit (`ctx.stop()` or `client.stop()`) | Typical Distributed Use Case |
+| :--- | :--- | :--- | :--- |
+| **`Transient`** *(Recommended for remote services)* | **Restarted:** The supervisor automatically respawns the actor with fresh state. | **Not Restarted:** The actor terminates cleanly; subsequent client calls receive `ActorNotFound`. | User sessions, shopping carts, per-tenant workers, temporary computational jobs. |
+| **`Permanent`** | **Restarted:** Resurrected according to supervisor policy. | **Restarted:** Even a clean exit is treated as an unexpected termination; the supervisor respawns the actor. | Core background daemons, heartbeat monitors, primary event stream consumers. |
+| **`Temporary`** | **Not Restarted:** Remains dead on failure. | **Not Restarted:** Remains dead on clean exit. | Non-critical one-shot tasks where failure can be safely dropped. |
+
+This makes it trivial to implement domain commands like `AccountMsg::CloseAccount`: the actor handler calls `ctx.stop()`, runs its `on_stop` cleanup hook, drains any remaining messages, and exits. Because it is marked as `Transient`, the supervisor leaves it terminated, allowing client applications to verify that the actor is gone.
+
+---
+
+### 5.4.5 Coordinated Two-Phase Graceful Server Shutdown
+
+When an actor node is decommissioned (during rolling deployments or cluster re-balancing), terminating tasks abruptly causes dropped in-flight requests and partial writes.
+
+`ActorNodeHandle` implements a deterministic **Two-Phase Graceful Shutdown**:
+1. **Phase 1: In-Flight Request Drainage:** The gRPC service stops accepting new connections and pauses incoming message routing, granting active in-flight calls a configurable grace period (`with_drain_timeout`, e.g., 5 seconds) to finish executing and return their responses.
+2. **Phase 2: Hierarchical Actor Tree Teardown:** Once requests are drained, the server triggers sequential shutdown across the supervisor tree. Children are stopped in **reverse registration order**, giving each actor its configured `ShutdownPolicy` timeout window to flush buffers, persist state to storage, and execute asynchronous cleanup hooks before the process exits.
+
+Through this combination of universal wire envelopes, location-transparent clients, local supervision self-healing, and coordinated two-phase teardown, `otp-actor` elevates the classic Erlang/OTP actor model into a modern, distributed, type-safe Rust foundation.
