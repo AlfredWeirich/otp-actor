@@ -57,9 +57,7 @@ pub(crate) enum RootCommand {
         respond_to: oneshot::Sender<Result<(), RootError>>,
     },
     /// Gracefully shuts down the entire supervision tree (all services and their child actors).
-    Shutdown {
-        respond_to: oneshot::Sender<()>,
-    },
+    Shutdown { respond_to: oneshot::Sender<()> },
 }
 
 /// Metadata stored for each actively supervised service.
@@ -280,11 +278,8 @@ impl RootSupervisor {
             "[RootSupervisor] 👑 Root Supervisor online. Awaiting autonomous service registrations..."
         );
 
-        let (scheduled_restart_tx, mut scheduled_restart_rx) = mpsc::channel::<(
-            String,
-            u64,
-            Option<oneshot::Sender<Result<(), RootError>>>,
-        )>(64);
+        let (scheduled_restart_tx, mut scheduled_restart_rx) =
+            mpsc::channel::<(String, u64, Option<oneshot::Sender<Result<(), RootError>>>)>(64);
 
         loop {
             tokio::select! {
@@ -572,7 +567,9 @@ impl RootSupervisor {
             }
         }
 
-        tracing::info!("[RootSupervisor] Root supervisor shutdown. Aborting supervised service tasks.");
+        tracing::info!(
+            "[RootSupervisor] Root supervisor shutdown. Aborting supervised service tasks."
+        );
         self.join_set.abort_all();
     }
 }

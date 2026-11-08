@@ -136,9 +136,7 @@ pub(crate) enum ActorEnvelope<A: StatefulActor> {
         respond_to: oneshot::Sender<Result<A::Response, ActorError<A::Error>>>,
     },
     /// Fire-and-forget message (`cast`).
-    Cast {
-        msg: A::Message,
-    },
+    Cast { msg: A::Message },
     /// Requests a graceful shutdown: closes mailbox, drains pending messages, calls `on_stop`, and exits `Ok(())`.
     Shutdown,
     /// Explicit crash injection command for chaos and resilience testing.

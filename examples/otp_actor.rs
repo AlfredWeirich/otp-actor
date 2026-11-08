@@ -75,9 +75,7 @@ impl Worker<String, TokenError> for GcpTokenWorker {
 }
 
 /// 2. Showcase: Standalone async function implementing `Worker` directly (Zero `Box::pin`!).
-pub async fn gcp_bigquery_worker(
-    ctx: WorkerContext,
-) -> Result<TimedResource<String>, TokenError> {
+pub async fn gcp_bigquery_worker(ctx: WorkerContext) -> Result<TimedResource<String>, TokenError> {
     let token = fetch_token_from_gcp("gcp-bigquery", ctx.generation).await?;
     tracing::debug!(
         scope = "gcp-bigquery",

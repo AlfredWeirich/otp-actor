@@ -209,7 +209,9 @@ async fn main() {
         elapsed2
     );
 
-    println!("  ℹ️  Notice: Client queries travel directly to the actor mailbox; supervisors incur 0% overhead.\n");
+    println!(
+        "  ℹ️  Notice: Client queries travel directly to the actor mailbox; supervisors incur 0% overhead.\n"
+    );
 
     // ------------------------------------------------------------------
     // Step 5: Fault Resilience & Transparent Self-Healing
@@ -223,7 +225,9 @@ async fn main() {
     // Brief delay: ServiceSupervisor intercepts the termination and boots replacement instance #2
     tokio::time::sleep(Duration::from_millis(80)).await;
 
-    println!("  🔄 Client executes get() (detects disconnected channel & transparently rebinds)...");
+    println!(
+        "  🔄 Client executes get() (detects disconnected channel & transparently rebinds)..."
+    );
     let start = Instant::now();
     let token_recovered = client
         .get()
@@ -236,7 +240,9 @@ async fn main() {
         mask_secret(&token_recovered),
         elapsed_rec
     );
-    println!("  ℹ️  The caller requires zero manual reconnect logic — recovery occurs completely transparently!\n");
+    println!(
+        "  ℹ️  The caller requires zero manual reconnect logic — recovery occurs completely transparently!\n"
+    );
 
     // ------------------------------------------------------------------
     // Step 6: Manual Forced Refresh (force_refresh)
@@ -244,10 +250,7 @@ async fn main() {
     println!("--- Step 6: Manual Refresh (force_refresh) ---");
     println!("  🔄 Forcing out-of-band cache invalidation & background refresh...");
 
-    client
-        .force_refresh()
-        .await
-        .expect("Force refresh failed");
+    client.force_refresh().await.expect("Force refresh failed");
 
     // The refresh executes asynchronously in the background (non-blocking) so in-flight callers
     // are not stalled. Wait briefly (70ms) for the worker task to complete:
@@ -313,19 +316,25 @@ async fn main() {
     // Step 8: Orderly Cascading Shutdown (Graceful Shutdown)
     // ------------------------------------------------------------------
     println!("--- Step 8: Graceful Shutdown of the Entire Supervision Tree ---");
-    println!("  🛑 Cascading graceful shutdown across RootSupervisor, ServiceSupervisors, and all child actors...");
+    println!(
+        "  🛑 Cascading graceful shutdown across RootSupervisor, ServiceSupervisors, and all child actors..."
+    );
 
-    root.shutdown()
-        .await
-        .expect("Graceful shutdown failed");
+    root.shutdown().await.expect("Graceful shutdown failed");
 
-    println!("  ✅ All active worker and stateful actors (including on_stop hooks) terminated cleanly.\n");
+    println!(
+        "  ✅ All active worker and stateful actors (including on_stop hooks) terminated cleanly.\n"
+    );
 
     println!("========================================================");
     println!("  Summary:");
     println!("  - GenericResourceActor (TTL cache) + StatefulActor unified in one tree.");
-    println!("  - Clean architectural separation: Control Plane (supervisors) vs. Data Plane (clients).");
+    println!(
+        "  - Clean architectural separation: Control Plane (supervisors) vs. Data Plane (clients)."
+    );
     println!("  - OTP RestartType (Permanent/Transient/Temporary) & bounded ShutdownPolicy.");
-    println!("  - Automatic, transparent self-healing with zero client-side reconnect boilerplates.");
+    println!(
+        "  - Automatic, transparent self-healing with zero client-side reconnect boilerplates."
+    );
     println!("========================================================");
 }

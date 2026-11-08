@@ -10,13 +10,13 @@ use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::time::Instant;
 use thiserror::Error;
 use tokio::sync::{
     mpsc::{self, Receiver, Sender},
     oneshot, watch,
 };
 use tokio::task::JoinSet;
+use tokio::time::Instant;
 
 use super::model::{
     EXPIRY_BUFFER, RestartPolicy, RestartType, ServiceError, ShutdownPolicy, TaskResult,
@@ -108,10 +108,9 @@ impl<T> TimedResource<T> {
             return true;
         }
         match self.expires_at {
-            Some(exp) => {
-                exp.checked_add(stale_allowance)
-                    .is_none_or(|deadline| Instant::now() < deadline)
-            }
+            Some(exp) => exp
+                .checked_add(stale_allowance)
+                .is_none_or(|deadline| Instant::now() < deadline),
             None => true,
         }
     }
@@ -420,7 +419,8 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
             let w = worker.clone();
             let cfg = config.clone();
             let task_handle = tokio::spawn(async move {
-                let actor = GenericResourceActor::with_shutdown_rx(cfg, rx, shutdown_rx, new_inst, w);
+                let actor =
+                    GenericResourceActor::with_shutdown_rx(cfg, rx, shutdown_rx, new_inst, w);
                 actor.run().await
             });
             (sender_arc, task_handle)
@@ -719,7 +719,9 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
         if self.proactive_jitter > Duration::ZERO {
             let max_jitter = self.proactive_jitter.min(retry_delay);
             let jitter_ms = self.compute_jitter_ms(max_jitter);
-            target = target.checked_add(Duration::from_millis(jitter_ms)).unwrap_or(target);
+            target = target
+                .checked_add(Duration::from_millis(jitter_ms))
+                .unwrap_or(target);
         }
 
         tracing::info!(
@@ -777,7 +779,9 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
                 if let Some(target) = current_timer_target {
                     proactive_sleep.as_mut().reset(target);
                 } else {
-                    proactive_sleep.as_mut().reset(Instant::now() + Duration::from_secs(86400 * 365));
+                    proactive_sleep
+                        .as_mut()
+                        .reset(Instant::now() + Duration::from_secs(86400 * 365));
                 }
             }
 
@@ -941,7 +945,10 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
                     Ok(WorkerOutcome::Completed { generation, result }) => {
                         let _ = self.handle_refresh_complete(generation, result);
                     }
-                    Ok(WorkerOutcome::TimedOut { generation, timeout }) => {
+                    Ok(WorkerOutcome::TimedOut {
+                        generation,
+                        timeout,
+                    }) => {
                         let _ = self.handle_worker_timeout(generation, timeout);
                     }
                     Err(join_err) => {
@@ -1009,7 +1016,9 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
             }
 
             // 2. Expired, but within stale-while-error allowance
-            if self.stale_while_error > Duration::ZERO && res.is_usable_stale(self.stale_while_error) {
+            if self.stale_while_error > Duration::ZERO
+                && res.is_usable_stale(self.stale_while_error)
+            {
                 tracing::warn!(
                     actor = %self.name,
                     instance = self.instance_id,
@@ -1031,9 +1040,7 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
         }
 
         // 3. No usable resource (cold start or expired beyond stale allowance)
-        if in_cooldown
-            && let Some((t, f)) = &self.last_failure
-        {
+        if in_cooldown && let Some((t, f)) = &self.last_failure {
             let failure = f.to_resource_error();
             let remaining = self.failure_cooldown.saturating_sub(t.elapsed());
             tracing::warn!(

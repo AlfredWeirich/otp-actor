@@ -213,9 +213,7 @@ pub enum ServiceSupervisorCommand {
         respond_to: oneshot::Sender<Result<(), ServiceError>>,
     },
     /// Gracefully shuts down all supervised child actors and terminates the service supervisor.
-    Shutdown {
-        respond_to: oneshot::Sender<()>,
-    },
+    Shutdown { respond_to: oneshot::Sender<()> },
     /// Simulate an intentional crash in the service supervisor itself.
     SimulateCrash,
 }
@@ -468,9 +466,8 @@ impl ServiceSupervisor {
             "🚀 Spawning child actor from ChildSpec..."
         );
 
-        let spawn_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            (spec.factory)(inst_id)
-        }));
+        let spawn_res =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (spec.factory)(inst_id)));
         let (sender, task_handle) = match spawn_res {
             Ok(pair) => pair,
             Err(panic_err) => {
@@ -708,11 +705,10 @@ impl ServiceSupervisor {
             }
         }
 
-        let (scheduled_restart_tx, mut scheduled_restart_rx) =
-            mpsc::channel::<(
-                Vec<(String, u64)>,
-                Option<oneshot::Sender<Result<(), ServiceError>>>,
-            )>(64);
+        let (scheduled_restart_tx, mut scheduled_restart_rx) = mpsc::channel::<(
+            Vec<(String, u64)>,
+            Option<oneshot::Sender<Result<(), ServiceError>>>,
+        )>(64);
 
         loop {
             tokio::select! {

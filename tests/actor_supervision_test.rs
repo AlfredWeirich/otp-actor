@@ -321,7 +321,10 @@ async fn test_worker_panic_auto_recovery() {
         if ctx.instance_id == 1 {
             panic!("Intentional worker crash during instance 1!");
         }
-        Ok::<_, String>(TimedResource::perpetual(format!("recovered_inst_{}", ctx.instance_id)))
+        Ok::<_, String>(TimedResource::perpetual(format!(
+            "recovered_inst_{}",
+            ctx.instance_id
+        )))
     };
 
     let client = GenericResourceActor::builder("panicky-actor")
@@ -409,10 +412,16 @@ async fn test_supervisor_nonblocking_backoff() {
     };
 
     let worker_a = |ctx: WorkerContext| async move {
-        Ok::<_, String>(TimedResource::perpetual(format!("actor_a_{}", ctx.instance_id)))
+        Ok::<_, String>(TimedResource::perpetual(format!(
+            "actor_a_{}",
+            ctx.instance_id
+        )))
     };
     let worker_b = |ctx: WorkerContext| async move {
-        Ok::<_, String>(TimedResource::perpetual(format!("actor_b_{}", ctx.instance_id)))
+        Ok::<_, String>(TimedResource::perpetual(format!(
+            "actor_b_{}",
+            ctx.instance_id
+        )))
     };
 
     let client_a = GenericResourceActor::builder("actor-a")
@@ -487,10 +496,16 @@ async fn test_child_spec_builder_pattern() {
 
     // 1. Closures defined externally and passed into ChildSpecs via builder
     let worker_a = |ctx: WorkerContext| async move {
-        Ok::<_, String>(TimedResource::perpetual(format!("val_a_{}", ctx.instance_id)))
+        Ok::<_, String>(TimedResource::perpetual(format!(
+            "val_a_{}",
+            ctx.instance_id
+        )))
     };
     let worker_b = |ctx: WorkerContext| async move {
-        Ok::<_, String>(TimedResource::perpetual(format!("val_b_{}", ctx.instance_id)))
+        Ok::<_, String>(TimedResource::perpetual(format!(
+            "val_b_{}",
+            ctx.instance_id
+        )))
     };
 
     // 2. Build ServiceSupervisor declaring ChildSpecs up-front (OTP Style!)
@@ -534,7 +549,10 @@ async fn test_dynamic_start_child() {
         .expect("Failed to spawn supervisor");
 
     let worker = |ctx: WorkerContext| async move {
-        Ok::<_, String>(TimedResource::perpetual(format!("dyn_data_{}", ctx.instance_id)))
+        Ok::<_, String>(TimedResource::perpetual(format!(
+            "dyn_data_{}",
+            ctx.instance_id
+        )))
     };
 
     // Dynamically start a child actor at runtime from a ChildSpec
@@ -542,7 +560,9 @@ async fn test_dynamic_start_child() {
         .worker(worker)
         .build_child_spec();
 
-    sup.start_child(spec).await.expect("Failed to start child dynamically");
+    sup.start_child(spec)
+        .await
+        .expect("Failed to start child dynamically");
 
     let client = sup
         .get_client::<String, String>("dyn-child")
@@ -610,7 +630,10 @@ struct CustomStructWorker {
 
 impl Worker<String, String> for CustomStructWorker {
     async fn execute(&self, ctx: WorkerContext) -> Result<TimedResource<String>, String> {
-        Ok(TimedResource::perpetual(format!("{}_inst_{}", self.prefix, ctx.instance_id)))
+        Ok(TimedResource::perpetual(format!(
+            "{}_inst_{}",
+            self.prefix, ctx.instance_id
+        )))
     }
 }
 
@@ -656,7 +679,10 @@ async fn test_child_spec_with_closure_capturing_env() {
         async move {
             let mut guard = hist.lock().await;
             guard.push(ctx.instance_id);
-            Ok::<_, String>(TimedResource::perpetual(format!("history_len_{}", guard.len())))
+            Ok::<_, String>(TimedResource::perpetual(format!(
+                "history_len_{}",
+                guard.len()
+            )))
         }
     };
 
@@ -908,7 +934,10 @@ async fn test_client_channel_rebind_during_slow_backoff() {
     };
 
     let worker = |ctx: WorkerContext| async move {
-        Ok::<_, String>(TimedResource::perpetual(format!("val_inst_{}", ctx.instance_id)))
+        Ok::<_, String>(TimedResource::perpetual(format!(
+            "val_inst_{}",
+            ctx.instance_id
+        )))
     };
 
     let sup = ServiceSupervisor::builder("rebind-service")
@@ -936,7 +965,10 @@ async fn test_client_channel_rebind_during_slow_backoff() {
     // Previously, client would retry 3x in ~120ms and fail with ActorUnavailable.
     // With parked resolutions, it cleanly waits for the supervisor to complete backoff and respawn!
     let start = Instant::now();
-    let val = client.get().await.expect("Client should successfully rebind even during slow backoff");
+    let val = client
+        .get()
+        .await
+        .expect("Client should successfully rebind even during slow backoff");
     let elapsed = start.elapsed();
 
     assert_eq!(val, "val_inst_2");
@@ -966,19 +998,25 @@ async fn test_root_supervisor_crash_loop_protection() {
         .expect("Failed to spawn supervisor");
 
     // Crash 1: Allowed (restart 1 of 2)
-    sup.trigger_service_crash().await.expect("Crash 1 trigger failed");
+    sup.trigger_service_crash()
+        .await
+        .expect("Crash 1 trigger failed");
     tokio::time::sleep(Duration::from_millis(80)).await;
     let sender1 = root.resolve_service_channel("fragile-service").await;
     assert!(sender1.is_ok(), "Service should recover from crash 1");
 
     // Crash 2: Allowed (restart 2 of 2)
-    sup.trigger_service_crash().await.expect("Crash 2 trigger failed");
+    sup.trigger_service_crash()
+        .await
+        .expect("Crash 2 trigger failed");
     tokio::time::sleep(Duration::from_millis(100)).await;
     let sender2 = root.resolve_service_channel("fragile-service").await;
     assert!(sender2.is_ok(), "Service should recover from crash 2");
 
     // Crash 3: Exceeds threshold!
-    sup.trigger_service_crash().await.expect("Crash 3 trigger failed");
+    sup.trigger_service_crash()
+        .await
+        .expect("Crash 3 trigger failed");
     tokio::time::sleep(Duration::from_millis(80)).await;
 
     let res = root.resolve_service_channel("fragile-service").await;
@@ -1092,9 +1130,7 @@ async fn test_retry_storm_protection_and_negative_caching() {
     let mut handles = Vec::new();
     for _ in 0..20 {
         let c = client.clone();
-        handles.push(tokio::spawn(async move {
-            c.get().await
-        }));
+        handles.push(tokio::spawn(async move { c.get().await }));
     }
 
     for h in handles {
@@ -1103,7 +1139,10 @@ async fn test_retry_storm_protection_and_negative_caching() {
             Err(ResourceError::WorkerFailed(err)) => {
                 assert_eq!(err, "upstream unavailable");
             }
-            other => panic!("Expected fast-fail WorkerFailed during cooldown, got {:?}", other),
+            other => panic!(
+                "Expected fast-fail WorkerFailed during cooldown, got {:?}",
+                other
+            ),
         }
     }
 
@@ -1180,14 +1219,20 @@ async fn test_stale_while_error_serves_expired_cache() {
 
     // Call get(): Resource is expired, but within stale_while_error window (150ms).
     // Client should receive the stale value while background worker fails!
-    let val2 = client.get().await.expect("Stale value should be served during outage");
+    let val2 = client
+        .get()
+        .await
+        .expect("Stale value should be served during outage");
     assert_eq!(val2, "initial_data_gen_1");
 
     // Wait for the background worker to fail and set failure cooldown
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     // Subsequent call during outage: Still within stale_while_error window!
-    let val3 = client.get().await.expect("Stale value should still be served");
+    let val3 = client
+        .get()
+        .await
+        .expect("Stale value should still be served");
     assert_eq!(val3, "initial_data_gen_1");
 
     // Wait until stale_while_error window expires (total elapsed > 40ms + 150ms = 190ms)
@@ -1216,7 +1261,10 @@ async fn test_force_refresh_bypasses_failure_cooldown() {
             if n == 0 {
                 Err::<TimedResource<String>, _>("initial failure".to_string())
             } else {
-                Ok::<_, String>(TimedResource::perpetual(format!("recovered_gen_{}", ctx.generation)))
+                Ok::<_, String>(TimedResource::perpetual(format!(
+                    "recovered_gen_{}",
+                    ctx.generation
+                )))
             }
         }
     };
@@ -1250,7 +1298,10 @@ async fn test_force_refresh_bypasses_failure_cooldown() {
     tokio::time::sleep(Duration::from_millis(30)).await;
 
     // Next get() retrieves the successfully recovered resource
-    let val = client.get().await.expect("Should succeed after force_refresh");
+    let val = client
+        .get()
+        .await
+        .expect("Should succeed after force_refresh");
     assert_eq!(val, "recovered_gen_2");
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
 }
@@ -1439,7 +1490,10 @@ async fn test_restart_child_recovers_failed_actor() {
     };
 
     let worker = |ctx: WorkerContext| async move {
-        Ok::<_, String>(TimedResource::perpetual(format!("val_inst_{}", ctx.instance_id)))
+        Ok::<_, String>(TimedResource::perpetual(format!(
+            "val_inst_{}",
+            ctx.instance_id
+        )))
     };
 
     let client = GenericResourceActor::builder("crashing-actor")
@@ -1476,7 +1530,10 @@ async fn test_restart_child_recovers_failed_actor() {
         .expect("Manual restart_child should succeed");
 
     // Client transparently rebinds and gets fresh instance #4!
-    let recovered = client.get().await.expect("Recovered actor should answer requests");
+    let recovered = client
+        .get()
+        .await
+        .expect("Recovered actor should answer requests");
     assert_eq!(recovered, "val_inst_4");
 }
 
@@ -1493,7 +1550,10 @@ async fn test_escalate_on_failure_triggers_root_supervisor_restart() {
     };
 
     let worker = |ctx: WorkerContext| async move {
-        Ok::<_, String>(TimedResource::perpetual(format!("inst_{}", ctx.instance_id)))
+        Ok::<_, String>(TimedResource::perpetual(format!(
+            "inst_{}",
+            ctx.instance_id
+        )))
     };
 
     let service_sup = ServiceSupervisor::builder("escalating-svc")
@@ -1528,7 +1588,10 @@ async fn test_escalate_on_failure_triggers_root_supervisor_restart() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Client should transparently rebind via RootSupervisor to the rebooted ServiceSupervisor
-    let rebooted_val = client.get().await.expect("Rebound request after escalation must succeed");
+    let rebooted_val = client
+        .get()
+        .await
+        .expect("Rebound request after escalation must succeed");
     assert_eq!(rebooted_val, "inst_1"); // Reset back to inst 1 under the new supervisor instance!
 }
 
@@ -1551,12 +1614,20 @@ async fn test_restart_service_recovers_failed_supervisor() {
         .expect("Spawn failed");
 
     // Crash 1: Allowed
-    root.trigger_service_crash("fragile-root-svc").await.unwrap();
+    root.trigger_service_crash("fragile-root-svc")
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
-    assert!(root.resolve_service_channel("fragile-root-svc").await.is_ok());
+    assert!(
+        root.resolve_service_channel("fragile-root-svc")
+            .await
+            .is_ok()
+    );
 
     // Crash 2: Exceeds limit -> root marks service permanently failed
-    root.trigger_service_crash("fragile-root-svc").await.unwrap();
+    root.trigger_service_crash("fragile-root-svc")
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
     match root.resolve_service_channel("fragile-root-svc").await {
         Err(RootError::MaxRestartsExceeded(name, max, _)) => {
@@ -1668,7 +1739,10 @@ async fn test_restart_type_permanent_restarts_on_normal_exit() {
 
     // Request a clean shutdown directly on the actor (causes actor.run() to exit with Ok(())).
     // Because RestartType is Permanent, the supervisor MUST restart it to instance 2!
-    client.shutdown().await.expect("Direct shutdown command failed");
+    client
+        .shutdown()
+        .await
+        .expect("Direct shutdown command failed");
     tokio::time::sleep(Duration::from_millis(80)).await;
 
     let val2 = client
@@ -1707,7 +1781,10 @@ async fn test_restart_type_transient_stops_on_normal_exit_but_restarts_on_crash(
     assert_eq!(client.get().await.unwrap(), "trans_inst_2");
 
     // 2. Clean exit via shutdown(): Transient actor must NOT be restarted
-    client.shutdown().await.expect("Direct shutdown command failed");
+    client
+        .shutdown()
+        .await
+        .expect("Direct shutdown command failed");
     tokio::time::sleep(Duration::from_millis(80)).await;
 
     let res = service_sup
@@ -1801,7 +1878,9 @@ async fn test_stop_child_completes_in_flight_worker_gracefully() {
     tokio::time::sleep(Duration::from_millis(60)).await;
     assert!(
         matches!(
-            service_sup.resolve_actor_channel_untyped("graceful-actor").await,
+            service_sup
+                .resolve_actor_channel_untyped("graceful-actor")
+                .await,
             Err(ServiceError::ActorNotFound(_))
         ),
         "Explicitly stopped Permanent actor must not auto-restart"
@@ -1891,7 +1970,11 @@ async fn test_root_supervisor_graceful_shutdown_cascade() {
     );
 
     // Subsequent operations on the shut-down supervisor return unavailable
-    assert!(sup.resolve_actor_channel_untyped("cascade-actor").await.is_err());
+    assert!(
+        sup.resolve_actor_channel_untyped("cascade-actor")
+            .await
+            .is_err()
+    );
 }
 
 // ============================================================================
@@ -2049,7 +2132,9 @@ async fn test_mixed_supervision_resource_actor_and_stateful_actor_one_for_all() 
     let sup = ServiceSupervisor::builder("mixed-pipeline-service")
         .strategy(SupervisionStrategy::OneForAll)
         .add_child(GenericResourceActor::builder("auth-token").worker(token_worker))
-        .add_child(StatefulActorBuilder::from_default::<CounterActor>("order-counter"))
+        .add_child(StatefulActorBuilder::from_default::<CounterActor>(
+            "order-counter",
+        ))
         .spawn(&root)
         .await
         .expect("Failed to spawn mixed supervisor");
@@ -2079,7 +2164,10 @@ async fn test_mixed_supervision_resource_actor_and_stateful_actor_one_for_all() 
         "GenericResourceActor must be restarted to inst 2 when sibling StatefulActor crashes under OneForAll"
     );
     assert_eq!(
-        counter_client.call(CounterMsg::GetWithInstance).await.unwrap(),
+        counter_client
+            .call(CounterMsg::GetWithInstance)
+            .await
+            .unwrap(),
         (0, 2),
         "StatefulActor must be restarted to inst 2 with fresh state"
     );
@@ -2190,7 +2278,11 @@ impl StatefulActor for StopDrainActor {
     type Response = usize;
     type Error = String;
 
-    async fn handle(&mut self, msg: Self::Message, ctx: &mut ActorContext) -> Result<Self::Response, Self::Error> {
+    async fn handle(
+        &mut self,
+        msg: Self::Message,
+        ctx: &mut ActorContext,
+    ) -> Result<Self::Response, Self::Error> {
         self.handled_count.fetch_add(1, Ordering::SeqCst);
         if msg == 0 {
             // Give time for concurrent callers to buffer in the mailbox before initiating stop
@@ -2278,7 +2370,11 @@ impl StatefulActor for ExclusiveResourceSiblingActor {
         Ok(())
     }
 
-    async fn handle(&mut self, should_panic: Self::Message, _ctx: &mut ActorContext) -> Result<Self::Response, Self::Error> {
+    async fn handle(
+        &mut self,
+        should_panic: Self::Message,
+        _ctx: &mut ActorContext,
+    ) -> Result<Self::Response, Self::Error> {
         if should_panic {
             panic!("intentional crash");
         }
@@ -2309,37 +2405,39 @@ async fn test_one_for_all_and_restart_child_graceful_on_stop_without_overlap() {
     let overlap_b = Arc::new(AtomicBool::new(false));
     let events_b = Arc::new(std::sync::Mutex::new(Vec::new()));
 
-    let client_a = StatefulActorBuilder::new("actor-a", move |inst| ExclusiveResourceSiblingActor {
-        instance_id: inst,
-        active_instances: Arc::new(AtomicUsize::new(0)),
-        overlap_detected: Arc::new(AtomicBool::new(false)),
-        events: Arc::new(std::sync::Mutex::new(Vec::new())),
-    })
-    .restart_policy(RestartPolicy {
-        initial_backoff: Duration::ZERO,
-        ..Default::default()
-    })
-    .spawn(&sup)
-    .await
-    .expect("Failed to spawn actor-a");
+    let client_a =
+        StatefulActorBuilder::new("actor-a", move |inst| ExclusiveResourceSiblingActor {
+            instance_id: inst,
+            active_instances: Arc::new(AtomicUsize::new(0)),
+            overlap_detected: Arc::new(AtomicBool::new(false)),
+            events: Arc::new(std::sync::Mutex::new(Vec::new())),
+        })
+        .restart_policy(RestartPolicy {
+            initial_backoff: Duration::ZERO,
+            ..Default::default()
+        })
+        .spawn(&sup)
+        .await
+        .expect("Failed to spawn actor-a");
 
     let ab = active_b.clone();
     let ob = overlap_b.clone();
     let eb = events_b.clone();
-    let client_b = StatefulActorBuilder::new("actor-b", move |inst| ExclusiveResourceSiblingActor {
-        instance_id: inst,
-        active_instances: ab.clone(),
-        overlap_detected: ob.clone(),
-        events: eb.clone(),
-    })
-    .restart_policy(RestartPolicy {
-        initial_backoff: Duration::ZERO,
-        ..Default::default()
-    })
-    .shutdown_policy(ShutdownPolicy::Timeout(Duration::from_secs(2)))
-    .spawn(&sup)
-    .await
-    .expect("Failed to spawn actor-b");
+    let client_b =
+        StatefulActorBuilder::new("actor-b", move |inst| ExclusiveResourceSiblingActor {
+            instance_id: inst,
+            active_instances: ab.clone(),
+            overlap_detected: ob.clone(),
+            events: eb.clone(),
+        })
+        .restart_policy(RestartPolicy {
+            initial_backoff: Duration::ZERO,
+            ..Default::default()
+        })
+        .shutdown_policy(ShutdownPolicy::Timeout(Duration::from_secs(2)))
+        .spawn(&sup)
+        .await
+        .expect("Failed to spawn actor-b");
 
     assert_eq!(client_a.call(false).await.unwrap(), 1);
     assert_eq!(client_b.call(false).await.unwrap(), 1);
@@ -2359,7 +2457,10 @@ async fn test_one_for_all_and_restart_child_graceful_on_stop_without_overlap() {
             break;
         }
     }
-    assert_eq!(inst_b, 2, "Sibling actor-b should have restarted to instance 2");
+    assert_eq!(
+        inst_b, 2,
+        "Sibling actor-b should have restarted to instance 2"
+    );
     assert!(
         !overlap_b.load(Ordering::SeqCst),
         "Old and new instances of actor-b must never overlap concurrently"
@@ -2449,7 +2550,10 @@ async fn test_stopped_and_deleted_children_do_not_resurrect_on_supervisor_restar
 
     let _c1 = GenericResourceActor::builder("stopped-child")
         .worker(|ctx: WorkerContext| async move {
-            Ok::<_, String>(TimedResource::perpetual(format!("inst_{}", ctx.instance_id)))
+            Ok::<_, String>(TimedResource::perpetual(format!(
+                "inst_{}",
+                ctx.instance_id
+            )))
         })
         .spawn_and_register(&sup, &root)
         .await
@@ -2457,7 +2561,10 @@ async fn test_stopped_and_deleted_children_do_not_resurrect_on_supervisor_restar
 
     let _c2 = GenericResourceActor::builder("deleted-child")
         .worker(|ctx: WorkerContext| async move {
-            Ok::<_, String>(TimedResource::perpetual(format!("inst_{}", ctx.instance_id)))
+            Ok::<_, String>(TimedResource::perpetual(format!(
+                "inst_{}",
+                ctx.instance_id
+            )))
         })
         .spawn_and_register(&sup, &root)
         .await
@@ -2465,7 +2572,10 @@ async fn test_stopped_and_deleted_children_do_not_resurrect_on_supervisor_restar
 
     let c3 = GenericResourceActor::builder("active-child")
         .worker(|ctx: WorkerContext| async move {
-            Ok::<_, String>(TimedResource::perpetual(format!("inst_{}", ctx.instance_id)))
+            Ok::<_, String>(TimedResource::perpetual(format!(
+                "inst_{}",
+                ctx.instance_id
+            )))
         })
         .spawn_and_register(&sup, &root)
         .await
@@ -2672,7 +2782,10 @@ async fn test_stateful_actor_handler_timeout_fails_fast_and_restarts_cleanly() {
         .call_retry(Duration::ZERO)
         .await
         .expect("Actor should recover to fresh instance #2");
-    assert_eq!(inst, 2, "Supervisor must restart actor after handler_timeout");
+    assert_eq!(
+        inst, 2,
+        "Supervisor must restart actor after handler_timeout"
+    );
     assert!(
         !corrupted,
         "Restarted instance #2 must not carry half-mutated state from timed-out handler"
@@ -2811,16 +2924,20 @@ async fn test_stateful_actor_non_clone_message_rebind_and_call_retry_mid_handler
         .expect("Failed to spawn service supervisor");
 
     // Part A: Non-Clone Message recovery across closed channel on both call() and cast()
-    let non_clone_client = StatefulActorBuilder::from_default::<NonCloneMessageActor>("non-clone-actor")
-        .restart_policy(RestartPolicy {
-            initial_backoff: Duration::from_millis(10),
-            ..Default::default()
-        })
-        .spawn(&sup)
-        .await
-        .expect("Failed to spawn NonCloneMessageActor");
+    let non_clone_client =
+        StatefulActorBuilder::from_default::<NonCloneMessageActor>("non-clone-actor")
+            .restart_policy(RestartPolicy {
+                initial_backoff: Duration::from_millis(10),
+                ..Default::default()
+            })
+            .spawn(&sup)
+            .await
+            .expect("Failed to spawn NonCloneMessageActor");
 
-    assert_eq!(non_clone_client.call(NonCloneMsg(10)).await.unwrap(), (10, 1));
+    assert_eq!(
+        non_clone_client.call(NonCloneMsg(10)).await.unwrap(),
+        (10, 1)
+    );
 
     // Crash instance 1; next cast(NonCloneMsg) and call(NonCloneMsg) must recover the uncloned
     // message out of SendError and deliver it to instance 2!
@@ -2905,8 +3022,14 @@ async fn test_stateful_actor_on_start_failure_triggers_supervisor_recovery() {
         .call(())
         .await
         .expect("Actor must recover automatically when instance 1 fails in on_start");
-    assert_eq!(inst, 2, "Supervisor must have restarted actor after on_start failure");
-    assert_eq!(rehydrated, 99, "Instance 2 must have completed on_start rehydration");
+    assert_eq!(
+        inst, 2,
+        "Supervisor must have restarted actor after on_start failure"
+    );
+    assert_eq!(
+        rehydrated, 99,
+        "Instance 2 must have completed on_start rehydration"
+    );
 
     let _ = root.shutdown().await;
 }
@@ -2988,7 +3111,9 @@ async fn test_rest_for_one_overlapping_backoffs_and_failed_downstream_recovery()
     tokio::time::sleep(Duration::from_millis(20)).await;
     assert!(matches!(
         client_c.call_retry(CounterMsg::GetWithInstance).await,
-        Err(otp_actor::ActorError::Service(ServiceError::MaxRestartsExceeded(_, _, _)))
+        Err(otp_actor::ActorError::Service(
+            ServiceError::MaxRestartsExceeded(_, _, _)
+        ))
     ));
 
     client_b.simulate_crash().await.unwrap();
@@ -3172,7 +3297,9 @@ async fn test_resource_client_rebinds_on_actor_unavailable_and_propagates_actor_
     assert!(
         matches!(
             state_err,
-            Err(otp_actor::ActorError::Service(ServiceError::ActorNotFound(_)))
+            Err(otp_actor::ActorError::Service(ServiceError::ActorNotFound(
+                _
+            )))
         ),
         "Expected ActorError::Service(ServiceError::ActorNotFound), got {:?}",
         state_err
@@ -3180,4 +3307,3 @@ async fn test_resource_client_rebinds_on_actor_unavailable_and_propagates_actor_
 
     let _ = root.shutdown().await;
 }
-

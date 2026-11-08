@@ -4,8 +4,8 @@
 //! utilized across the multi-level supervision hierarchy (Root -> Service -> Actors).
 
 use std::time::Duration;
-use tokio::time::Instant;
 use thiserror::Error;
+use tokio::time::Instant;
 
 /// Safety margin threshold: Asynchronous refresh requests are triggered before actual expiration.
 /// Set to 2 seconds for this demonstration (typically 5 minutes / 300s in production environments).

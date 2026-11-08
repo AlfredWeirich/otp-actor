@@ -13,11 +13,11 @@
 //! 3. **Hierarchical Clean Teardown**: Shutting down the root supervisor gracefully
 //!    terminates the entire multi-level tree.
 
-use std::time::Duration;
 use otp_actor::actor::{
     ActorClient, ActorContext, RestartType, RootSupervisor, RootSupervisorHandle,
     ServiceSupervisor, StatefulActor, StatefulActorBuilder, SupervisionStrategy,
 };
+use std::time::Duration;
 
 // ============================================================================
 // Child Actor B: Database Worker
@@ -146,7 +146,9 @@ impl StatefulActor for TenantManager {
 
                 // 2. Register DatabaseWorker (Child B) under the new supervisor
                 let db_name = format!("db-{tenant_id}");
-                println!("  [TenantManager] 2. Spawning child '{db_name}' under tenant supervisor...");
+                println!(
+                    "  [TenantManager] 2. Spawning child '{db_name}' under tenant supervisor..."
+                );
                 let db_client = StatefulActorBuilder::from_instance(
                     db_name,
                     DatabaseWorker {
@@ -160,7 +162,9 @@ impl StatefulActor for TenantManager {
 
                 // 3. Register CacheWorker (Child C) under the same tenant supervisor
                 let cache_name = format!("cache-{tenant_id}");
-                println!("  [TenantManager] 3. Spawning child '{cache_name}' under tenant supervisor...");
+                println!(
+                    "  [TenantManager] 3. Spawning child '{cache_name}' under tenant supervisor..."
+                );
                 let cache_client = StatefulActorBuilder::from_instance(
                     cache_name,
                     CacheWorker {
@@ -252,17 +256,16 @@ async fn main() {
         .await
         .expect("Cache recovery query failed");
 
+    println!("  ✅ DatabaseWorker recovered: \"{db_rec}\" (Now on Instance #{db_new_inst})");
+    println!("  ✅ CacheWorker co-restarted: \"{cache_rec}\" (Now on Instance #{cache_new_inst})");
     println!(
-        "  ✅ DatabaseWorker recovered: \"{db_rec}\" (Now on Instance #{db_new_inst})"
+        "  💡 Both actors were co-restarted together under their dedicated supervisor to preserve consistency!\n"
     );
-    println!(
-        "  ✅ CacheWorker co-restarted: \"{cache_rec}\" (Now on Instance #{cache_new_inst})"
-    );
-    println!("  💡 Both actors were co-restarted together under their dedicated supervisor to preserve consistency!\n");
 
     // Step 6: Hierarchical Graceful Shutdown
     println!("--- Step 4: Hierarchical Graceful Shutdown ---");
     root.shutdown().await.expect("Shutdown failed");
-    println!("✅ RootSupervisor, all ServiceSupervisors, and all dynamic sub-actors shut down cleanly.");
+    println!(
+        "✅ RootSupervisor, all ServiceSupervisors, and all dynamic sub-actors shut down cleanly."
+    );
 }
-

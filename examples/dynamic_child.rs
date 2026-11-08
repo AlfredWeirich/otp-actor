@@ -65,14 +65,12 @@ impl StatefulActor for Manager {
                 println!("  [Manager] Dynamically registering '{worker_name}' under supervisor...");
 
                 // The Manager uses its injected supervisor handle to spawn a Worker:
-                let worker_client = StatefulActorBuilder::from_instance(
-                    worker_name,
-                    Worker { id: worker_id },
-                )
-                .restart_type(RestartType::Transient)
-                .spawn(&self.supervisor)
-                .await
-                .map_err(|e| e.to_string())?;
+                let worker_client =
+                    StatefulActorBuilder::from_instance(worker_name, Worker { id: worker_id })
+                        .restart_type(RestartType::Transient)
+                        .spawn(&self.supervisor)
+                        .await
+                        .map_err(|e| e.to_string())?;
 
                 Ok(worker_client)
             }
