@@ -621,6 +621,11 @@ impl<A: StatefulActor> ActorClient<A> {
         &self.name
     }
 
+    /// Returns the name of the [`ServiceSupervisorHandle`] managing this actor.
+    pub fn service_name(&self) -> &str {
+        self.supervisor.name()
+    }
+
     /// Returns a clone of the currently cached channel sender without holding the lock across `.await`.
     fn current_sender(&self) -> Sender<ActorEnvelope<A>> {
         self.sender

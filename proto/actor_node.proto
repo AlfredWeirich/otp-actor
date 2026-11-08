@@ -1,0 +1,66 @@
+syntax = "proto3";
+
+package otp_actor.remote.v1;
+
+// Service exposed by any node hosting otp-actor actors.
+service ActorNode {
+  // Synchronous request/response (call) with typed/serialized response payload.
+  rpc Call (CallRequest) returns (CallResponse);
+
+  // Fire-and-forget notification (cast).
+  rpc Cast (CastRequest) returns (CastResponse);
+}
+
+// Universal call envelope carrying an arbitrary serialized payload.
+message CallRequest {
+  // The service supervisor domain name (e.g., "auth-service").
+  string service_name = 1;
+  // The registered child actor name within that service (e.g., "token-worker").
+  string actor_name = 2;
+  // Serialized payload of the actor's Message.
+  bytes payload = 3;
+  // Optional client-side timeout in milliseconds for processing inside the actor.
+  optional uint64 timeout_ms = 4;
+}
+
+// Universal call response envelope carrying the outcome.
+message CallResponse {
+  oneof result {
+    // Serialized A::Response
+    bytes ok_payload = 1;
+    // Serialized A::Error (domain error returned by the actor)
+    bytes actor_error_payload = 2;
+    // Framework-level error (Actor not found, supervisor dead, mailbox full, panic, etc.)
+    RemoteError framework_error = 3;
+  }
+}
+
+// Universal cast envelope.
+message CastRequest {
+  string service_name = 1;
+  string actor_name = 2;
+  bytes payload = 3;
+}
+
+// Cast acknowledgment (returns once enqueued in local actor mailbox).
+message CastResponse {
+  optional RemoteError framework_error = 1;
+}
+
+// Structured error for remote actor invocations.
+message RemoteError {
+  enum Kind {
+    UNSPECIFIED = 0;
+    SERVICE_NOT_FOUND = 1;
+    ACTOR_NOT_FOUND = 2;
+    MAILBOX_FULL = 3;
+    ACTOR_UNAVAILABLE = 4;
+    TIMEOUT = 5;
+    SERIALIZATION = 6;
+    DESERIALIZATION = 7;
+    ACTOR_PANIC = 8;
+  }
+  Kind kind = 1;
+  string message = 2;
+}
+
