@@ -8,7 +8,7 @@ use crate::remote::endpoint::ByteEndpoint;
 use crate::remote::proto::RemoteError;
 use crate::remote::proto::remote_error::Kind;
 
-type EndpointMap = HashMap<(String, String), Arc<dyn ByteEndpoint>>;
+type EndpointMap = HashMap<String, HashMap<String, Arc<dyn ByteEndpoint>>>;
 
 /// Registry that routes incoming gRPC calls to local actors.
 #[derive(Clone, Default)]
@@ -33,7 +33,9 @@ impl ActorNodeRegistry {
             .endpoints
             .write()
             .unwrap_or_else(PoisonError::into_inner);
-        map.insert((service_name.into(), actor_name.into()), endpoint);
+        map.entry(service_name.into())
+            .or_default()
+            .insert(actor_name.into(), endpoint);
     }
 
     /// Registers a strongly typed `ActorClient<A>` under the specified service and actor names.
@@ -70,21 +72,30 @@ impl ActorNodeRegistry {
             .endpoints
             .write()
             .unwrap_or_else(PoisonError::into_inner);
-        map.remove(&(service_name.to_string(), actor_name.to_string()))
-            .is_some()
+        if let Some(actors) = map.get_mut(service_name) {
+            let removed = actors.remove(actor_name).is_some();
+            if actors.is_empty() {
+                map.remove(service_name);
+            }
+            removed
+        } else {
+            false
+        }
     }
 
-    /// Looks up the actor endpoint for the given service and actor name.
+    /// Looks up the actor endpoint for the given service and actor name without heap allocations.
     pub fn get(&self, service_name: &str, actor_name: &str) -> Option<Arc<dyn ByteEndpoint>> {
         let map = self
             .endpoints
             .read()
             .unwrap_or_else(PoisonError::into_inner);
-        map.get(&(service_name.to_string(), actor_name.to_string()))
+        map.get(service_name)
+            .and_then(|actors| actors.get(actor_name))
             .cloned()
     }
 
-    /// Resolves the actor endpoint, distinguishing between `ServiceNotFound` and `ActorNotFound`.
+    /// Resolves the actor endpoint without heap allocations on the hot path,
+    /// distinguishing between `ServiceNotFound` and `ActorNotFound` in $O(1)$.
     pub fn resolve(
         &self,
         service_name: &str,
@@ -94,21 +105,18 @@ impl ActorNodeRegistry {
             .endpoints
             .read()
             .unwrap_or_else(PoisonError::into_inner);
-        if let Some(ep) = map.get(&(service_name.to_string(), actor_name.to_string())) {
-            return Ok(ep.clone());
-        }
-
-        let service_exists = map.keys().any(|(svc, _)| svc == service_name);
-        if service_exists {
-            Err(RemoteError {
-                kind: Kind::ActorNotFound as i32,
-                message: format!("{service_name}/{actor_name}"),
-            })
-        } else {
-            Err(RemoteError {
+        match map.get(service_name) {
+            Some(actors) => match actors.get(actor_name) {
+                Some(ep) => Ok(ep.clone()),
+                None => Err(RemoteError {
+                    kind: Kind::ActorNotFound as i32,
+                    message: format!("{service_name}/{actor_name}"),
+                }),
+            },
+            None => Err(RemoteError {
                 kind: Kind::ServiceNotFound as i32,
                 message: service_name.to_string(),
-            })
+            }),
         }
     }
 }
