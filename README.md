@@ -150,7 +150,7 @@ flowchart TD
 | Remote Server Node (Rechner B) | [`examples/remote/server.rs`](examples/remote/server.rs) | Standalone daemon hosting actors under OTP supervision over network gRPC (default: `http://127.0.0.1:50051`, override via `REMOTE_ADDR`). |
 | Remote Client (Rechner A) | [`examples/remote/client.rs`](examples/remote/client.rs) | Lightweight client invoking remote actors with location transparency and testing crash recovery. |
 | Integration tests | [`tests/actor_supervision_test.rs`](tests/actor_supervision_test.rs) | 58 tests covering supervision, caching, stateful actors, restart types, graceful shutdown, timeouts, backpressure, and more. |
-| Remote gRPC tests | [`tests/remote_grpc_test.rs`](tests/remote_grpc_test.rs) | 6 integration tests covering TCP transport, location transparency, crash recovery, timeouts, and in-flight drainage. |
+| Remote gRPC tests | [`tests/remote_grpc_test.rs`](tests/remote_grpc_test.rs) | 7 integration tests covering TCP transport, location transparency, crash recovery, timeouts, trailing-byte rejection, and in-flight drainage. |
 
 ---
 
@@ -193,7 +193,7 @@ cargo run --example remote_server --features remote
 # Terminal 2 (Rechner A / Client):
 cargo run --example remote_client --features remote
 
-# Run all 64 core & remote integration tests (+ 4 doc-tests)
+# Run all 66 core & remote integration tests (+ 4 doc-tests)
 cargo test --features remote
 
 # Optimized build
@@ -612,9 +612,9 @@ tokio = { version = "1", features = ["full"] }
 
 The remote subsystem is built around four core principles:
 1. **Universal Protobuf Wire Contract ([`proto/actor_node.proto`](proto/actor_node.proto))**: A single schema-agnostic `ActorNode` service (`Call` and `Cast` RPCs) transports arbitrary typed messages without modifying or recompiling `.proto` files per actor type.
-2. **Type-Erased Byte Bridging & DoS Defense (`ByteEndpoint`)**: `ByteEndpoint` is implemented directly for `ActorClient<A>`, decoding `bincode` payloads (`DefaultOptions::new().with_fixint_encoding().allow_trailing_bytes().with_limit(MAX_REMOTE_PAYLOAD_BYTES)`) with a strict **4 MiB** limit (`MAX_REMOTE_PAYLOAD_BYTES`) and forwarding them directly to the actor mailbox. Both `Ok(A::Response)` and domain errors `Err(A::Error)` are serialized symmetrically across the wire.
+2. **Type-Erased Byte Bridging & DoS Defense (`ByteEndpoint`)**: `ByteEndpoint` is implemented directly for `ActorClient<A>`, decoding `bincode` payloads (`DefaultOptions::new().with_fixint_encoding().reject_trailing_bytes().with_limit(MAX_REMOTE_PAYLOAD_BYTES)`) with a strict **4 MiB** limit (`MAX_REMOTE_PAYLOAD_BYTES`) and forwarding them directly to the actor mailbox. Both `Ok(A::Response)` and domain errors `Err(A::Error)` are serialized symmetrically across the wire.
 3. **Location Transparency (`AnyActorClient<A>`)**: Enum unifier (`AnyActorClient::Local(ActorClient<A>)` | `AnyActorClient::Remote(RemoteActorClient<A>)`) exposing `.call()`, `.call_timeout()`, and `.cast()`, mapping local `ActorError<A::Error>` variants into `RemoteActorError<A::Error>`.
-4. **Coordinated 2-Phase Graceful Shutdown**: `ActorNodeHandle::shutdown()` emits HTTP/2 `GOAWAY` and awaits completion of `serve_with_incoming_shutdown` until active in-flight RPCs drain (bounded in practice by per-call `timeout_ms` or `handler_timeout`), then calls `RootSupervisorHandle::shutdown()` so services and actors stop sequentially in reverse registration order according to each `ShutdownPolicy`.
+4. **Coordinated 2-Phase Graceful Shutdown**: `ActorNodeHandle::shutdown()` emits HTTP/2 `GOAWAY` and awaits completion of `serve_with_incoming_shutdown` until active in-flight RPCs drain (bounded by `with_drain_timeout(...)`, default `DEFAULT_DRAIN_TIMEOUT = 10s`), then calls `RootSupervisorHandle::shutdown()` so services and actors stop sequentially in reverse registration order according to each `ShutdownPolicy`.
 
 ### The Protobuf Contract
 

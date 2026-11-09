@@ -4,7 +4,8 @@
 
 > 📦 **Implementation Reference (`otp-actor`):**  
 > The architectural models, supervision hierarchies, and self-healing resilience strategies analyzed in this guide are implemented and battle-tested in the open-source Rust framework [**`otp-actor`**](https://github.com/AlfredWeirich/otp-actor) (available on [crates.io](https://crates.io/crates/otp-actor)).  
-> Inspired directly by Erlang/OTP, `otp-actor` brings hierarchical supervision trees (`RootSupervisor` → `ServiceSupervisor` → actors), OTP restart strategies (`OneForOne`, `OneForAll`, `RestForOne`), generic proactive resource caching, and stateful actors (`gen_server`-style) with transparent client re-binding to the [Tokio](https://tokio.rs) ecosystem.
+> Inspired directly by Erlang/OTP, `otp-actor` brings hierarchical supervision trees (`RootSupervisor` → `ServiceSupervisor` → actors), OTP restart strategies (`OneForOne`, `OneForAll`, `RestForOne`), generic proactive resource caching, and stateful actors (`gen_server`-style) with transparent client re-binding to the [Tokio](https://tokio.rs) ecosystem.  
+> It also supports distributed **remote actors** over gRPC with location transparency via the optional `remote` feature (see [Section 5.4](#54-distributed-actors-remote-communication-over-grpc-in-otp-actor) and the [GitHub repository](https://github.com/AlfredWeirich/otp-actor) for architecture details and multi-process examples).
 
 ---
 
@@ -1114,7 +1115,7 @@ Inside the host node, the gRPC handler receives untyped byte slices (`&[u8]`). T
 * When an actor is spawned, its typed `ActorClient<A>` is registered into an `ActorNodeRegistry` using either `registry.register_client(client)` (which automatically uses `client.service_name()` and `client.name()`) or `registry.register(service_name, actor_name, client)`.
 * Because `otp-actor` implements `ByteEndpoint` **directly for `ActorClient<A>`** (`impl<A> ByteEndpoint for ActorClient<A>`), `ActorNodeRegistry` stores each registered actor as an `Arc<dyn ByteEndpoint>` without extra wrapper indirection.
 * Upon receiving a gRPC call, `ByteEndpoint::call_bytes` decodes the payload into `A::Message` via bounded `bincode`, forwards it through `self.call` / `self.call_timeout` into the actor's Tokio mailbox channel, awaits `Result<A::Response, ActorError<A::Error>>`, and encodes `ok_payload`, `actor_error_payload`, or `framework_error` into the `CallResponse` envelope.
-* **DoS Protection:** Both client-side encoding and server-side decoding enforce a strict payload size cap (`MAX_REMOTE_PAYLOAD_BYTES = 4 * 1024 * 1024` = **4 MiB**, aligned with tonic's default HTTP/2 frame limit) via `bincode::DefaultOptions::new().with_fixint_encoding().allow_trailing_bytes().with_limit(...)`, rejecting oversized payloads or length-prefix allocation bombs before allocation.
+* **DoS Protection:** Both client-side encoding and server-side decoding enforce a strict payload size cap (`MAX_REMOTE_PAYLOAD_BYTES = 4 * 1024 * 1024` = **4 MiB**, aligned with tonic's default HTTP/2 frame limit) via `bincode::DefaultOptions::new().with_fixint_encoding().reject_trailing_bytes().with_limit(...)`, rejecting oversized payloads, trailing garbage bytes, or length-prefix allocation bombs before allocation.
 
 #### 3. Complete Location Transparency with `AnyActorClient<A>`
 In large-scale distributed architectures, components frequently migrate between monolithic co-location and separate microservice pods. If client code had to change its invocation style depending on where an actor runs, architectural refactoring would be cumbersome.
@@ -1197,7 +1198,7 @@ This makes it straightforward to implement domain commands like `AccountMsg::Clo
 When an actor node is decommissioned (during rolling deployments or cluster re-balancing), terminating tasks abruptly causes dropped in-flight requests and partial writes.
 
 `ActorNodeHandle` implements a deterministic **Two-Phase Graceful Shutdown** (`ActorNodeHandle::shutdown()`):
-1. **Phase 1: In-Flight Request Drainage:** Sending the shutdown trigger to `tonic`'s `serve_with_incoming_shutdown` stops accepting new connections, emits HTTP/2 `GOAWAY`, and awaits completion of active in-flight RPCs (bounded in practice by per-call `timeout_ms` or `handler_timeout` deadlines).
+1. **Phase 1: In-Flight Request Drainage:** Sending the shutdown trigger to `tonic`'s `serve_with_incoming_shutdown` stops accepting new connections, emits HTTP/2 `GOAWAY`, and awaits completion of active in-flight RPCs up to a configurable drain deadline (`with_drain_timeout(...)`, defaulting to `DEFAULT_DRAIN_TIMEOUT = 10s`).
 2. **Phase 2: Hierarchical Actor Tree Teardown:** Once active gRPC streams drain, if a `RootSupervisorHandle` was attached via `ActorNodeHandle::start(...)`, Phase 2 calls `root.shutdown().await?`. Registered service supervisors and their child actors are stopped sequentially in **reverse registration order**, granting each actor its configured `ShutdownPolicy` window (`Timeout`, `Infinity`, or `BrutalKill`) to flush buffers, persist state, and run `on_stop` before the process exits.
 
 *(Note: For cross-network deployments over untrusted networks, wrap the underlying `tonic::transport::Server` and client `Endpoint` with TLS, as `ActorNodeHandle::start` binds plaintext HTTP/2 TCP by default.)*
