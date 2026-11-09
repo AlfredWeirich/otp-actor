@@ -127,15 +127,15 @@ async fn main() {
     println!("--- Step 1: Initialize Supervision Hierarchy ---");
 
     // The root Supervisor oversees domain child Supervisors at the root level.
-    let root = Supervisor::new("root");
+    let root_supervisor = Supervisor::new("root");
 
     // The child Supervisor manages the concrete worker and stateful actors within a domain.
-    let auth_service = Supervisor::builder("auth-service")
-        .spawn(&root)
+    let child_supervisor = Supervisor::builder("auth-service")
+        .spawn(&root_supervisor)
         .await
         .expect("Failed to register child Supervisor with root Supervisor");
 
-    println!("  ✅ Root Supervisor and child Supervisor ('auth-service') active.\n");
+    println!("  ✅ Root Supervisor and child Supervisor active.\n");
 
     // ------------------------------------------------------------------
     // Step 2: Define Worker Logic (Resource Acquisition)
@@ -170,13 +170,13 @@ async fn main() {
     // ------------------------------------------------------------------
     println!("--- Step 3: Configure & Launch Actor ---");
 
-    let client = ResourceActor::builder("auth-token")
+    let actor = ResourceActor::builder("auth-token")
         .worker(token_worker)
         .restart_type(RestartType::Permanent) // Critical daemon: always restarted on termination
         .shutdown_timeout(Duration::from_secs(2)) // Graceful shutdown with 2s grace period for in-flight workers
         .eager_prewarm(true) // Pre-emptively fetch the resource in the background at boot time
         .expiry_buffer(Duration::from_secs(1)) // Proactively refresh 1 second before expiry
-        .spawn(&auth_service)
+        .spawn(&child_supervisor)
         .await
         .expect("Failed to spawn resource actor");
 
@@ -191,7 +191,7 @@ async fn main() {
 
     // 1st request: Instant 0-hop cache hit due to eager pre-warming!
     let start = Instant::now();
-    let token1 = client.get().await.expect("Failed to retrieve token");
+    let token1 = actor.get().await.expect("Failed to retrieve token");
     let elapsed1 = start.elapsed();
     println!(
         "  👉 1st fetch: \"{}\" (Latency: {:?}) -> Instant 0-hop cache hit!",
@@ -201,7 +201,7 @@ async fn main() {
 
     // 2nd request: Subsequent cache hit (worker is NOT re-invoked)
     let start = Instant::now();
-    let token2 = client.get().await.expect("Failed to retrieve token");
+    let token2 = actor.get().await.expect("Failed to retrieve token");
     let elapsed2 = start.elapsed();
     println!(
         "  👉 2nd fetch: \"{}\" (Latency: {:?}) -> Served directly from in-memory watch cache!",
@@ -220,7 +220,7 @@ async fn main() {
     println!("  💥 Triggering controlled actor crash via simulate_crash()...");
 
     // Simulate an abnormal exit/panic of the actor task
-    let _ = client.simulate_crash().await;
+    let _ = actor.simulate_crash().await;
 
     // Brief delay: Supervisor intercepts the termination and boots replacement instance #2
     tokio::time::sleep(Duration::from_millis(80)).await;
@@ -229,7 +229,7 @@ async fn main() {
         "  🔄 Client executes get() (detects disconnected channel & transparently rebinds)..."
     );
     let start = Instant::now();
-    let token_recovered = client
+    let token_recovered = actor
         .get()
         .await
         .expect("Transparent client self-healing failed");
@@ -250,13 +250,13 @@ async fn main() {
     println!("--- Step 6: Manual Refresh (force_refresh) ---");
     println!("  🔄 Forcing out-of-band cache invalidation & background refresh...");
 
-    client.force_refresh().await.expect("Force refresh failed");
+    actor.force_refresh().await.expect("Force refresh failed");
 
     // The refresh executes asynchronously in the background (non-blocking) so in-flight callers
     // are not stalled. Wait briefly (70ms) for the worker task to complete:
     tokio::time::sleep(Duration::from_millis(70)).await;
 
-    let fresh_token = client.get().await.expect("Failed to retrieve token");
+    let fresh_token = actor.get().await.expect("Failed to retrieve token");
     println!(
         "  ✅ Fresh token following forced refresh: \"{}\"\n",
         mask_secret(&fresh_token)
@@ -270,7 +270,7 @@ async fn main() {
     let audit_client = StatefulActorBuilder::from_default::<AuditCounterActor>("audit-counter")
         .restart_type(RestartType::Permanent)
         .shutdown_timeout(Duration::from_secs(2))
-        .spawn(&auth_service)
+        .spawn(&child_supervisor)
         .await
         .expect("Failed to spawn StatefulActor");
 
@@ -320,7 +320,7 @@ async fn main() {
         "  🛑 Cascading graceful shutdown across root Supervisor, child Supervisors, and all child actors..."
     );
 
-    root.shutdown().await.expect("Graceful shutdown failed");
+    root_supervisor.shutdown().await.expect("Graceful shutdown failed");
 
     println!(
         "  ✅ All active worker and stateful actors (including on_stop hooks) terminated cleanly.\n"
