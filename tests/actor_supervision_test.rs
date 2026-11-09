@@ -3345,3 +3345,250 @@ async fn test_root_supervisor_drop_aborts_services_even_with_active_handles() {
         "Expected ServiceSupervisor task to be aborted by SupervisedService::drop even when a command sender is still held"
     );
 }
+
+struct SlowDrainActor {
+    processed: Arc<AtomicUsize>,
+}
+
+impl StatefulActor for SlowDrainActor {
+    type Message = Duration;
+    type Response = usize;
+    type Error = String;
+
+    async fn handle(
+        &mut self,
+        sleep_dur: Self::Message,
+        _ctx: &mut ActorContext,
+    ) -> Result<Self::Response, Self::Error> {
+        if !sleep_dur.is_zero() {
+            tokio::time::sleep(sleep_dur).await;
+        }
+        Ok(self.processed.fetch_add(1, Ordering::SeqCst) + 1)
+    }
+}
+
+#[tokio::test]
+async fn test_stateful_actor_graceful_shutdown_drains_messages_queued_after_shutdown_envelope() {
+    let root = RootSupervisor::new();
+    let sup = ServiceSupervisor::spawn_and_register("drain-shutdown-svc", &root)
+        .await
+        .expect("Failed to spawn service supervisor");
+
+    let processed = Arc::new(AtomicUsize::new(0));
+    let p_clone = processed.clone();
+
+    let client = StatefulActorBuilder::new("drain-actor", move |_inst| SlowDrainActor {
+        processed: p_clone.clone(),
+    })
+    .spawn(&sup)
+    .await
+    .expect("Failed to spawn SlowDrainActor");
+
+    // 1. Start a slow 80ms call so the actor is busy inside `handle()`
+    let c1 = client.clone();
+    let slow_call = tokio::spawn(async move { c1.call(Duration::from_millis(80)).await });
+    tokio::time::sleep(Duration::from_millis(15)).await;
+
+    // 2. Initiate stop_child (which sends watch signal AND enqueues ActorEnvelope::Shutdown)
+    let sup_clone = sup.clone();
+    let stop_handle = tokio::spawn(async move { sup_clone.stop_child("drain-actor").await });
+    tokio::time::sleep(Duration::from_millis(15)).await;
+
+    // 3. Enqueue another message AFTER ActorEnvelope::Shutdown was placed in the mailbox
+    //    while the 80ms in-flight handler is still running (before receiver.close()).
+    let c2 = client.clone();
+    let queued_after_shutdown = tokio::spawn(async move { c2.call(Duration::ZERO).await });
+
+    assert_eq!(slow_call.await.unwrap().unwrap(), 1);
+    assert_eq!(
+        queued_after_shutdown
+            .await
+            .unwrap()
+            .expect("Message queued before receiver.close() must be drained, not dropped by Shutdown envelope"),
+        2
+    );
+    stop_handle.await.unwrap().unwrap();
+    assert_eq!(processed.load(Ordering::SeqCst), 2);
+
+    let _ = root.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_one_for_all_max_restarts_preserves_stopped_and_removes_temporary_siblings() {
+    let root = RootSupervisor::new();
+    let sup = ServiceSupervisor::builder("ofa-exhaust-svc")
+        .strategy(SupervisionStrategy::OneForAll)
+        .spawn(&root)
+        .await
+        .expect("Failed to spawn OneForAll supervisor");
+
+    let _stopped_client = StatefulActorBuilder::from_default::<CounterActor>("stopped-sib")
+        .spawn(&sup)
+        .await
+        .expect("Failed to spawn stopped-sib");
+
+    let _temp_client = StatefulActorBuilder::from_default::<CounterActor>("temp-sib")
+        .restart_type(RestartType::Temporary)
+        .spawn(&sup)
+        .await
+        .expect("Failed to spawn temp-sib");
+
+    let crash_client = StatefulActorBuilder::from_default::<CounterActor>("crashing-sib")
+        .restart_policy(RestartPolicy {
+            max_restarts: 0,
+            time_window: Duration::from_secs(5),
+            initial_backoff: Duration::from_millis(10),
+            max_backoff: Duration::from_millis(50),
+            backoff_multiplier: 1.0,
+        })
+        .spawn(&sup)
+        .await
+        .expect("Failed to spawn crashing-sib");
+
+    // Explicitly stop `stopped-sib` before the crash
+    sup.stop_child("stopped-sib").await.unwrap();
+
+    // Crash `crashing-sib` with `max_restarts: 0` so it immediately hits the exhaustion branch
+    crash_client.simulate_crash().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(40)).await;
+
+    assert!(matches!(
+        sup.resolve_actor_channel_untyped("crashing-sib").await,
+        Err(ServiceError::MaxRestartsExceeded(_, _, _))
+    ));
+    assert!(
+        matches!(
+            sup.resolve_actor_channel_untyped("stopped-sib").await,
+            Err(ServiceError::ActorNotFound(_))
+        ),
+        "Explicitly stopped sibling must remain ActorNotFound, not MaxRestartsExceeded"
+    );
+    assert!(
+        matches!(
+            sup.resolve_actor_channel_untyped("temp-sib").await,
+            Err(ServiceError::ActorNotFound(_))
+        ),
+        "Temporary sibling must be removed (ActorNotFound), not marked MaxRestartsExceeded"
+    );
+
+    let _ = root.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_stop_child_prevents_overlapping_start_child_while_on_stop_running() {
+    let root = RootSupervisor::new();
+    let sup = ServiceSupervisor::spawn_and_register("stop-overlap-svc", &root)
+        .await
+        .expect("Failed to spawn service supervisor");
+
+    let active_instances = Arc::new(AtomicUsize::new(0));
+    let overlap_detected = Arc::new(AtomicBool::new(false));
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let make_spec = || {
+        let ai = active_instances.clone();
+        let od = overlap_detected.clone();
+        let ev = events.clone();
+        StatefulActorBuilder::new("slow-stop-actor", move |inst| {
+            ExclusiveResourceSiblingActor {
+                instance_id: inst,
+                active_instances: ai.clone(),
+                overlap_detected: od.clone(),
+                events: ev.clone(),
+            }
+        })
+        .build_child_spec()
+    };
+
+    sup.start_child(make_spec()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(15)).await;
+
+    // Begin stop_child in background (on_stop sleeps 50ms in ExclusiveResourceSiblingActor)
+    let sup_for_stop = sup.clone();
+    let stop_task = tokio::spawn(async move { sup_for_stop.stop_child("slow-stop-actor").await });
+    tokio::time::sleep(Duration::from_millis(15)).await;
+
+    // Attempting to start_child with the same name while on_stop is still running must fail with ActorAlreadyExists
+    let overlap_start = sup.start_child(make_spec()).await;
+    assert!(
+        matches!(overlap_start, Err(ServiceError::ActorAlreadyExists(_))),
+        "start_child must reject duplicate spawn while old instance is still running on_stop"
+    );
+
+    // Wait for stop_child to finish; now start_child must succeed cleanly without overlap!
+    stop_task.await.unwrap().unwrap();
+    sup.start_child(make_spec())
+        .await
+        .expect("start_child must succeed immediately after stop_child completes");
+
+    let client = sup
+        .get_actor_client::<ExclusiveResourceSiblingActor>("slow-stop-actor")
+        .await
+        .unwrap();
+    assert_eq!(client.call(false).await.unwrap(), 2);
+    assert!(
+        !overlap_detected.load(Ordering::SeqCst),
+        "Old on_stop and new on_start must never overlap"
+    );
+
+    let _ = root.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_restart_tracker_enforces_max_restarts_when_backoff_exceeds_time_window_and_delete_service()
+ {
+    let root = RootSupervisor::new();
+    let sup = ServiceSupervisor::spawn_and_register("backoff-window-svc", &root)
+        .await
+        .expect("Failed to spawn service supervisor");
+
+    // Configure initial_backoff (45ms) > time_window (30ms) with max_restarts = 1.
+    // Previously, the 45ms backoff sleep caused the first crash timestamp to age out of the 30ms
+    // time_window before instance 2 even spawned, allowing infinite restarts!
+    let client = StatefulActorBuilder::from_default::<CounterActor>("backoff-window-actor")
+        .restart_policy(RestartPolicy {
+            max_restarts: 1,
+            time_window: Duration::from_millis(30),
+            initial_backoff: Duration::from_millis(45),
+            max_backoff: Duration::from_millis(100),
+            backoff_multiplier: 2.0,
+        })
+        .spawn(&sup)
+        .await
+        .expect("Failed to spawn actor");
+
+    // Crash 1 (allowed, sleeps 45ms backoff and spawns instance 2)
+    client.simulate_crash().await.unwrap();
+    let (_, inst) = client
+        .call_retry(CounterMsg::GetWithInstance)
+        .await
+        .expect("Instance 2 should spawn after first crash");
+    assert_eq!(inst, 2);
+
+    // Crash 2 immediately (active runtime < 30ms time_window -> must exceed max_restarts = 1!)
+    client.simulate_crash().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let res = client.call_retry(CounterMsg::GetWithInstance).await;
+    assert!(
+        matches!(
+            res,
+            Err(otp_actor::ActorError::Service(
+                ServiceError::MaxRestartsExceeded(_, 1, _)
+            ))
+        ),
+        "Expected MaxRestartsExceeded even when backoff > time_window, got {:?}",
+        res
+    );
+
+    // Verify RootSupervisorHandle::delete_service gracefully stops and removes the service
+    root.delete_service("backoff-window-svc")
+        .await
+        .expect("delete_service should succeed");
+    assert!(matches!(
+        root.resolve_service_channel("backoff-window-svc").await,
+        Err(RootError::ServiceNotFound(_))
+    ));
+
+    let _ = root.shutdown().await;
+}

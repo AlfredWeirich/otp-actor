@@ -6,6 +6,7 @@ use tokio::sync::oneshot;
 use tonic::{Request, Response, Status};
 
 use crate::actor::RootSupervisorHandle;
+use crate::remote::endpoint::MAX_GRPC_FRAME_BYTES;
 use crate::remote::proto::call_response::Result as CallResult;
 use crate::remote::proto::{
     ActorNode, ActorNodeServer, CallRequest, CallResponse, CastRequest, CastResponse,
@@ -102,7 +103,10 @@ impl ActorNodeHandle {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
         let service = ActorNodeService::new(registry.clone());
-        let server = tonic::transport::Server::builder().add_service(ActorNodeServer::new(service));
+        let svc = ActorNodeServer::new(service)
+            .max_decoding_message_size(MAX_GRPC_FRAME_BYTES)
+            .max_encoding_message_size(MAX_GRPC_FRAME_BYTES);
+        let server = tonic::transport::Server::builder().add_service(svc);
 
         let server_task = tokio::spawn(async move {
             let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);

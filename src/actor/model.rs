@@ -132,7 +132,7 @@ impl RestartTracker {
     pub fn record_crash(&mut self) -> Option<Duration> {
         let now = Instant::now();
         self.restarts
-            .retain(|&t| now.duration_since(t) <= self.policy.time_window);
+            .retain(|&t| now.saturating_duration_since(t) <= self.policy.time_window);
 
         // If all past crashes are outside the time window, the component has stabilized:
         // reset consecutive failures so backoff does not stay permanently saturated!
@@ -161,6 +161,16 @@ impl RestartTracker {
         };
 
         Some(backoff)
+    }
+
+    /// Offsets recorded crash timestamps by a scheduled supervisor backoff sleep duration so that
+    /// `time_window` tracks active runtime rather than expiring while waiting in backoff.
+    pub(crate) fn offset_for_backoff(&mut self, backoff: Duration) {
+        if !backoff.is_zero() {
+            for t in &mut self.restarts {
+                *t += backoff;
+            }
+        }
     }
 }
 

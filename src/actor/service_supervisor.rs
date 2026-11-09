@@ -440,7 +440,7 @@ impl ServiceSupervisor {
     fn spawn_child_from_spec(&mut self, spec: ChildSpec) -> Result<(), ServiceError> {
         let name = spec.name;
         if let Some(existing) = self.actors.get(&name)
-            && !existing.is_stopped
+            && (!existing.is_stopped || !*existing.term_rx.borrow())
         {
             tracing::warn!(
                 supervisor = %self.name,
@@ -734,7 +734,7 @@ impl ServiceSupervisor {
                             let already_running = self
                                 .actors
                                 .get(&spec.name)
-                                .is_some_and(|a| !a.is_stopped);
+                                .is_some_and(|a| !a.is_stopped || !*a.term_rx.borrow());
                             if already_running {
                                 let _ = respond_to.send(Err(ServiceError::ActorAlreadyExists(spec.name)));
                             } else {
@@ -809,7 +809,9 @@ impl ServiceSupervisor {
                             for target_name in actors_to_restart.iter().rev() {
                                 let ticket = self.allocate_restart_ticket();
                                 if let Some(entry) = self.actors.get_mut(target_name) {
-                                    if target_name != &actor_name && entry.is_stopped {
+                                    if target_name != &actor_name
+                                        && (entry.is_stopped || entry.is_stopping)
+                                    {
                                         continue;
                                     }
                                     let is_running = !*entry.term_rx.borrow();
@@ -872,6 +874,7 @@ impl ServiceSupervisor {
                                             temp_name,
                                             &mut entry,
                                         );
+                                        term_receivers.push(rx.clone());
                                         tokio::spawn(async move {
                                             let _ = rx.wait_for(|&done| done).await;
                                             drop(entry);
@@ -886,6 +889,7 @@ impl ServiceSupervisor {
                                     self.actors.get(name).and_then(|entry| {
                                         if name != &actor_name
                                             && (entry.is_stopped
+                                                || entry.is_stopping
                                                 || entry.restart_type == RestartType::Temporary)
                                         {
                                             None
@@ -917,8 +921,14 @@ impl ServiceSupervisor {
                                     .write()
                                     .await
                                     .retain(|s| s.name != actor_name);
-                                if entry.is_stopped {
+                                if entry.is_stopped && *entry.term_rx.borrow() {
                                     let _ = respond_to.send(Ok(()));
+                                } else if entry.is_stopping {
+                                    let mut term_rx = entry.term_rx.clone();
+                                    tokio::spawn(async move {
+                                        let _ = term_rx.wait_for(|&done| done).await;
+                                        let _ = respond_to.send(Ok(()));
+                                    });
                                 } else {
                                     Self::trigger_child_shutdown(
                                         self.name.clone(),
@@ -945,7 +955,7 @@ impl ServiceSupervisor {
                                         actor_name.clone(),
                                     )));
                                 }
-                                let is_running = !entry.is_stopped && !*entry.term_rx.borrow();
+                                let is_running = !*entry.term_rx.borrow();
                                 if is_running {
                                     let mut term_rx = Self::initiate_actor_termination(
                                         self.name.clone(),
@@ -993,7 +1003,7 @@ impl ServiceSupervisor {
                     if let Ok((actor_name, inst_id, task_result)) = join_res {
                         // 1. Ignore stale exit events from older superseded actor instances
                         let (restart_type, is_stopping, is_restarting, is_failed) =
-                            match self.actors.get(&actor_name) {
+                            match self.actors.get_mut(&actor_name) {
                                 Some(entry) if inst_id < entry.instance_id => {
                                     tracing::debug!(
                                         supervisor = %self.name,
@@ -1004,12 +1014,18 @@ impl ServiceSupervisor {
                                     );
                                     continue;
                                 }
-                                Some(entry) => (
-                                    entry.restart_type,
-                                    entry.is_stopping,
-                                    entry.is_restarting,
-                                    entry.is_failed,
-                                ),
+                                Some(entry) => {
+                                    let info = (
+                                        entry.restart_type,
+                                        entry.is_stopping,
+                                        entry.is_restarting,
+                                        entry.is_failed,
+                                    );
+                                    if entry.is_stopping {
+                                        entry.is_stopping = false;
+                                    }
+                                    info
+                                }
                                 None => continue,
                             };
 
@@ -1183,7 +1199,11 @@ impl ServiceSupervisor {
 
                         // Check crash limit and compute backoff on the actor that triggered the crash
                         let maybe_backoff = if let Some(actor_entry) = self.actors.get_mut(&actor_name) {
-                            actor_entry.restart_tracker.record_crash()
+                            let res = actor_entry.restart_tracker.record_crash();
+                            if let Some(backoff) = res {
+                                actor_entry.restart_tracker.offset_for_backoff(backoff);
+                            }
+                            res
                         } else {
                             Some(Duration::ZERO)
                         };
@@ -1197,7 +1217,9 @@ impl ServiceSupervisor {
                                 for target_name in actors_to_restart.iter().rev() {
                                     let ticket = self.allocate_restart_ticket();
                                     if let Some(entry) = self.actors.get_mut(target_name) {
-                                        if target_name != &actor_name && entry.is_stopped {
+                                        if target_name != &actor_name
+                                            && (entry.is_stopped || entry.is_stopping)
+                                        {
                                             continue;
                                         }
                                         let is_running =
@@ -1237,6 +1259,7 @@ impl ServiceSupervisor {
                                                 temp_name,
                                                 &mut entry,
                                             );
+                                            term_receivers.push(rx.clone());
                                             tokio::spawn(async move {
                                                 let _ = rx.wait_for(|&done| done).await;
                                                 drop(entry);
@@ -1249,7 +1272,8 @@ impl ServiceSupervisor {
                                     .iter()
                                     .filter_map(|name| {
                                         self.actors.get(name).and_then(|entry| {
-                                            if (name != &actor_name && entry.is_stopped)
+                                            if (name != &actor_name
+                                                && (entry.is_stopped || entry.is_stopping))
                                                 || entry.restart_type == RestartType::Temporary
                                             {
                                                 None
@@ -1301,11 +1325,21 @@ impl ServiceSupervisor {
                                     "🛑 CRASH-LOOP DETECTED: Actor exceeded max restarts! Marking restart group as permanently FAILED."
                                 );
 
+                                let mut temp_to_remove = Vec::new();
                                 for target_name in actors_to_restart.iter().rev() {
                                     let ticket = self.allocate_restart_ticket();
                                     if let Some(entry) = self.actors.get_mut(target_name) {
+                                        if target_name != &actor_name
+                                            && (entry.is_stopped || entry.is_stopping)
+                                        {
+                                            continue;
+                                        }
                                         let is_running =
                                             target_name != &actor_name && !*entry.term_rx.borrow();
+                                        if entry.restart_type == RestartType::Temporary {
+                                            temp_to_remove.push((target_name.clone(), is_running));
+                                            continue;
+                                        }
                                         entry.is_failed = true;
                                         entry.is_restarting = false;
                                         entry.restart_ticket = ticket;
@@ -1323,6 +1357,32 @@ impl ServiceSupervisor {
                                                 target_name.clone(),
                                                 entry,
                                             );
+                                        }
+                                    }
+                                }
+
+                                for (temp_name, is_running) in temp_to_remove {
+                                    self.actor_order.retain(|n| n != &temp_name);
+                                    self.child_specs
+                                        .write()
+                                        .await
+                                        .retain(|s| s.name != temp_name);
+                                    if let Some(mut entry) = self.actors.remove(&temp_name) {
+                                        for waiter in entry.pending_resolutions.drain(..) {
+                                            let _ = waiter.send(Err(ServiceError::ActorNotFound(
+                                                temp_name.clone(),
+                                            )));
+                                        }
+                                        if is_running {
+                                            let mut rx = Self::initiate_actor_termination(
+                                                self.name.clone(),
+                                                temp_name,
+                                                &mut entry,
+                                            );
+                                            tokio::spawn(async move {
+                                                let _ = rx.wait_for(|&done| done).await;
+                                                drop(entry);
+                                            });
                                         }
                                     }
                                 }
@@ -1411,7 +1471,7 @@ impl ServiceSupervisor {
 #[derive(Clone)]
 pub struct ServiceSupervisorHandle {
     name: String,
-    sender: Arc<RwLock<Sender<ServiceSupervisorCommand>>>,
+    sender: Arc<std::sync::RwLock<Sender<ServiceSupervisorCommand>>>,
     root: Option<RootSupervisorHandle>,
 }
 
@@ -1424,7 +1484,7 @@ impl ServiceSupervisorHandle {
     ) -> Self {
         Self {
             name: name.into(),
-            sender: Arc::new(RwLock::new(sender)),
+            sender: Arc::new(std::sync::RwLock::new(sender)),
             root,
         }
     }
@@ -1440,7 +1500,10 @@ impl ServiceSupervisorHandle {
         &self,
     ) -> Result<Sender<ServiceSupervisorCommand>, ServiceError> {
         {
-            let guard = self.sender.read().await;
+            let guard = self
+                .sender
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if !guard.is_closed() {
                 return Ok(guard.clone());
             }
@@ -1449,15 +1512,20 @@ impl ServiceSupervisorHandle {
         if let Some(root) = &self.root {
             match root.resolve_service_channel(&self.name).await {
                 Ok(new_sender) if !new_sender.is_closed() => {
-                    let mut guard = self.sender.write().await;
-                    *guard = new_sender.clone();
+                    *self
+                        .sender
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = new_sender.clone();
                     return Ok(new_sender);
                 }
                 _ => return Err(ServiceError::ServiceUnavailable),
             }
         }
 
-        let guard = self.sender.read().await;
+        let guard = self
+            .sender
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if guard.is_closed() {
             Err(ServiceError::ServiceUnavailable)
         } else {
@@ -1532,7 +1600,10 @@ impl ServiceSupervisorHandle {
     pub async fn shutdown(&self) -> Result<(), ServiceError> {
         let (tx, rx) = oneshot::channel();
         let cmd_sender = {
-            let guard = self.sender.read().await;
+            let guard = self
+                .sender
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if guard.is_closed() {
                 return Ok(());
             }

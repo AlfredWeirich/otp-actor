@@ -449,7 +449,8 @@ impl<A: StatefulActor> StatefulActorRunner<A> {
                         return Err(reason.clone());
                     }
                 }
-                ActorEnvelope::Shutdown | ActorEnvelope::SimulateCrash => break,
+                ActorEnvelope::Shutdown => continue,
+                ActorEnvelope::SimulateCrash => break,
             }
         }
 
@@ -494,6 +495,8 @@ impl<A: StatefulActor> StatefulActorRunner<A> {
             }
 
             tokio::select! {
+                biased;
+
                 Ok(()) = self.shutdown_rx.changed() => {
                     if *self.shutdown_rx.borrow() {
                         return self.finish_graceful_shutdown(&mut ctx).await;
@@ -636,25 +639,37 @@ impl<A: StatefulActor> ActorClient<A> {
 
     /// Re-resolves the actor's mailbox channel from the [`ServiceSupervisorHandle`] after a crash.
     async fn rebind_channel(&self) -> Result<(), ActorError<A::Error>> {
-        match self
-            .supervisor
-            .resolve_actor_channel::<Sender<ActorEnvelope<A>>>(&self.name)
-            .await
-        {
-            Ok(new_sender) if !new_sender.is_closed() => {
-                *self
-                    .sender
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = new_sender;
-                tracing::info!(
-                    actor = %self.name,
-                    "🔄 ActorClient channel re-established with replacement actor!"
-                );
-                Ok(())
+        for retry in 0..4 {
+            match self
+                .supervisor
+                .resolve_actor_channel::<Sender<ActorEnvelope<A>>>(&self.name)
+                .await
+            {
+                Ok(new_sender) if !new_sender.is_closed() => {
+                    *self
+                        .sender
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = new_sender;
+                    tracing::info!(
+                        actor = %self.name,
+                        "🔄 ActorClient channel re-established with replacement actor!"
+                    );
+                    return Ok(());
+                }
+                Ok(_) => {
+                    // The actor closed its receiver, but its task termination guard has not yet
+                    // been observed by the supervisor. Yield/pause briefly so `term_rx` updates
+                    // and the next resolution parks on `pending_resolutions`.
+                    if retry == 0 {
+                        tokio::task::yield_now().await;
+                    } else {
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                    }
+                }
+                Err(err) => return Err(ActorError::Service(err)),
             }
-            Ok(_) => Err(ActorError::ActorUnavailable),
-            Err(err) => Err(ActorError::Service(err)),
         }
+        Err(ActorError::ActorUnavailable)
     }
 
     /// Re-binds the direct channel immediately if the supervisor has already replaced the actor
@@ -673,7 +688,7 @@ impl<A: StatefulActor> ActorClient<A> {
                 Err(_) if first_try => {
                     tokio::time::sleep(REBIND_BACKOFF).await;
                 }
-                Err(_) => return Ok(()),
+                Err(err) => return Err(err),
             }
         }
         Ok(())

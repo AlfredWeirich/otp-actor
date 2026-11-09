@@ -15,6 +15,13 @@ use crate::remote::proto::{CallResponse, CastResponse, RemoteError};
 /// to guard against untrusted length-prefix allocation bombs.
 pub const MAX_REMOTE_PAYLOAD_BYTES: u64 = 4 * 1024 * 1024;
 
+/// Maximum gRPC Protobuf frame size (4 MiB payload + 64 KiB envelope headroom)
+/// configured on Tonic server and client codecs so full 4 MiB payloads do not fail frame decoding.
+pub const MAX_GRPC_FRAME_BYTES: usize = (MAX_REMOTE_PAYLOAD_BYTES as usize) + 64 * 1024;
+
+/// Default backpressure timeout for remote `cast` operations before returning `MailboxFull`.
+pub const DEFAULT_REMOTE_CAST_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Encodes a value using bounded bincode options compatible with standard fixed-int encoding.
 pub(crate) fn encode_payload<T: serde::Serialize>(val: &T) -> Result<Vec<u8>, bincode::Error> {
     bincode::DefaultOptions::new()
@@ -132,12 +139,21 @@ where
                 }
             };
 
-            match self.cast(msg).await {
-                Ok(()) => CastResponse {
+            match tokio::time::timeout(DEFAULT_REMOTE_CAST_TIMEOUT, self.cast(msg)).await {
+                Ok(Ok(())) => CastResponse {
                     framework_error: None,
                 },
-                Err(err) => CastResponse {
+                Ok(Err(err)) => CastResponse {
                     framework_error: Some(err.into()),
+                },
+                Err(_) => CastResponse {
+                    framework_error: Some(RemoteError {
+                        kind: Kind::MailboxFull as i32,
+                        message: format!(
+                            "Remote actor mailbox remained full for {:?}",
+                            DEFAULT_REMOTE_CAST_TIMEOUT
+                        ),
+                    }),
                 },
             }
         })

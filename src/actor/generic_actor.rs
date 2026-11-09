@@ -1328,32 +1328,41 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static> Resourc
 
     /// Resolves and updates the internal sender channel from the [`ServiceSupervisorHandle`].
     async fn rebind_channel(&self) -> Result<(), ResourceError<E>> {
-        match self
-            .supervisor
-            .resolve_actor_channel::<Sender<ResourceCommand<T, E>>>(&self.name)
-            .await
-        {
-            Ok(new_sender) if !new_sender.is_closed() => {
-                *self
-                    .sender
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = new_sender;
-                tracing::info!(
-                    actor = %self.name,
-                    "🔄 Channel re-established with replacement actor! Retrying direct request..."
-                );
-                Ok(())
-            }
-            Ok(_) => Err(ResourceError::ActorUnavailable),
-            Err(err) => {
-                tracing::error!(
-                    actor = %self.name,
-                    error = ?err,
-                    "❌ Failed to rebind channel."
-                );
-                Err(ResourceError::Service(err))
+        for retry in 0..4 {
+            match self
+                .supervisor
+                .resolve_actor_channel::<Sender<ResourceCommand<T, E>>>(&self.name)
+                .await
+            {
+                Ok(new_sender) if !new_sender.is_closed() => {
+                    *self
+                        .sender
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = new_sender;
+                    tracing::info!(
+                        actor = %self.name,
+                        "🔄 Channel re-established with replacement actor! Retrying direct request..."
+                    );
+                    return Ok(());
+                }
+                Ok(_) => {
+                    if retry == 0 {
+                        tokio::task::yield_now().await;
+                    } else {
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                    }
+                }
+                Err(err) => {
+                    tracing::error!(
+                        actor = %self.name,
+                        error = ?err,
+                        "❌ Failed to rebind channel."
+                    );
+                    return Err(ResourceError::Service(err));
+                }
             }
         }
+        Err(ResourceError::ActorUnavailable)
     }
 
     /// Re-binds the direct channel immediately if the supervisor has already replaced the actor
@@ -1372,7 +1381,7 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static> Resourc
                 Err(_) if first_try => {
                     tokio::time::sleep(REBIND_BACKOFF).await;
                 }
-                Err(_) => return Ok(()),
+                Err(err) => return Err(err),
             }
         }
         Ok(())

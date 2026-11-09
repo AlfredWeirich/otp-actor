@@ -56,6 +56,11 @@ pub(crate) enum RootCommand {
         service_name: String,
         respond_to: oneshot::Sender<Result<(), RootError>>,
     },
+    /// Gracefully stops (if running) and completely removes a service supervisor from the root registry.
+    DeleteService {
+        service_name: String,
+        respond_to: oneshot::Sender<Result<(), RootError>>,
+    },
     /// Gracefully shuts down the entire supervision tree (all services and their child actors).
     Shutdown { respond_to: oneshot::Sender<()> },
 }
@@ -348,7 +353,7 @@ impl RootSupervisor {
                             let already_running = self
                                 .services
                                 .get(&name)
-                                .is_some_and(|s| !s.is_stopped);
+                                .is_some_and(|s| !s.is_stopped || !*s.term_rx.borrow());
                             if already_running {
                                 let _ = respond_to.send(Err(RootError::ServiceAlreadyExists(name)));
                                 continue;
@@ -411,7 +416,10 @@ impl RootSupervisor {
                                     )));
                                 } else if service.is_stopped || service.is_stopping {
                                     let _ = respond_to.send(Err(RootError::ServiceNotFound(service_name)));
-                                } else if service.is_restarting || service.sender.is_closed() {
+                                } else if service.is_restarting
+                                    || service.sender.is_closed()
+                                    || *service.term_rx.borrow()
+                                {
                                     service.pending_resolutions.push(respond_to);
                                 } else {
                                     let _ = respond_to.send(Ok(service.sender.clone()));
@@ -446,7 +454,7 @@ impl RootSupervisor {
                         RootCommand::RestartService { service_name, respond_to } => {
                             let ticket = self.allocate_restart_ticket();
                             if let Some(service) = self.services.get_mut(&service_name) {
-                                let is_running = !service.is_stopped && !*service.term_rx.borrow();
+                                let is_running = !*service.term_rx.borrow();
                                 service.is_failed = false;
                                 service.is_stopped = false;
                                 service.is_stopping = false;
@@ -481,8 +489,14 @@ impl RootSupervisor {
                         RootCommand::StopService { service_name, respond_to } => {
                             let ticket = self.allocate_restart_ticket();
                             if let Some(entry) = self.services.get_mut(&service_name) {
-                                if entry.is_stopped {
+                                if entry.is_stopped && *entry.term_rx.borrow() {
                                     let _ = respond_to.send(Ok(()));
+                                } else if entry.is_stopping {
+                                    let mut term_rx = entry.term_rx.clone();
+                                    tokio::spawn(async move {
+                                        let _ = term_rx.wait_for(|&done| done).await;
+                                        let _ = respond_to.send(Ok(()));
+                                    });
                                 } else {
                                     Self::trigger_service_shutdown(
                                         service_name,
@@ -490,6 +504,33 @@ impl RootSupervisor {
                                         ticket,
                                         Some(respond_to),
                                     );
+                                }
+                            } else {
+                                let _ = respond_to.send(Err(RootError::ServiceNotFound(service_name)));
+                            }
+                        }
+
+                        RootCommand::DeleteService { service_name, respond_to } => {
+                            if let Some(mut entry) = self.services.remove(&service_name) {
+                                self.service_order.retain(|n| n != &service_name);
+                                for waiter in entry.pending_resolutions.drain(..) {
+                                    let _ = waiter.send(Err(RootError::ServiceNotFound(
+                                        service_name.clone(),
+                                    )));
+                                }
+                                let is_running = !*entry.term_rx.borrow();
+                                if is_running {
+                                    let mut term_rx = Self::initiate_service_termination(
+                                        service_name,
+                                        &mut entry,
+                                    );
+                                    tokio::spawn(async move {
+                                        let _ = term_rx.wait_for(|&done| done).await;
+                                        drop(entry);
+                                        let _ = respond_to.send(Ok(()));
+                                    });
+                                } else {
+                                    let _ = respond_to.send(Ok(()));
                                 }
                             } else {
                                 let _ = respond_to.send(Err(RootError::ServiceNotFound(service_name)));
@@ -507,12 +548,15 @@ impl RootSupervisor {
 
                 Some(join_res) = self.join_set.join_next() => {
                     if let Ok((service_name, inst_id, task_res)) = join_res {
-                        if let Some(entry) = self.services.get(&service_name)
+                        if let Some(entry) = self.services.get_mut(&service_name)
                             && (inst_id < entry.instance_id
                                 || entry.is_stopping
                                 || entry.is_restarting
                                 || entry.is_failed)
                         {
+                            if inst_id == entry.instance_id && entry.is_stopping {
+                                entry.is_stopping = false;
+                            }
                             continue;
                         }
 
@@ -551,7 +595,11 @@ impl RootSupervisor {
                         );
 
                         let maybe_backoff = if let Some(service_entry) = self.services.get_mut(&service_name) {
-                            service_entry.restart_tracker.record_crash()
+                            let res = service_entry.restart_tracker.record_crash();
+                            if let Some(backoff) = res {
+                                service_entry.restart_tracker.offset_for_backoff(backoff);
+                            }
+                            res
                         } else {
                             Some(Duration::ZERO)
                         };
@@ -714,6 +762,21 @@ impl RootSupervisorHandle {
         let (tx, rx) = oneshot::channel();
         self.sender
             .send(RootCommand::StopService {
+                service_name: service_name.into(),
+                respond_to: tx,
+            })
+            .await
+            .map_err(|_| RootError::RootUnavailable)?;
+
+        rx.await.map_err(|_| RootError::RootUnavailable)?
+    }
+
+    /// Gracefully stops (if running) and completely removes a service supervisor's specification and state
+    /// from the root supervisor.
+    pub async fn delete_service(&self, service_name: impl Into<String>) -> Result<(), RootError> {
+        let (tx, rx) = oneshot::channel();
+        self.sender
+            .send(RootCommand::DeleteService {
                 service_name: service_name.into(),
                 respond_to: tx,
             })

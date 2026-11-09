@@ -5,7 +5,7 @@ use std::time::Duration;
 use tonic::transport::{Channel, Endpoint};
 
 use crate::actor::{ActorClient, StatefulActor};
-use crate::remote::endpoint::{decode_payload, encode_payload};
+use crate::remote::endpoint::{MAX_GRPC_FRAME_BYTES, decode_payload, encode_payload};
 use crate::remote::error::RemoteActorError;
 use crate::remote::proto::call_response::Result as CallResult;
 use crate::remote::proto::{ActorNodeClient, CallRequest, CastRequest};
@@ -120,7 +120,9 @@ impl<A: StatefulActor> RemoteActorClient<A> {
             request.set_timeout(dur);
         }
 
-        let mut client = ActorNodeClient::new(self.channel.clone());
+        let mut client = ActorNodeClient::new(self.channel.clone())
+            .max_decoding_message_size(MAX_GRPC_FRAME_BYTES)
+            .max_encoding_message_size(MAX_GRPC_FRAME_BYTES);
         let response = client.call(request).await?.into_inner();
 
         match response.result {
@@ -153,7 +155,9 @@ impl<A: StatefulActor> RemoteActorClient<A> {
             payload,
         };
 
-        let mut client = ActorNodeClient::new(self.channel.clone());
+        let mut client = ActorNodeClient::new(self.channel.clone())
+            .max_decoding_message_size(MAX_GRPC_FRAME_BYTES)
+            .max_encoding_message_size(MAX_GRPC_FRAME_BYTES);
         let response = client.cast(request).await?.into_inner();
 
         if let Some(err) = response.framework_error {
@@ -191,7 +195,7 @@ impl<A: StatefulActor> AnyActorClient<A> {
     where
         A::Message: serde::Serialize,
         A::Response: serde::de::DeserializeOwned,
-        A::Error: serde::de::DeserializeOwned + ToString,
+        A::Error: serde::de::DeserializeOwned,
     {
         match self {
             Self::Local(client) => client.call(msg).await.map_err(Self::map_local_error),
@@ -208,7 +212,7 @@ impl<A: StatefulActor> AnyActorClient<A> {
     where
         A::Message: serde::Serialize,
         A::Response: serde::de::DeserializeOwned,
-        A::Error: serde::de::DeserializeOwned + ToString,
+        A::Error: serde::de::DeserializeOwned,
     {
         match self {
             Self::Local(client) => client
@@ -223,7 +227,6 @@ impl<A: StatefulActor> AnyActorClient<A> {
     pub async fn cast(&self, msg: A::Message) -> Result<(), RemoteActorError<A::Error>>
     where
         A::Message: serde::Serialize,
-        A::Error: ToString,
     {
         match self {
             Self::Local(client) => client.cast(msg).await.map_err(Self::map_local_error),
