@@ -27,6 +27,14 @@ impl ActorNodeService {
 
 #[tonic::async_trait]
 impl ActorNode for ActorNodeService {
+    #[tracing::instrument(
+        name = "grpc_call",
+        skip(self, request),
+        fields(
+            service = %request.get_ref().service_name,
+            actor = %request.get_ref().actor_name,
+        )
+    )]
     async fn call(&self, request: Request<CallRequest>) -> Result<Response<CallResponse>, Status> {
         let req = request.into_inner();
         let timeout = req.timeout_ms.map(Duration::from_millis);
@@ -44,6 +52,14 @@ impl ActorNode for ActorNodeService {
         Ok(Response::new(response))
     }
 
+    #[tracing::instrument(
+        name = "grpc_cast",
+        skip(self, request),
+        fields(
+            service = %request.get_ref().service_name,
+            actor = %request.get_ref().actor_name,
+        )
+    )]
     async fn cast(&self, request: Request<CastRequest>) -> Result<Response<CastResponse>, Status> {
         let req = request.into_inner();
 
