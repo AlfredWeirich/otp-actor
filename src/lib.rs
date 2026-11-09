@@ -5,7 +5,7 @@
 //!
 //! ## Architectural Pillars
 //!
-//! `otp-actor` combines three core capabilities:
+//! `otp-actor` combines four core capabilities:
 //!
 //! 1. **Hierarchical Supervision Tree** ([`RootSupervisor`] &rarr; [`ServiceSupervisor`] &rarr; child actors):
 //!    - Detects task exits and unhandled panics, isolating failures within subsystems.
@@ -32,16 +32,21 @@
 //!    - Controlled failure escalation via [`ActorContext::fail`], triggering supervisor recovery while returning an immediate error to the caller.
 //!    - Supervised alongside [`GenericResourceActor`] under the same supervision tree.
 //!
+//! 4. **Remote Actors over gRPC** (`--features remote`, see `otp_actor::remote`):
+//!    - Extends [`StatefulActor`] messaging across processes and hosts over HTTP/2 gRPC (`proto/actor_node.proto`) with bounded `bincode` payloads (&le; 4 MiB).
+//!    - Location transparency via `RemoteActorClient` and `AnyActorClient` (`Local` vs. `Remote`) with host-side re-binding via `ActorClient` / `ByteEndpoint`.
+//!    - Coordinated 2-phase graceful shutdown via `ActorNodeHandle::shutdown` (HTTP/2 `GOAWAY` request drainage followed by [`RootSupervisorHandle::shutdown`]).
+//!
 //! ## Control Plane vs. Data Plane
 //!
 //! A core design principle is the strict decoupling of the control plane and the data plane:
 //!
-//! - **Data Plane (Direct 1-Hop)**: Clients ([`ResourceClient`], [`ActorClient`]) hold direct bounded `mpsc`
-//!   channels to the actor mailboxes. Requests never traverse supervisors, eliminating bottlenecks.
+//! - **Data Plane (Direct 1-Hop / gRPC Bridge)**: In-process clients ([`ResourceClient`], [`ActorClient`]) hold direct bounded `mpsc`
+//!   channels to the actor mailboxes, while remote clients traverse gRPC into a registered `ActorClient` (`ByteEndpoint`). Requests never traverse supervisors, eliminating bottlenecks.
 //! - **Control Plane (Supervisors)**: Supervisors own task handles, monitor exits/panics, manage lifecycle transitions,
 //!   and maintain active channel registries.
 //! - **Transparent Self-Healing**: If an actor crashes, its direct channel closes. The client intercepts the
-//!   disconnection, queries the supervisor for the replacement channel, and retries transparently.
+//!   disconnection, queries the supervisor for the replacement channel (`ServiceSupervisorHandle::resolve_actor_channel`), and retries transparently.
 //!
 //! ## Quick Start: Generic Resource Actor
 //!

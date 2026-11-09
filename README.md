@@ -5,7 +5,7 @@ A **fault-tolerant actor framework** for [Tokio](https://tokio.rs), inspired by 
 1. **A hierarchical supervision tree** (`RootSupervisor` → `ServiceSupervisor` → actors) that detects controlled error exits (`TaskResult::Err`) and task panics, applies restart strategies (`OneForOne`, `OneForAll`, `RestForOne`), honors OTP child restart rules (`RestartType::Permanent`, `Transient`, `Temporary`) and graceful shutdown policies (`ShutdownPolicy::Timeout`, `BrutalKill`, `Infinity`), and protects against crash loops with rate limiting and exponential backoff.
 2. **A generic, reusable "resource actor" (`GenericResourceActor`)** that fetches, caches and proactively refreshes *any* kind of expiring resource (OAuth tokens, database credentials, config snapshots, signed URLs, …) by delegating the actual work to a user-supplied `Worker` — a struct, an `async fn`, or a closure.
 3. **A zero-cost stateful actor (`StatefulActor`)** (modeled after Erlang's `gen_server`) for general-purpose state machines with typed `call` (request/response) and `cast` (fire-and-forget) messaging, `on_start` / `on_stop` lifecycle hooks, and the same self-healing 1-hop client architecture (`ActorClient`).
-4. **Remote actors over gRPC (`RemoteActorClient`, `ActorNodeServer`, `AnyActorClient`)** (optional `--features remote`) providing complete location transparency, universal Protobuf envelopes (`proto/actor_node.proto`), Serde serialization, network self-healing across actor crashes without connection drops, and coordinated 2-phase graceful shutdown.
+4. **Remote actors over gRPC (`RemoteActorClient`, `ActorNodeHandle`, `AnyActorClient`)** (optional `--features remote`) providing complete location transparency, a universal Protobuf wire contract ([`proto/actor_node.proto`](proto/actor_node.proto)), bounded `bincode` payload serialization via Serde, network self-healing across actor crashes without connection drops, and coordinated 2-phase graceful shutdown.
 
 In-process clients talk **directly** to actors over their own 1-hop Tokio channel (the *data plane*), while remote clients communicate over multiplexed HTTP/2 gRPC into server-side endpoints. In both modes, supervisors are strictly confined to lifecycle management (the *control plane*), so they are never a messaging bottleneck, and actors transparently self-heal and re-bind after a crash.
 
@@ -31,14 +31,13 @@ In-process clients talk **directly** to actors over their own 1-hop Tokio channe
   - [Implementing `StatefulActor`](#implementing-statefulactor)
   - [Spawning and communicating via `ActorClient`](#spawning-and-communicating-via-actorclient)
   - [State lifecycle on restart & persistence patterns](#state-lifecycle-on-restart--persistence-patterns)
-- [Remote Actors over gRPC (`feature = "remote"`)](#remote-actors-over-grpc-feature--remote)
-  - [Universal Protobuf wire envelope](#universal-protobuf-wire-envelope)
-  - [Hosting actors on server nodes](#hosting-actors-on-server-nodes)
-  - [Calling remote actors with location transparency](#calling-remote-actors-with-location-transparency)
-  - [Network self-healing & OTP recovery](#network-self-healing--otp-recovery)
-  - [Client-initiated domain termination (`ctx.stop()`)](#client-initiated-domain-termination-ctxstop)
-  - [Coordinated 2-phase graceful shutdown](#coordinated-2-phase-graceful-shutdown)
-  - [Distributed examples (multi-terminal / multi-host)](#distributed-examples-multi-terminal--multi-host)
+- [Remote Actors over gRPC](#remote-actors-over-grpc)
+  - [Architectural Overview](#architectural-overview)
+  - [The Protobuf Contract](#the-protobuf-contract)
+  - [Running Multi-Process Examples](#running-multi-process-examples)
+  - [Code Example: Building a Remote Node](#code-example-building-a-remote-node)
+  - [Code Example: Calling from a Remote Client](#code-example-calling-from-a-remote-client)
+  - [Client-Initiated Stopping and Lifecycle Semantics](#client-initiated-stopping-and-lifecycle-semantics)
 - [Supervision](#supervision)
   - [Strategies](#supervision-strategies)
   - [Restart policy and backoff](#restart-policy-and-backoff)
@@ -116,23 +115,23 @@ flowchart TD
 flowchart TD
     subgraph DataPlane["Data Plane (Zero Supervisor Bottleneck)"]
         LocalClient["Local Client<br/>(ActorClient / ResourceClient)"] -- "direct in-memory<br/>1-hop mpsc channel" --> Mailbox["Actor Mailbox<br/>(Task)"]
-        RemoteClient["Remote Client<br/>(RemoteActorClient)"] -- "HTTP/2 gRPC<br/>(proto/actor_node.proto)" --> ServerNode["ActorNodeServer<br/>(ByteEndpoint Bridge)"]
-        ServerNode -- "forward payload via<br/>local client channel" --> Mailbox
+        RemoteClient["Remote Client<br/>(RemoteActorClient)"] -- "HTTP/2 gRPC<br/>(proto/actor_node.proto)" --> ServerNode["ActorNodeService<br/>(ByteEndpoint / ActorClient)"]
+        ServerNode -- "forward payload via<br/>local ActorClient channel" --> Mailbox
     end
 
     subgraph ControlPlane["Control Plane (Supervision Tree)"]
         Root["RootSupervisor"] -. "spawn / monitor / restart" .-> Sup["ServiceSupervisor"]
         Sup -. "spawn / monitor / restart" .-> Mailbox
-        LocalClient -. "on crash: re-bind via watch channel" .-> Sup
-        ServerNode -. "on crash: re-bind via watch channel" .-> Sup
+        LocalClient -. "on crash: re-resolve channel" .-> Sup
+        ServerNode -. "on crash: ActorClient re-resolves channel" .-> Sup
     end
 ```
 
 - **Data plane** —
   - **In-process:** `ResourceClient::get()` and `ActorClient::call()` send messages straight to the actor's mailbox over a private 1-hop Tokio `mpsc` channel.
-  - **Remote (`--features remote`):** `RemoteActorClient` sends requests over multiplexed HTTP/2 gRPC to the host `ActorNodeServer`, where a type-erased `ByteEndpoint` forwards the payload directly into the local actor's mailbox.
+  - **Remote (`--features remote`):** `RemoteActorClient` sends requests over multiplexed HTTP/2 gRPC to `ActorNodeService`, where `ActorClient<A>` (implementing the type-erased `ByteEndpoint` trait) decodes the `bincode` payload and forwards it directly into the local actor's mailbox.
   - In both cases, **no supervisor is ever in the message request path**.
-- **Control plane** — Supervisors own the actors' `JoinHandle`s, detect exits/panics, execute restart strategies (`OneForOne`, `OneForAll`, `RestForOne`), and maintain the channel registry. Clients (or server-side `ByteEndpoint`s in remote setups) consult the control plane only when their direct channel is broken to re-bind to the replacement actor.
+- **Control plane** — Supervisors own the actors' `JoinHandle`s, detect exits/panics, execute restart strategies (`OneForOne`, `OneForAll`, `RestForOne`), and maintain the channel registry. When a direct `mpsc` channel closes after a crash, clients (including server-side `ActorClient`s in remote setups) call `ServiceSupervisorHandle::resolve_actor_channel` (awaiting a `oneshot` queued in the supervisor while any restart is in progress) to re-bind to the replacement actor.
 
 ### Component overview
 
@@ -142,13 +141,13 @@ flowchart TD
 | `ServiceSupervisor` / `ServiceSupervisorHandle` / `ServiceSupervisorBuilder` | [`src/actor/service_supervisor.rs`](src/actor/service_supervisor.rs) | Type-agnostic domain supervisor. Owns child actors, applies the `SupervisionStrategy`, tracks restart rates and ticket-based restart wave isolation, hands out typed `ResourceClient`s and `ActorClient`s. |
 | `GenericResourceActor`, `ActorBuilder`, `GenericResourceActorBuilder`, `ResourceClient`, `Worker`, `TimedResource`, `WorkerContext`, `ResourceError` | [`src/actor/generic_actor.rs`](src/actor/generic_actor.rs) | The cache/refresh actor, its fluent builders, the worker abstraction and the direct client. |
 | `StatefulActor`, `StatefulActorBuilder`, `ActorClient`, `ActorContext`, `ActorControl`, `ActorError` | [`src/actor/stateful_actor.rs`](src/actor/stateful_actor.rs) | Zero-cost general-purpose stateful actor (`gen_server` style) with `call`/`cast` messaging, lifecycle hooks, and self-healing `ActorClient`. |
-| `RemoteActorClient`, `AnyActorClient`, `ActorNodeHandle`, `ActorNodeRegistry`, `ByteEndpoint`, `RemoteActorError` | [`src/remote/mod.rs`](src/remote/mod.rs) | gRPC remote actors (`--features remote`): universal envelope, typed remote client, location transparency, coordinated 2-phase shutdown. |
+| `RemoteActorClient`, `AnyActorClient`, `ActorNodeHandle`, `ActorNodeService`, `ActorNodeRegistry`, `ByteEndpoint`, `RemoteActorError` | [`src/remote/mod.rs`](src/remote/mod.rs) | gRPC remote actors (`--features remote`): bounded `bincode` endpoint bridge, typed remote client, location transparency, coordinated 2-phase shutdown. |
 | Protobuf Schema & Build Script | [`proto/actor_node.proto`](proto/actor_node.proto) & [`build.rs`](build.rs) | Compact universal gRPC actor wire contract (`Call`, `Cast`, `RemoteError`), compiled automatically via `tonic-prost-build`. |
 | `SupervisionStrategy`, `RestartPolicy`, `RestartTracker`, `RestartType`, `ShutdownPolicy`, `ServiceError`, `RootError`, `TaskResult`, `EXPIRY_BUFFER`, `DEFAULT_SHUTDOWN_TIMEOUT` | [`src/actor/model.rs`](src/actor/model.rs) | Shared domain model: strategies, policies, restart types, shutdown policies, backoff computation, task exit results, error types. |
 | Demo | [`examples/otp_actor.rs`](examples/otp_actor.rs) | Eight-phase walkthrough with simulated GCP tokens and a database secret. |
 | Simple / Educational | [`examples/simple.rs`](examples/simple.rs) | Minimal, step-by-step example highlighting core usages, self-healing, and graceful shutdown. |
 | Remote All-in-One Showcase | [`examples/remote/all_in_one.rs`](examples/remote/all_in_one.rs) | Full remote lifecycle: hosting, gRPC client calls, crash self-healing, client-initiated `ctx.stop()`, and 2-phase shutdown. |
-| Remote Server Node (Rechner B) | [`examples/remote/server.rs`](examples/remote/server.rs) | Standalone daemon hosting actors under OTP supervision over network gRPC (`http://0.0.0.0:50051`). |
+| Remote Server Node (Rechner B) | [`examples/remote/server.rs`](examples/remote/server.rs) | Standalone daemon hosting actors under OTP supervision over network gRPC (default: `http://127.0.0.1:50051`, override via `REMOTE_ADDR`). |
 | Remote Client (Rechner A) | [`examples/remote/client.rs`](examples/remote/client.rs) | Lightweight client invoking remote actors with location transparency and testing crash recovery. |
 | Integration tests | [`tests/actor_supervision_test.rs`](tests/actor_supervision_test.rs) | 58 tests covering supervision, caching, stateful actors, restart types, graceful shutdown, timeouts, backpressure, and more. |
 | Remote gRPC tests | [`tests/remote_grpc_test.rs`](tests/remote_grpc_test.rs) | 6 integration tests covering TCP transport, location transparency, crash recovery, timeouts, and in-flight drainage. |
@@ -194,7 +193,7 @@ cargo run --example remote_server --features remote
 # Terminal 2 (Rechner A / Client):
 cargo run --example remote_client --features remote
 
-# Run all 64 core & remote integration tests
+# Run all 64 core & remote integration tests (+ 4 doc-tests)
 cargo test --features remote
 
 # Optimized build
@@ -503,7 +502,6 @@ assert_eq!(current, 15);
 | `.shutdown_policy(p)` | `ShutdownPolicy::Timeout(5 s)` | How the supervisor terminates the actor on stop/shutdown (`Timeout(Duration)`, `BrutalKill`, or `Infinity`). |
 | `.shutdown_timeout(d)` | — | Shorthand for `.shutdown_policy(ShutdownPolicy::Timeout(d))`. |
 | `.handler_timeout(d)` | `None` (disabled) | Aborts a `handle()` execution that exceeds `d`, immediately returns `Err(ActorError::Timeout(d))` to the caller, and escalates to the supervisor (`ctx.fail(...)`) so a fresh instance is booted via `on_start` without leaving partially mutated `&mut self` state. |
-| `.no_handler_timeout()` | — | Disables the handler execution timeout. |
 
 ### State Lifecycle on Restart & Persistence Patterns
 
@@ -562,54 +560,61 @@ When state must survive actor restarts, combine `StatefulActor` with an external
 
 ---
 
-## Remote Actors over gRPC (`feature = "remote"`)
+## Remote Actors over gRPC
 
 When built with `--features remote`, the crate enables distributed actor communication across machines, processes, and containers over high-performance HTTP/2 gRPC.
 
 ```toml
 [dependencies]
 otp-actor = { version = "0.2.0", features = ["remote"] }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
 ```
 
 ### Architectural Overview
 
-```
- ┌─────────────────────────────────────────────────────────────┐
- │                      Remote Machine A                       │
- │                                                             │
- │   let client: AnyActorClient<BankAccountActor> =            │
- │       AnyActorClient::remote("http://192.168.1.50:50051",   │
- │                              "bank-service", "acc-42")      │
- │                              .await?;                       │
- │                                                             │
- │   let balance: i64 = client.call(AccountMsg::GetBalance,    │
- │                                  Duration::from_secs(3))    │
- │                                  .await?;                   │
- └──────────────────────────────┬──────────────────────────────┘
-                                │
-                                │ gRPC / HTTP/2 (actor_node.proto)
-                                │ Envelope: [service, actor, payload, deadline]
-                                ▼
- ┌─────────────────────────────────────────────────────────────┐
- │                      Remote Machine B                       │
- │                                                             │
- │   ActorNodeServer (0.0.0.0:50051)                           │
- │     │                                                       │
- │     ├── ActorRegistry ("bank-service" -> ByteEndpoint)      │
- │     │     │                                                 │
- │     │     └── Deserializes JSON payload (≤ 4 MiB)           │
- │     │           │                                           │
- │     ▼           ▼                                           │
- │   ServiceSupervisor (OneForOne, MaxRestarts: 3)             │
- │     └── BankAccountActor ("acc-42", balance: 500)           │
- └─────────────────────────────────────────────────────────────┘
+```text
+ ┌─────────────────────────────────────────────────────────────────┐
+ │                         Remote Machine A                        │
+ │                                                                 │
+ │   let remote = RemoteActorClient::<BankAccount>::connect(       │
+ │       "http://192.168.1.50:50051",                              │
+ │       "bank-service",                                           │
+ │       "acc-42",                                                 │
+ │   ).await?;                                                     │
+ │   let client: AnyActorClient<BankAccount> =                     │
+ │       AnyActorClient::Remote(remote);                           │
+ │                                                                 │
+ │   let balance: i64 = client                                     │
+ │       .call_timeout(BankMsg::GetBalance, Duration::from_secs(3))│
+ │       .await?;                                                  │
+ └───────────────────────────────┬─────────────────────────────────┘
+                                 │
+                                 │ gRPC / HTTP/2 (otp_actor.remote.v1)
+                                 │ CallRequest { service_name, actor_name,
+                                 │               payload (bincode), timeout_ms }
+                                 ▼
+ ┌─────────────────────────────────────────────────────────────────┐
+ │                         Remote Machine B                        │
+ │                                                                 │
+ │   ActorNodeHandle / ActorNodeService (127.0.0.1:50051)          │
+ │     │                                                           │
+ │     ├── ActorNodeRegistry (("bank-service", "acc-42")           │
+ │     │     │              -> Arc<dyn ByteEndpoint>)              │
+ │     │     │                                                     │
+ │     │     └── ActorClient<BankAccount> (impl ByteEndpoint)      │
+ │     │           │ Decodes bincode payload (≤ 4 MiB)             │
+ │     ▼           ▼                                               │
+ │   ServiceSupervisor (OneForOne, RestartType::Transient)         │
+ │     └── BankAccount ("acc-42", balance: 1000)                   │
+ └─────────────────────────────────────────────────────────────────┘
 ```
 
-The remote subsystem is architected around four core principles:
-1. **Universal Protobuf Envelope (`proto/actor_node.proto`)**: A single schema-agnostic protocol transports arbitrary typed messages without recompiling `.proto` files for every actor type.
-2. **Type-Erased Byte Adapters (`ByteEndpoint`)**: The server routes raw bytes to local `ActorClient<A>` handles using JSON (or custom) serialization and DoS payload limits (4 MiB max).
-3. **Location Transparency (`AnyActorClient<A>`)**: Unifies `ActorClient<A>` (local mpsc) and `RemoteActorClient<A>` (gRPC) behind an identical interface (`call`, `cast`, `stop`).
-4. **Coordinated 2-Phase Graceful Shutdown**: `ActorNodeHandle` drains active in-flight RPCs, then shuts down all registered actors in reverse registration order honoring their individual `ShutdownPolicy` deadlines.
+The remote subsystem is built around four core principles:
+1. **Universal Protobuf Wire Contract ([`proto/actor_node.proto`](proto/actor_node.proto))**: A single schema-agnostic `ActorNode` service (`Call` and `Cast` RPCs) transports arbitrary typed messages without modifying or recompiling `.proto` files per actor type.
+2. **Type-Erased Byte Bridging & DoS Defense (`ByteEndpoint`)**: `ByteEndpoint` is implemented directly for `ActorClient<A>`, decoding `bincode` payloads (`DefaultOptions::new().with_fixint_encoding().allow_trailing_bytes().with_limit(MAX_REMOTE_PAYLOAD_BYTES)`) with a strict **4 MiB** limit (`MAX_REMOTE_PAYLOAD_BYTES`) and forwarding them directly to the actor mailbox. Both `Ok(A::Response)` and domain errors `Err(A::Error)` are serialized symmetrically across the wire.
+3. **Location Transparency (`AnyActorClient<A>`)**: Enum unifier (`AnyActorClient::Local(ActorClient<A>)` | `AnyActorClient::Remote(RemoteActorClient<A>)`) exposing `.call()`, `.call_timeout()`, and `.cast()`, mapping local `ActorError<A::Error>` variants into `RemoteActorError<A::Error>`.
+4. **Coordinated 2-Phase Graceful Shutdown**: `ActorNodeHandle::shutdown()` emits HTTP/2 `GOAWAY` and awaits completion of `serve_with_incoming_shutdown` until active in-flight RPCs drain (bounded in practice by per-call `timeout_ms` or `handler_timeout`), then calls `RootSupervisorHandle::shutdown()` so services and actors stop sequentially in reverse registration order according to each `ShutdownPolicy`.
 
 ### The Protobuf Contract
 
@@ -617,50 +622,66 @@ Defined in [`proto/actor_node.proto`](proto/actor_node.proto):
 
 ```protobuf
 syntax = "proto3";
-package otp_actor.v1;
 
+package otp_actor.remote.v1;
+
+// Service exposed by any node hosting otp-actor actors.
 service ActorNode {
-  rpc Call  (Envelope) returns (CallReply);
-  rpc Cast  (Envelope) returns (CastAck);
-  rpc Stop  (StopRequest) returns (StopAck);
-  rpc Health(HealthRequest) returns (HealthReply);
+  // Request/response (call) with typed/serialized response payload.
+  rpc Call (CallRequest) returns (CallResponse);
+
+  // Fire-and-forget notification (cast).
+  rpc Cast (CastRequest) returns (CastResponse);
 }
 
-message Envelope {
+// Universal call envelope carrying an arbitrary serialized payload.
+message CallRequest {
   string service_name = 1;
-  string instance_id  = 2;
-  bytes  payload      = 3;
-  uint64 deadline_ms  = 4;
-  map<string, string> trace_context = 5;
+  string actor_name = 2;
+  bytes payload = 3;
+  optional uint64 timeout_ms = 4;
 }
 
-message CallReply {
-  bytes  payload = 1;
-  string error   = 2;
+// Universal call response envelope carrying the outcome.
+message CallResponse {
+  oneof result {
+    bytes ok_payload = 1;
+    bytes actor_error_payload = 2;
+    RemoteError framework_error = 3;
+  }
 }
 
-message CastAck {}
-
-message StopRequest {
+// Universal cast envelope.
+message CastRequest {
   string service_name = 1;
-  string instance_id  = 2;
-  uint64 timeout_ms   = 3;
+  string actor_name = 2;
+  bytes payload = 3;
 }
 
-message StopAck {
-  bool stopped = 1;
+// Cast acknowledgment (returns once enqueued in local actor mailbox).
+message CastResponse {
+  optional RemoteError framework_error = 1;
 }
 
-message HealthRequest {}
-
-message HealthReply {
-  string status              = 1;
-  uint64 uptime_secs         = 2;
-  uint32 active_actors_count = 3;
+// Structured error for remote actor invocations.
+message RemoteError {
+  enum Kind {
+    UNSPECIFIED = 0;
+    SERVICE_NOT_FOUND = 1;
+    ACTOR_NOT_FOUND = 2;
+    MAILBOX_FULL = 3;
+    ACTOR_UNAVAILABLE = 4;
+    TIMEOUT = 5;
+    SERIALIZATION = 6;
+    DESERIALIZATION = 7;
+    ACTOR_PANIC = 8;
+  }
+  Kind kind = 1;
+  string message = 2;
 }
 ```
 
-### Running Multi-Process / Multi-Terminal Examples
+### Running Multi-Process Examples
 
 We provide ready-to-run examples in [`examples/remote/`](examples/remote/):
 
@@ -672,17 +693,17 @@ Open two terminal windows:
 ```bash
 cargo run --example remote_server --features remote
 ```
-Starts an actor node on `0.0.0.0:50051`, registers a supervised `BankAccountActor` ("account-42") with `RestartType::Transient`, and serves requests.
+Starts an actor node on `127.0.0.1:50051` by default (override via `REMOTE_ADDR`, e.g. `REMOTE_ADDR=0.0.0.0:50051` for LAN access), registers a supervised `BankAccountActor` (`"banking-service/account-9876"`) with `RestartType::Transient`, and serves requests until `Ctrl+C` triggers 2-phase graceful shutdown.
 
 **Terminal 2 — Run the Remote Client:**
 ```bash
 cargo run --example remote_client --features remote
 ```
-Connects to `http://127.0.0.1:50051`, executes deposits, tests overdraft errors, triggers a crash to observe automatic supervisor self-healing over the wire, and performs a graceful client shutdown.
+Connects to `http://127.0.0.1:50051` (override via `REMOTE_ENDPOINT`), executes deposits/withdrawals, tests domain error propagation (`RemoteActorError::Actor`), triggers a simulated crash to observe transparent supervisor self-healing over the existing HTTP/2 channel, and requests account closure (`AccountMsg::CloseAccount` → `ctx.stop()`).
 
 #### Scenario B: Automated All-in-One Demo
 
-To run both server and client together in a single automated integration runner:
+To run both server and client together in a single automated showcase:
 ```bash
 cargo run --example remote_all_in_one --features remote
 ```
@@ -690,76 +711,81 @@ cargo run --example remote_all_in_one --features remote
 ### Code Example: Building a Remote Node
 
 ```rust
-use otp_actor::{
-    actor::{ActorContext, ActorControl, StatefulActor, StatefulActorBuilder},
-    remote::{ActorNodeServer, ActorRegistry},
-    supervision::{RestartPolicy, RestartType, ServiceSupervisor, SupervisionStrategy},
+use otp_actor::actor::{
+    ActorContext, RestartType, RootSupervisor, ServiceSupervisor, StatefulActor,
+    StatefulActorBuilder, SupervisionStrategy,
 };
+use otp_actor::remote::{ActorNodeHandle, ActorNodeRegistry};
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use std::net::SocketAddr;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 enum BankMsg {
-    Deposit(u64),
+    Deposit(i64),
     GetBalance,
     SimulateCrash,
     CloseAccount,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct BankAccount {
-    balance: u64,
+    balance: i64,
 }
 
 impl StatefulActor for BankAccount {
     type Message = BankMsg;
-    type Response = Result<u64, String>;
+    type Response = i64;
+    type Error = String;
 
-    async fn handle(&mut self, msg: Self::Message, ctx: &mut ActorContext) -> ActorControl<Self::Response> {
+    async fn handle(
+        &mut self,
+        msg: Self::Message,
+        ctx: &mut ActorContext,
+    ) -> Result<Self::Response, Self::Error> {
         match msg {
             BankMsg::Deposit(amount) => {
                 self.balance += amount;
-                ActorControl::reply(Ok(self.balance))
+                Ok(self.balance)
             }
-            BankMsg::GetBalance => ActorControl::reply(Ok(self.balance)),
+            BankMsg::GetBalance => Ok(self.balance),
             BankMsg::SimulateCrash => {
                 ctx.fail("Fatal hardware error simulated!");
-                ActorControl::reply(Err("Crashing...".into()))
+                Err("Crashing...".into())
             }
             BankMsg::CloseAccount => {
-                ctx.stop(); // Normal termination
-                ActorControl::reply(Ok(self.balance))
+                ctx.stop(); // Clean termination
+                Ok(self.balance)
             }
         }
     }
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Set up supervisor with Transient restart (stops are NOT restarted)
-    let supervisor = ServiceSupervisor::builder("bank-supervisor")
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // 1. Set up supervision tree with Transient restart (normal stops are NOT restarted)
+    let root = RootSupervisor::new();
+    let supervisor = ServiceSupervisor::builder("bank-service")
         .strategy(SupervisionStrategy::OneForOne)
-        .build();
+        .spawn(&root)
+        .await?;
 
-    let client = StatefulActorBuilder::new("bank-service", |_| BankAccount::default())
-        .restart_policy(RestartPolicy::default().with_type(RestartType::Transient))
+    let local_client = StatefulActorBuilder::from_default::<BankAccount>("account-42")
+        .restart_type(RestartType::Transient)
         .spawn(&supervisor)
         .await?;
 
-    // 2. Register actor in remote registry
-    let registry = ActorRegistry::new();
-    registry.register_client("bank-service", client);
+    // 2. Register actor in the remote node registry (uses client.service_name() & client.name())
+    let registry = ActorNodeRegistry::new();
+    registry.register_client(local_client);
 
-    // 3. Start gRPC server
-    let server = ActorNodeServer::new(registry)
-        .with_drain_timeout(Duration::from_secs(5));
+    // 3. Start gRPC server attached to the RootSupervisor for coordinated shutdown
+    let addr: SocketAddr = "127.0.0.1:50051".parse()?;
+    let node = ActorNodeHandle::start(addr, registry, Some(root)).await?;
+    println!("Node listening on http://{}", node.local_addr());
 
-    let handle = server.serve("0.0.0.0:50051".parse()?).await?;
-    println!("Node listening on :50051");
-
-    // Wait for shutdown signal...
+    // 4. Wait for shutdown signal, then drain RPCs & tear down supervision tree
     tokio::signal::ctrl_c().await?;
-    handle.shutdown().await?;
+    node.shutdown().await?;
     Ok(())
 }
 ```
@@ -767,47 +793,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ### Code Example: Calling from a Remote Client
 
 ```rust
+// Reusing BankAccount and BankMsg from a shared module/crate
 use otp_actor::remote::{AnyActorClient, RemoteActorClient};
 use std::time::Duration;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Option A: Explicit Remote Client
-    let client = RemoteActorClient::<BankAccount>::connect(
+    let remote = RemoteActorClient::<BankAccount>::connect(
         "http://127.0.0.1:50051",
         "bank-service",
-        "default",
-    ).await?;
+        "account-42",
+    )
+    .await?;
 
-    // Option B: Location-Transparent Client (Local or Remote)
-    let client: AnyActorClient<BankAccount> = AnyActorClient::remote(
-        "http://127.0.0.1:50051",
-        "bank-service",
-        "default",
-    ).await?;
+    // Option B: Location-Transparent Client (can wrap either ActorClient or RemoteActorClient)
+    let client: AnyActorClient<BankAccount> = AnyActorClient::Remote(remote);
 
-    // Call with deadline
-    let balance = client.call(BankMsg::Deposit(250), Duration::from_secs(3)).await??;
+    // Call with timeout deadline (sets both gRPC deadline and wire timeout_ms)
+    let balance = client
+        .call_timeout(BankMsg::Deposit(250), Duration::from_secs(3))
+        .await?;
     println!("Balance: {balance}");
 
-    // Cast (fire-and-forget)
+    // Cast (fire-and-forget enqueue)
     client.cast(BankMsg::Deposit(50)).await?;
 
-    // Gracefully stop the actor remotely
-    client.stop(Duration::from_secs(3)).await?;
+    // Domain-initiated graceful stop via a message whose handler calls ctx.stop()
+    let final_balance = client.call(BankMsg::CloseAccount).await?;
+    println!("Final balance before close: {final_balance}");
     Ok(())
 }
 ```
 
-### Client-Initiated Stopping & Lifecycle Semantics
+### Client-Initiated Stopping and Lifecycle Semantics
 
-When designing remote actors that can be stopped by external clients, consider the interaction with the actor's `RestartType`:
+Because `RemoteActorClient` intentionally exposes only domain `Call` / `Cast` RPCs (rather than a generic administrative stop RPC), remote clients trigger controlled termination via a domain message (such as `BankMsg::CloseAccount`) whose `StatefulActor::handle` calls `ctx.stop()`, while in-process callers can also invoke `ActorClient::shutdown()`. The actor's `RestartType` governs what happens next:
 
-| Configuration | What happens when `ctx.stop()` or `client.stop()` is invoked? | Use Case |
+| Configuration | What happens when `ctx.stop()` (or local `ActorClient::shutdown()`) runs? | Use Case |
 | --- | --- | --- |
-| **`RestartType::Transient`** *(Recommended for stoppable actors)* | The actor terminates cleanly. Because the exit is normal (`TaskResult::Ok`), the supervisor **does not** restart it. Subsequent client requests return `ActorNotFound`. | User sessions, shopping carts, game lobbies, connection workers. |
-| **`RestartType::Permanent`** | The actor terminates, but the supervisor considers every exit unexpected and immediately restarts it with clean state. | Core infrastructure daemons that must always stay alive. |
-| **`RestartType::Temporary`** | The actor is never restarted, even on crash. | Short-lived background compute jobs. |
+| **`RestartType::Transient`** *(Recommended for stoppable actors)* | The actor drains its mailbox, runs `on_stop`, and terminates cleanly (`TaskResult::Ok`). The supervisor **does not** restart it, and follow-up calls receive `ActorUnavailable` (or `ActorNotFound` if unregistered). | User sessions, shopping carts, bank accounts, per-tenant workers. |
+| **`RestartType::Permanent`** | The actor terminates, but the supervisor treats any self-initiated exit as unexpected and immediately restarts a fresh instance (unless stopped explicitly via supervisor APIs like `stop_child`). | Core infrastructure daemons that must always remain active. |
+| **`RestartType::Temporary`** | The actor is never restarted, even after a crash (`ctx.fail` / panic), and is reaped from supervisor state on exit. | Short-lived one-shot compute jobs. |
 
 ---
 
@@ -984,7 +1011,7 @@ Because children are owned by their supervisor, a supervisor crash also replaces
 | `cast(msg)` | Sends a fire-and-forget message. Re-binds transparently if the channel was closed. |
 | `shutdown()` | Sends a graceful shutdown command directly to the actor (drains mailbox, runs `on_stop`, and exits cleanly; re-binds if needed). |
 | `simulate_crash()` | Chaos: terminate the actor with a crash error (`TaskResult::Err`) to exercise supervision. |
-| `name()` | The actor's name. |
+| `name()` / `service_name()` | The actor's name and its managing service supervisor's name. |
 
 ---
 
@@ -1093,10 +1120,14 @@ The output is intentionally verbose (emoji-tagged log lines such as `🔥 Eager 
 ## Testing
 
 ```bash
-cargo test                                   # everything
-cargo test --test actor_supervision_test     # the integration suite only
+cargo test                                   # core suite + doc-tests (58 + 4)
+cargo test --features remote                 # all core & remote gRPC tests + doc-tests (64 + 4)
+cargo test --test actor_supervision_test     # core integration suite only
+cargo test --test remote_grpc_test --features remote  # remote gRPC suite only
 cargo test test_strategy_rest_for_one -- --nocapture   # a single test with logs
 ```
+
+> **Remote test suite ([`tests/remote_grpc_test.rs`](tests/remote_grpc_test.rs)):** 6 end-to-end TCP/HTTP2 integration tests covering request/response `call`, `cast`, domain error round-tripping, location transparency (`AnyActorClient`), crash recovery over an active channel, timeout enforcement, and coordinated 2-phase graceful shutdown.
 
 The integration suite in [`tests/actor_supervision_test.rs`](tests/actor_supervision_test.rs) covers 58 deterministic tests:
 
@@ -1123,20 +1154,41 @@ The integration suite in [`tests/actor_supervision_test.rs`](tests/actor_supervi
 .
 ├── Cargo.toml
 ├── README.md
+├── build.rs                            # compiles actor_node.proto when `--features remote` is active
+├── proto
+│   └── actor_node.proto                # universal Protobuf wire contract (otp_actor.remote.v1)
+├── docs
+│   └── actor_model_guide.md            # deep-dive architectural guide to the Actor Model & OTP
 ├── src
-│   ├── lib.rs                      # crate root: `pub mod actor; pub use actor::*;`
+│   ├── lib.rs                          # crate root: `pub mod actor; pub use actor::*; #[cfg(feature = "remote")] pub mod remote;`
 │   ├── actor
-│   │   ├── mod.rs                  # module docs + public re-exports
-│   │   ├── generic_actor.rs        # Worker trait, builders, ActorConfig, GenericResourceActor, ResourceClient
-│   │   ├── stateful_actor.rs       # StatefulActor trait, ActorContext, StatefulActorBuilder, ActorClient
-│   │   ├── model.rs                # SupervisionStrategy, RestartType, ShutdownPolicy, RestartPolicy, errors
-│   │   ├── root_supervisor.rs      # RootSupervisor + handle
-│   │   └── service_supervisor.rs   # ServiceSupervisor + builder + handle, ChildSpec
+│   │   ├── mod.rs                      # module docs + public re-exports
+│   │   ├── generic_actor.rs            # Worker trait, builders, ActorConfig, GenericResourceActor, ResourceClient
+│   │   ├── stateful_actor.rs           # StatefulActor trait, ActorContext, StatefulActorBuilder, ActorClient
+│   │   ├── model.rs                    # SupervisionStrategy, RestartType, ShutdownPolicy, RestartPolicy, errors
+│   │   ├── root_supervisor.rs          # RootSupervisor + handle
+│   │   └── service_supervisor.rs       # ServiceSupervisor + builder + handle, ChildSpec
+│   └── remote                          # optional (`--features remote`) distributed gRPC subsystem
+│       ├── mod.rs                      # module docs + public re-exports
+│       ├── client.rs                   # RemoteActorClient, AnyActorClient
+│       ├── endpoint.rs                 # ByteEndpoint trait + bounded bincode codec (MAX_REMOTE_PAYLOAD_BYTES)
+│       ├── error.rs                    # RemoteActorError + gRPC status mapping
+│       ├── proto.rs                    # generated tonic/prost bindings
+│       ├── registry.rs                 # ActorNodeRegistry
+│       └── server.rs                   # ActorNodeService + ActorNodeHandle (2-phase shutdown)
 ├── examples
-│   ├── otp_actor.rs                # full 8-phase demo walkthrough
-│   └── simple.rs                   # minimal step-by-step educational example
+│   ├── otp_actor.rs                    # full 8-phase demo walkthrough
+│   ├── simple.rs                       # minimal step-by-step educational example
+│   ├── dynamic_child.rs                # dynamic child registration example
+│   ├── dynamic_supervisor.rs           # dynamic service supervisor lifecycle example
+│   └── remote
+│       ├── all_in_one.rs               # combined gRPC remote actor showcase
+│       ├── common.rs                   # shared domain actor & messages for remote examples
+│       ├── server.rs                   # standalone gRPC server node
+│       └── client.rs                   # standalone gRPC client
 └── tests
-    └── actor_supervision_test.rs   # 58 integration tests
+    ├── actor_supervision_test.rs       # 58 core integration tests
+    └── remote_grpc_test.rs             # 6 gRPC remote integration tests (`--features remote`)
 ```
 
 The public API is re-exported from the crate root and `otp_actor::actor`:
@@ -1156,6 +1208,12 @@ use otp_actor::{
     RootSupervisor, RootSupervisorHandle,
     ChildSpec, ServiceSupervisor, ServiceSupervisorBuilder,
     ServiceSupervisorHandle, ShutdownSignalFn, UntypedActorFactory, UntypedSender,
+};
+
+// With `--features remote`:
+use otp_actor::remote::{
+    ActorNodeClient, ActorNodeHandle, ActorNodeRegistry, ActorNodeServer, ActorNodeService,
+    AnyActorClient, ByteEndpoint, RemoteActorClient, RemoteActorError,
 };
 ```
 
@@ -1178,7 +1236,8 @@ use otp_actor::{
 
 ## Known Limitations & Design Notes
 
-- **In-process & Distributed execution.** Core actors run in-process over high-throughput Tokio mpsc channels with zero network overhead. When distributed cross-process, cross-container, or cross-network communication is needed, the optional `remote` feature (`--features remote`) provides high-performance gRPC actor nodes and location-transparent clients (`AnyActorClient`).
+- **In-process & Distributed execution.** Core actors run in-process over high-throughput Tokio mpsc channels with zero network overhead. When distributed cross-process, cross-container, or cross-network communication is needed, the optional `remote` feature (`--features remote`) provides HTTP/2 gRPC actor nodes and location-transparent clients (`AnyActorClient`).
+- **Remote wire format & transport security.** Remote payloads are encoded with bounded `bincode` (≤ 4 MiB), so both client and server nodes should share matching Rust message schemas (not intended for schema-evolving polyglot contracts). `ActorNodeHandle` binds plaintext HTTP/2 TCP by default; terminate TLS via `tonic::transport::Server` / `Endpoint` (or a service mesh) when traversing untrusted networks.
 - **Secret redaction in `Debug`.** `TimedResource<T>` redacts its inner `value` (`"<redacted>"`) in `fmt::Debug` output so cached tokens or credentials are never accidentally leaked into logs.
 - **Hybrid failure signaling (`TaskResult` + panic isolation).** Supervision is triggered both by controlled error exits (`TaskResult::Err`, such as `max_consecutive_failures`, `handler_timeout`, `ctx.fail()`, `escalate_on_failure`, or `simulate_crash()`) and by uncaught task/factory panics (`JoinError::is_panic()` / `catch_unwind`) when compiled with `panic = "unwind"`.
 - **Restarts reset in-memory actor state (by design).** Actors and supervisors are re-created from their configured factories with clean initial state to prevent crash loops caused by corrupted state (see [State lifecycle on restart & persistence patterns](#state-lifecycle-on-restart--persistence-patterns)). Use `on_start` to rehydrate state from external persistence if durable state is needed.

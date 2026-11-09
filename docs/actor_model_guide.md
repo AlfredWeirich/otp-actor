@@ -148,7 +148,7 @@ With the **OTP (Open Telecom Platform)** framework, Erlang elevated these concep
 >
 > **4. Scalability & Distribution**
 > * **Advantages:** *Location Transparency.* An actor's messaging contract remains identical whether running on the local core or across a network cluster.
-> * **Challenges & Trade-offs:** *Request-Response Latency.* Synchronous request-reply patterns (`call`/`ask`) introduce timeout risks and can create cascading wait chains if not properly bounded.
+> * **Challenges & Trade-offs:** *Request-Response Latency.* Request–response patterns (`call`/`ask`) suspend caller progress until a reply arrives, introducing timeout risks and cascading wait chains if not properly bounded.
 
 ---
 
@@ -254,7 +254,7 @@ Caller Task                         Actor Task (Single Owner)
 >
 > **• Deadlock Risk:**
 > * `Arc<Mutex<T>>` / `RwLock<T>`: High; nested locks with conflicting acquisition orders create deadlocks.
-> * `Actor Pattern` (`mpsc` + Task): Negligible; eliminated at the state level (only circular synchronous `call` chains can stall).
+> * `Actor Pattern` (`mpsc` + Task): Negligible; eliminated at the state level (only circular request–response `call` chains can stall).
 >
 > **• Cancellation Safety:**
 > * `Arc<Mutex<T>>` / `RwLock<T>`: Fragile; dropping a future mid-mutation across an `.await` leaves shared state half-mutated and corrupted.
@@ -502,18 +502,18 @@ enum ConnectionState {
 ```
 
 * **`cast` (Fire-and-Forget):** Non-blocking, decoupled, high-throughput. Best for telemetry, event streams, metrics, and cache invalidation.
-* **`call` (Request-Response / Ask):** Two-way synchronization. The sender awaits a response delivered over a temporary one-shot channel.
+* **`call` (Request-Response / Ask):** Logically sequential request–response interaction (traditionally termed *"synchronous"* in Erlang/OTP terminology because the caller suspends its control flow until a reply arrives, though in Rust/Tokio it executes asynchronously and non-blockingly at `.await` over a temporary `oneshot` channel).
 
 ---
 
 ## 3.3 Golden Rules for the `call` Pattern
 
 1. **Never Issue a `call` Without a Timeout:**  
-   Always wrap synchronous `call` requests in `tokio::time::timeout` to prevent callers from hanging indefinitely if an actor crashes or deadlocks.
+   Always bound request–response `call` operations with a timeout (e.g., via `ActorClient::call_timeout` or `tokio::time::timeout`) to prevent caller tasks from suspending indefinitely if an actor stalls or deadlocks.
 2. **Handle `SendError` on Reply Gracefully:**  
    If a caller times out and drops its receiver, the actor's `reply.send(...)` will return an error. This is **not an actor failure**—the state mutation succeeded; only the caller is no longer listening.
-3. **Eliminate Circular Synchronous Invocations:**  
-   Actor A must never synchronously call Actor B if Actor B can synchronously call Actor A. This produces a distributed deadlock.
+3. **Eliminate Circular `call` Invocations:**  
+   Actor A must never await a `call` to Actor B inside its handler if Actor B can await a `call` back to Actor A. Even though `.await` does not block OS threads, both actors wait on each other's mailboxes—producing a logical deadlock.
 
 ---
 
@@ -914,7 +914,7 @@ When an actor crashes and is re-spawned, channel-based architectures encounter a
 4. *Without re-binding,* every client in the application would have to be torn down and manually recreated, defeating the purpose of autonomous self-healing.
 
 #### The 1-Hop Re-Binding Architecture
-To solve this, modern frameworks (such as `otp-actor`) equip clients with **transparent re-binding**. Clients hold a synchronized channel reference (e.g., `Arc<RwLock<mpsc::Sender<Msg>>>` or a `tokio::sync::watch` receiver connected to the supervisor registry):
+To solve this, modern frameworks (such as `otp-actor`) equip clients with **transparent re-binding**. Clients hold a synchronized channel reference (`Arc<std::sync::RwLock<mpsc::Sender<Msg>>>`) alongside a handle to their managing supervisor:
 
 ```
 [ Client ]                   [ Supervisor ]             [ Actor Task ]
@@ -936,8 +936,8 @@ To solve this, modern frameworks (such as `otp-actor`) equip clients with **tran
 
 #### Detailed Re-Binding Lifecycle:
 1. **Error Detection:** When `.send()` yields `Err(SendError)`, the client recognizes that the underlying actor has terminated or is currently restarting.
-2. **Supervisor Coordination:** The client requests the active mailbox handle from the supervisor's registry.
-3. **Resilient Backoff Waiting:** If the supervisor is currently observing a backoff delay, the client asynchronously awaits an update notification (`tokio::sync::watch` or `Notify`) rather than spinning in an active CPU poll loop.
+2. **Supervisor Coordination:** The client requests the active mailbox handle from the supervisor (`ServiceSupervisorHandle::resolve_actor_channel`).
+3. **Resilient Backoff Waiting:** If the supervisor is currently executing a backoff delay or restart wave, it queues a `oneshot` responder (`pending_resolutions` in `otp-actor`; other systems use primitives such as `tokio::sync::watch` or `Notify`) so the client suspends asynchronously without polling in a CPU spin loop.
 4. **Transparent Retry:** Once the replacement actor is spawned and registered, the client updates its internal sender handle and retries the original message transparently.
 5. **System Impact:** For upstream callers (e.g., REST API handlers or gRPC controllers), the failure was invisible—manifesting as a momentary millisecond latency bump rather than a dropped connection.
 
@@ -966,8 +966,8 @@ Review this checklist when designing actor-based systems:
 
 ### 2. Messaging & Mailbox Management
 - [ ] **Default to Bounded Channels:** Always configure bounded mailboxes in production to prevent out-of-memory crashes via natural backpressure.
-- [ ] **Enforce Mandatory Timeouts on `call`s:** Every synchronous request-reply must be bounded by a timeout to prevent cascading hangs.
-- [ ] **Prevent Circular Invocations:** Eliminate synchronous call cycles between actors; use asynchronous `cast` notifications for cross-actor eventing.
+- [ ] **Enforce Mandatory Timeouts on `call`s:** Every request–response `call` must be bounded by a timeout (e.g., `call_timeout`) to prevent cascading hangs.
+- [ ] **Prevent Circular Invocations:** Eliminate circular `call` cycles between actors; use fire-and-forget `cast` notifications for cross-actor eventing.
 
 ### 3. Resilience & Supervision
 - [ ] **Select Appropriate Restart Strategies:**
@@ -1012,7 +1012,7 @@ The remote subsystem decouples the network wire protocol from individual actor d
 │   │                 Location-Agnostic Application                │     │
 │   └──────────────────────────────┬───────────────────────────────┘     │
 │                                  │                                     │
-│                let client: AnyActorClient<BankActor>                   │
+│                let client: AnyActorClient<BankAccountActor>            │
 │                                  │                                     │
 │         ┌────────────────────────┴────────────────────────┐            │
 │         ▼                                                 ▼            │
@@ -1021,41 +1021,41 @@ The remote subsystem decouples the network wire protocol from individual actor d
 │         ▼                                                 │            │
 │  [Local Mailbox]                                          ▼            │
 │                                            RemoteActorClient<A>        │
-│                                            (JSON Serializer)           │
+│                                            (bincode Serializer, ≤4 MiB)│
 │                                                           │            │
 │                                                           ▼            │
 │                                                    Tonic gRPC Client   │
 └───────────────────────────────────────────────────────────┬────────────┘
                                                             │
-                                                            │ HTTP/2 gRPC Stream
-                                                            │ Envelope: [service, actor,
-                                                            │            payload, deadline]
+                                                            │ HTTP/2 gRPC (otp_actor.remote.v1)
+                                                            │ CallRequest / CastRequest
+                                                            │ [service, actor, payload, timeout_ms]
                                                             ▼
 ┌────────────────────────────────────────────────────────────────────────┐
 │                        Node B: The Actor Host                          │
 │                                                                        │
-│   ActorNodeServer (0.0.0.0:50051)                                      │
+│   ActorNodeHandle / ActorNodeService (e.g. 127.0.0.1:50051)            │
 │     │                                                                  │
-│     ├── gRPC Service (`ActorNodeService`)                              │
+│     ├── gRPC Service (`ActorNodeServer<ActorNodeService>`)             │
 │     │     │                                                            │
-│     │     ├── Enforces Payload Limits (≤ 4 MiB DoS Protection)         │
-│     │     ├── Maps gRPC Deadlines to Tokio Timeouts                    │
+│     │     ├── Resolves `(service_name, actor_name)` in registry        │
+│     │     ├── Forwards wire `timeout_ms` to `call_timeout`             │
 │     │     │                                                            │
 │     │     ▼                                                            │
-│     ├── ActorRegistry                                                  │
-│     │     │ Resolves "bank-service"                                    │
+│     ├── ActorNodeRegistry                                              │
+│     │     │ Resolves ("banking-service", "account-9876")               │
 │     │     ▼                                                            │
-│     ├── Box<dyn ByteEndpoint> (Type-Erased Bridge)                     │
-│     │     │ Deserializes raw binary payload into BankMsg               │
+│     ├── Arc<dyn ByteEndpoint> (implemented directly for ActorClient<A>)│
+│     │     │ Decodes bounded bincode payload (≤ 4 MiB)                  │
 │     │     ▼                                                            │
 │     └── ServiceSupervisor (Supervision Strategy: OneForOne)            │
 │           │                                                            │
-│           ├── Transparent 1-Hop Re-Binding Mailbox                     │
+│           ├── 1-Hop Self-Healing Channel (re-resolved on crash)        │
 │           ▼                                                            │
-│         BankActor Task ("account-42")                                  │
+│         BankAccountActor Task ("account-9876")                         │
 │           ├── Process Message                                          │
 │           ├── Execute Domain State Mutations                           │
-│           └── Reply via oneshot ──► [ByteEndpoint serializes] ──► gRPC │
+│           └── Reply via oneshot ──► [ByteEndpoint encodes] ──► gRPC    │
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -1063,50 +1063,58 @@ The remote subsystem decouples the network wire protocol from individual actor d
 
 ### 5.4.2 Core Architectural Principles
 
-#### 1. The Universal Binary Envelope (`actor_node.proto`)
+#### 1. The Universal Binary Wire Contract (`actor_node.proto`)
 Traditional RPC systems (like vanilla gRPC or Thrift) require developers to define every domain entity and message variant in `.proto` files, compile them via build scripts, and re-deploy whenever a message field changes.
 
-`otp-actor` eliminates this friction through a **Universal Binary Envelope** ([`proto/actor_node.proto`](file:///Users/fredi/Data/Projekte/Rust/261102_actor/proto/actor_node.proto)). A single, invariant wire contract serves the entire actor system:
+`otp-actor` eliminates this friction through a **Universal Binary Wire Contract** ([`proto/actor_node.proto`](../proto/actor_node.proto)). A single, invariant schema serves the entire actor system:
 
 ```protobuf
 syntax = "proto3";
-package otp_actor.v1;
+package otp_actor.remote.v1;
 
 service ActorNode {
-  // Synchronous request-response with propagated error strings
-  rpc Call   (Envelope)    returns (CallReply);
-  // Asynchronous fire-and-forget messaging
-  rpc Cast   (Envelope)    returns (CastAck);
-  // Administrative or remote actor termination
-  rpc Stop   (StopRequest) returns (StopAck);
-  // Node health, uptime, and active actor telemetry
-  rpc Health (HealthRequest) returns (HealthReply);
+  // Request/response (call) with typed/serialized response payload
+  rpc Call (CallRequest) returns (CallResponse);
+  // Fire-and-forget notification (cast)
+  rpc Cast (CastRequest) returns (CastResponse);
 }
 
-message Envelope {
-  string service_name               = 1;
-  string instance_id                = 2;
-  bytes  payload                    = 3; // Serialized actor message
-  uint64 deadline_ms                = 4; // Absolute request deadline
-  map<string, string> trace_context = 5; // Distributed tracing context
+message CallRequest {
+  string service_name     = 1;
+  string actor_name       = 2;
+  bytes  payload          = 3; // bincode-serialized actor message (<= 4 MiB)
+  optional uint64 timeout_ms = 4; // Optional per-call processing timeout
 }
 
-message CallReply {
-  bytes  payload = 1; // Serialized actor reply
-  string error   = 2; // Server-side or actor error message (if any)
+message CallResponse {
+  oneof result {
+    bytes       ok_payload          = 1; // Serialized A::Response
+    bytes       actor_error_payload = 2; // Serialized A::Error
+    RemoteError framework_error     = 3; // Transport / supervision error
+  }
+}
+
+message CastRequest {
+  string service_name = 1;
+  string actor_name   = 2;
+  bytes  payload      = 3;
+}
+
+message CastResponse {
+  optional RemoteError framework_error = 1;
 }
 ```
 
-Because the message payload is treated as opaque binary data on the wire, actor developers use standard Rust serialization frameworks (`serde_json`, `bincode`, or `postcard`) without modifying or recompiling the underlying gRPC schema.
+Because message payloads are treated as opaque binary bytes encoded with bounded **`bincode`** (using Serde's `Serialize` / `Deserialize` traits), actor developers can evolve typed Rust messages freely without modifying or recompiling `.proto` schemas. Domain failures (`Err(A::Error)`) are encoded on `actor_error_payload` separately from framework errors (`RemoteError`, which uses a structured `Kind` enum for `SERVICE_NOT_FOUND`, `ACTOR_NOT_FOUND`, `MAILBOX_FULL`, `ACTOR_UNAVAILABLE`, `TIMEOUT`, `SERIALIZATION`, `DESERIALIZATION`, and `ACTOR_PANIC`).
 
-#### 2. Type-Erased Bridging via `ByteEndpoint`
-Inside the host node, the gRPC handler receives untyped `bytes::Bytes`. The server cannot know at compile time what Rust struct or enum corresponds to `"bank-service"`.
+#### 2. Type-Erased Bridging via `ByteEndpoint` and `ActorNodeRegistry`
+Inside the host node, the gRPC handler receives untyped byte slices (`&[u8]`). The server cannot know at compile time what concrete Rust struct or enum corresponds to `("banking-service", "account-9876")`.
 
-`otp-actor` solves this through the `ByteEndpoint` trait:
-* When an actor is spawned, its typed `ActorClient<A>` is registered into an `ActorRegistry` using `registry.register_client("service_name", client)`.
-* `register_client` automatically wraps the client in an internal `TypeErasedEndpoint<A>` that implements `ByteEndpoint`.
-* Upon receiving a gRPC call, `ByteEndpoint::call_bytes` dynamically deserializes the payload into `A::Message`, forwards it into the actor's Tokio mailbox channel, awaits the actor's typed `A::Response`, and serializes the result back into raw bytes for the gRPC response envelope.
-* **DoS Protection:** To defend against malicious or corrupted network traffic, the endpoint enforces a strict payload limit (`MAX_REMOTE_PAYLOAD_BYTES = 4 MiB`), rejecting oversized requests before memory allocation occurs.
+`otp-actor` solves this through the `ByteEndpoint` trait and `ActorNodeRegistry`:
+* When an actor is spawned, its typed `ActorClient<A>` is registered into an `ActorNodeRegistry` using either `registry.register_client(client)` (which automatically uses `client.service_name()` and `client.name()`) or `registry.register(service_name, actor_name, client)`.
+* Because `otp-actor` implements `ByteEndpoint` **directly for `ActorClient<A>`** (`impl<A> ByteEndpoint for ActorClient<A>`), `ActorNodeRegistry` stores each registered actor as an `Arc<dyn ByteEndpoint>` without extra wrapper indirection.
+* Upon receiving a gRPC call, `ByteEndpoint::call_bytes` decodes the payload into `A::Message` via bounded `bincode`, forwards it through `self.call` / `self.call_timeout` into the actor's Tokio mailbox channel, awaits `Result<A::Response, ActorError<A::Error>>`, and encodes `ok_payload`, `actor_error_payload`, or `framework_error` into the `CallResponse` envelope.
+* **DoS Protection:** Both client-side encoding and server-side decoding enforce a strict payload size cap (`MAX_REMOTE_PAYLOAD_BYTES = 4 * 1024 * 1024` = **4 MiB**, aligned with tonic's default HTTP/2 frame limit) via `bincode::DefaultOptions::new().with_fixint_encoding().allow_trailing_bytes().with_limit(...)`, rejecting oversized payloads or length-prefix allocation bombs before allocation.
 
 #### 3. Complete Location Transparency with `AnyActorClient<A>`
 In large-scale distributed architectures, components frequently migrate between monolithic co-location and separate microservice pods. If client code had to change its invocation style depending on where an actor runs, architectural refactoring would be cumbersome.
@@ -1120,12 +1128,12 @@ pub enum AnyActorClient<A: StatefulActor> {
 }
 ```
 
-Both local and remote variants implement identical methods:
-* `.call(msg, timeout)` $\rightarrow$ Sends a message and awaits the typed response.
-* `.cast(msg)` $\rightarrow$ Dispatches a fire-and-forget message without waiting.
-* `.stop(timeout)` $\rightarrow$ Initiates a controlled lifecycle shutdown of the target actor.
+Both `RemoteActorClient<A>` and `AnyActorClient<A>` expose matching asynchronous messaging methods:
+* `.call(msg)` $\rightarrow$ Sends a request message and awaits `Result<A::Response, RemoteActorError<A::Error>>`.
+* `.call_timeout(msg, duration)` $\rightarrow$ Bounds the request with both a client-side `tokio::time::timeout` / gRPC deadline and wire `timeout_ms` propagation to the host actor.
+* `.cast(msg)` $\rightarrow$ Dispatches a fire-and-forget notification without awaiting handler completion.
 
-A caller can accept an `AnyActorClient<MyActor>` and invoke `.call(...)` completely oblivious to whether the request traverses a fast in-memory Tokio channel (sub-microsecond latency) or an HTTP/2 TCP connection across availability zones.
+A caller can accept an `AnyActorClient<MyActor>` and invoke `.call(...)`, `.call_timeout(...)`, or `.cast(...)` completely oblivious to whether the request traverses a fast in-memory Tokio channel or an HTTP/2 TCP connection across availability zones. Controlled actor shutdown over gRPC is intentionally modeled explicitly via domain messages whose `StatefulActor::handle` invokes `ctx.stop()` (rather than an unauthenticated generic stop RPC).
 
 ---
 
@@ -1152,19 +1160,19 @@ In an un-supervised distributed system, a remote process crash results in severe
        │                                            ├── Enforces Backoff/Rate-Limit    │
        │                                            └── Spawns clean Replacement ─────►[ New Actor ]
        │                                            │                                  │
-       │ (Client encounters error or brief wait)   │                                  │
+       │ (Client receives FrameworkError/ActorPanic)│                                  │
        │                                            │                                  │
        ├─ 3. gRPC Call(Deposit(50)) ───────────────►│                                  │
-       │                                            ├─ Routes to new Mailbox ─────────►│
-       │                                            │◄─ Reply: Ok(150) ────────────────┤
-       │◄─ gRPC Reply: Ok(150) ─────────────────────┤                                  │
+       │                                            ├─ Rebinds & routes to new Mailbox►│
+       │                                            │◄─ Reply: Ok(50) ─────────────────┤
+       │◄─ gRPC Reply: Ok(50) ──────────────────────┤                                  │
        ▼                                            ▼                                  ▼
 ```
 
-1. **Failure Containment:** The crash of a supervised actor does not kill the `ActorNodeServer` or sever the HTTP/2 gRPC channel.
+1. **Failure Containment:** The crash of a supervised actor does not kill `ActorNodeHandle` / `ActorNodeService` or sever the HTTP/2 gRPC connection.
 2. **Supervisor Recovery:** The supervisor's restart strategy (`OneForOne`, `OneForAll`, or `RestForOne`) restarts the failed actor with fresh in-memory state.
-3. **Transparent Re-Binding:** Because the `ByteEndpoint` wraps an `ActorClient` holding an internal watch channel to the supervisor, the server-side endpoint automatically re-binds to the newly spawned actor's mailbox.
-4. **Resilient Client Experience:** The next call issued by the remote client succeeds immediately against the resurrected actor without requiring the client to reconnect or re-resolve the target endpoint.
+3. **Transparent Re-Binding:** Because `ActorNodeRegistry` stores the local `ActorClient<A>` directly as an `Arc<dyn ByteEndpoint>`, a closed mailbox triggers `ServiceSupervisorHandle::resolve_actor_channel`—suspending cleanly on a `oneshot` inside `ServiceSupervisor`'s `pending_resolutions` queue while any restart wave completes—and atomically updates the client's `Arc<RwLock<mpsc::Sender<...>>>` to the newly spawned actor's mailbox.
+4. **Resilient Client Experience:** The next call issued by the remote client succeeds seamlessly against the resurrected actor over the existing gRPC channel without requiring the client to reconnect or re-resolve the target endpoint.
 
 ---
 
@@ -1174,13 +1182,13 @@ A critical challenge in distributed actor systems is distinguishing between **un
 
 In `otp-actor`, this distinction is governed by the actor's `RestartType`:
 
-| `RestartType` | Behavior on Panic / Failure (`ctx.fail()`) | Behavior on Normal Exit (`ctx.stop()` or `client.stop()`) | Typical Distributed Use Case |
+| `RestartType` | Behavior on Panic / Failure (`ctx.fail()`) | Behavior on Normal Exit (`ctx.stop()` or local `ActorClient::shutdown()`) | Typical Distributed Use Case |
 | :--- | :--- | :--- | :--- |
-| **`Transient`** *(Recommended for remote services)* | **Restarted:** The supervisor automatically respawns the actor with fresh state. | **Not Restarted:** The actor terminates cleanly; subsequent client calls receive `ActorNotFound`. | User sessions, shopping carts, per-tenant workers, temporary computational jobs. |
-| **`Permanent`** | **Restarted:** Resurrected according to supervisor policy. | **Restarted:** Even a clean exit is treated as an unexpected termination; the supervisor respawns the actor. | Core background daemons, heartbeat monitors, primary event stream consumers. |
-| **`Temporary`** | **Not Restarted:** Remains dead on failure. | **Not Restarted:** Remains dead on clean exit. | Non-critical one-shot tasks where failure can be safely dropped. |
+| **`Transient`** *(Recommended for remote services)* | **Restarted:** The supervisor automatically respawns the actor with fresh state. | **Not Restarted:** The actor terminates cleanly; subsequent client calls receive `ActorUnavailable` (or `ActorNotFound` if unregistered). | User sessions, shopping carts, per-tenant workers, bank accounts, computational jobs. |
+| **`Permanent`** | **Restarted:** Resurrected according to supervisor policy. | **Restarted:** Even a self-initiated clean exit is treated as unexpected termination; the supervisor respawns the actor (unless stopped explicitly via supervisor APIs such as `stop_child`). | Core background daemons, heartbeat monitors, primary event stream consumers. |
+| **`Temporary`** | **Not Restarted:** Remains dead on failure and is reaped from supervisor state. | **Not Restarted:** Remains dead on clean exit and is reaped from supervisor state. | Non-critical one-shot tasks where failure can be safely dropped. |
 
-This makes it trivial to implement domain commands like `AccountMsg::CloseAccount`: the actor handler calls `ctx.stop()`, runs its `on_stop` cleanup hook, drains any remaining messages, and exits. Because it is marked as `Transient`, the supervisor leaves it terminated, allowing client applications to verify that the actor is gone.
+This makes it straightforward to implement domain commands like `AccountMsg::CloseAccount`: the actor handler calls `ctx.stop()`, drains any already-queued messages, executes its `on_stop` cleanup hook, and exits cleanly. Because it is marked as `Transient`, the supervisor leaves it terminated, allowing remote clients to observe clean teardown.
 
 ---
 
@@ -1188,8 +1196,10 @@ This makes it trivial to implement domain commands like `AccountMsg::CloseAccoun
 
 When an actor node is decommissioned (during rolling deployments or cluster re-balancing), terminating tasks abruptly causes dropped in-flight requests and partial writes.
 
-`ActorNodeHandle` implements a deterministic **Two-Phase Graceful Shutdown**:
-1. **Phase 1: In-Flight Request Drainage:** The gRPC service stops accepting new connections and pauses incoming message routing, granting active in-flight calls a configurable grace period (`with_drain_timeout`, e.g., 5 seconds) to finish executing and return their responses.
-2. **Phase 2: Hierarchical Actor Tree Teardown:** Once requests are drained, the server triggers sequential shutdown across the supervisor tree. Children are stopped in **reverse registration order**, giving each actor its configured `ShutdownPolicy` timeout window to flush buffers, persist state to storage, and execute asynchronous cleanup hooks before the process exits.
+`ActorNodeHandle` implements a deterministic **Two-Phase Graceful Shutdown** (`ActorNodeHandle::shutdown()`):
+1. **Phase 1: In-Flight Request Drainage:** Sending the shutdown trigger to `tonic`'s `serve_with_incoming_shutdown` stops accepting new connections, emits HTTP/2 `GOAWAY`, and awaits completion of active in-flight RPCs (bounded in practice by per-call `timeout_ms` or `handler_timeout` deadlines).
+2. **Phase 2: Hierarchical Actor Tree Teardown:** Once active gRPC streams drain, if a `RootSupervisorHandle` was attached via `ActorNodeHandle::start(...)`, Phase 2 calls `root.shutdown().await?`. Registered service supervisors and their child actors are stopped sequentially in **reverse registration order**, granting each actor its configured `ShutdownPolicy` window (`Timeout`, `Infinity`, or `BrutalKill`) to flush buffers, persist state, and run `on_stop` before the process exits.
 
-Through this combination of universal wire envelopes, location-transparent clients, local supervision self-healing, and coordinated two-phase teardown, `otp-actor` elevates the classic Erlang/OTP actor model into a modern, distributed, type-safe Rust foundation.
+*(Note: For cross-network deployments over untrusted networks, wrap the underlying `tonic::transport::Server` and client `Endpoint` with TLS, as `ActorNodeHandle::start` binds plaintext HTTP/2 TCP by default.)*
+
+Through this combination of a universal binary wire contract, bounded `bincode` bridging, location-transparent clients, local supervision self-healing, and coordinated two-phase teardown, `otp-actor` elevates the classic Erlang/OTP actor model into a modern, distributed, type-safe Rust foundation.
