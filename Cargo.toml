@@ -1,6 +1,6 @@
 [package]
 name = "otp-actor"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.88"
 description = "OTP Actor framework for Tokio with supervision tree and resilient resource actor inspired by Erlang/OTP"
@@ -12,6 +12,7 @@ categories = ["asynchronous", "concurrency"]
 
 [features]
 default = []
+chaos_test = []
 remote = [
     "dep:tonic",
     "dep:tonic-prost",
@@ -40,6 +41,7 @@ tokio-stream = { version = "0.1", features = ["net"], optional = true }
 tonic-prost-build = { version = "0.14", optional = true }
 
 [dev-dependencies]
+otp-actor = { path = ".", features = ["chaos_test"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

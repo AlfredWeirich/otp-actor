@@ -4,16 +4,16 @@
 //! of the framework:
 //!
 //! 1. **Supervision Tree Hierarchy (Control Plane)**:
-//!    Multi-level lifecycle management via `RootSupervisor` -> `ServiceSupervisor` -> actors.
+//!    Arbitrary multi-level lifecycle management via `Supervisor` -> child `Supervisor` -> actors.
 //! 2. **Worker Definition (Zero-Cost Abstraction)**:
 //!    A lightweight asynchronous closure or struct returning `impl Future` to fetch and refresh
 //!    expiring resources (`TimedResource`) without `Box::pin` heap allocations.
 //! 3. **Declarative Actor Configuration & Registration**:
 //!    Fluent builder ergonomics with eager pre-warming, expiry safety margins, and OTP restart rules.
 //! 4. **Direct Data-Plane Channel (Zero Supervisor Overhead)**:
-//!    Direct 1-hop client-to-actor messaging for sub-microsecond cache hits and maximum throughput.
+//!    Zero-hop in-memory watch cache reads (`ResourceClient::get`) and direct 1-hop actor messaging.
 //! 5. **Transparent Client Self-Healing**:
-//!    Automatic supervisor-driven crash recovery with transparent client channel rebinding and retry.
+//!    Automatic supervisor-driven crash recovery with event-driven `watch` channel rebinding.
 //! 6. **General-Purpose Stateful Actor (`StatefulActor`)**:
 //!    Erlang/OTP `gen_server`-style state machines (`call` request/response, `cast` fire-and-forget,
 //!    `on_start` and `on_stop` lifecycle hooks) supervised alongside resource actors in the same tree.
@@ -25,8 +25,8 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use otp_actor::actor::{
-    ActorContext, GenericResourceActor, RestartType, RootSupervisor, ServiceSupervisor,
-    StatefulActor, StatefulActorBuilder, TimedResource, WorkerContext,
+    ActorContext, ResourceActor, RestartType, StatefulActor, StatefulActorBuilder, Supervisor,
+    TimedResource, WorkerContext,
 };
 
 // ============================================================================
@@ -55,7 +55,7 @@ impl StatefulActor for AuditCounterActor {
     type Response = (u64, usize);
     type Error = String;
 
-    async fn on_start(&mut self, ctx: &mut ActorContext) -> Result<(), String> {
+    async fn on_start(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), String> {
         println!(
             "  🟢 [StatefulActor '{}'] on_start hook executed (Instance #{})",
             ctx.name(),
@@ -67,7 +67,7 @@ impl StatefulActor for AuditCounterActor {
     async fn handle(
         &mut self,
         msg: Self::Message,
-        ctx: &mut ActorContext,
+        ctx: &mut ActorContext<Self>,
     ) -> Result<Self::Response, Self::Error> {
         match msg {
             AuditMsg::RecordEvents(n) => {
@@ -76,7 +76,7 @@ impl StatefulActor for AuditCounterActor {
             }
             AuditMsg::GetStats => Ok((self.requests_logged, ctx.instance_id())),
             AuditMsg::TriggerFatalError => {
-                // `ctx.fail(...)` escalates the fatal failure to the ServiceSupervisor (triggering restart recovery),
+                // `ctx.fail(...)` escalates the fatal failure to the Supervisor (triggering restart recovery),
                 // while `Err(...)` immediately returns the error message to the waiting caller (`call`).
                 ctx.fail("Simulated critical state corruption in AuditCounterActor");
                 Err("Internal state corrupted".to_string())
@@ -84,7 +84,7 @@ impl StatefulActor for AuditCounterActor {
         }
     }
 
-    async fn on_stop(&mut self, ctx: &mut ActorContext) {
+    async fn on_stop(&mut self, ctx: &mut ActorContext<Self>) {
         println!(
             "  🔵 [StatefulActor '{}'] on_stop hook executed during graceful shutdown (Instance #{}, logged events: {})",
             ctx.name(),
@@ -118,7 +118,7 @@ async fn main() {
         .init();
 
     println!("========================================================");
-    println!("  Educational Demo: Generic Resource Actor & StatefulActor");
+    println!("  Educational Demo: ResourceActor & StatefulActor");
     println!("========================================================\n");
 
     // ------------------------------------------------------------------
@@ -126,16 +126,16 @@ async fn main() {
     // ------------------------------------------------------------------
     println!("--- Step 1: Initialize Supervision Hierarchy ---");
 
-    // The RootSupervisor oversees domain ServiceSupervisors at the root level.
-    let root = RootSupervisor::new();
+    // The root Supervisor oversees domain child Supervisors at the root level.
+    let root = Supervisor::new("root");
 
-    // The ServiceSupervisor manages the concrete worker and stateful actors within a domain.
-    // It autonomously self-registers with the RootSupervisor.
-    let auth_service = ServiceSupervisor::spawn_and_register("auth-service", &root)
+    // The child Supervisor manages the concrete worker and stateful actors within a domain.
+    let auth_service = Supervisor::builder("auth-service")
+        .spawn(&root)
         .await
-        .expect("Failed to register ServiceSupervisor with RootSupervisor");
+        .expect("Failed to register child Supervisor with root Supervisor");
 
-    println!("  ✅ RootSupervisor and ServiceSupervisor ('auth-service') active.\n");
+    println!("  ✅ Root Supervisor and child Supervisor ('auth-service') active.\n");
 
     // ------------------------------------------------------------------
     // Step 2: Define Worker Logic (Resource Acquisition)
@@ -170,31 +170,31 @@ async fn main() {
     // ------------------------------------------------------------------
     println!("--- Step 3: Configure & Launch Actor ---");
 
-    let client = GenericResourceActor::builder("auth-token")
+    let client = ResourceActor::builder("auth-token")
         .worker(token_worker)
         .restart_type(RestartType::Permanent) // Critical daemon: always restarted on termination
         .shutdown_timeout(Duration::from_secs(2)) // Graceful shutdown with 2s grace period for in-flight workers
         .eager_prewarm(true) // Pre-emptively fetch the resource in the background at boot time
         .expiry_buffer(Duration::from_secs(1)) // Proactively refresh 1 second before expiry
-        .spawn_and_register(&auth_service, &root)
+        .spawn(&auth_service)
         .await
-        .expect("Failed to spawn generic resource actor");
+        .expect("Failed to spawn resource actor");
 
     // Short sleep (100ms) to allow the asynchronous eager pre-warm background task to complete
     tokio::time::sleep(Duration::from_millis(100)).await;
     println!("  ✅ Actor 'auth-token' online. Client handle acquired.\n");
 
     // ------------------------------------------------------------------
-    // Step 4: Data-Plane Serving & Caching (Direct 1-Hop)
+    // Step 4: Data-Plane Serving & Caching (Zero-Hop Watch Cache)
     // ------------------------------------------------------------------
     println!("--- Step 4: Test Data-Plane Serving & Caching ---");
 
-    // 1st request: Instant cache hit due to eager pre-warming!
+    // 1st request: Instant 0-hop cache hit due to eager pre-warming!
     let start = Instant::now();
     let token1 = client.get().await.expect("Failed to retrieve token");
     let elapsed1 = start.elapsed();
     println!(
-        "  👉 1st fetch: \"{}\" (Latency: {:?}) -> Instant cache hit!",
+        "  👉 1st fetch: \"{}\" (Latency: {:?}) -> Instant 0-hop cache hit!",
         mask_secret(&token1),
         elapsed1
     );
@@ -204,13 +204,13 @@ async fn main() {
     let token2 = client.get().await.expect("Failed to retrieve token");
     let elapsed2 = start.elapsed();
     println!(
-        "  👉 2nd fetch: \"{}\" (Latency: {:?}) -> Served directly from in-memory cache!",
+        "  👉 2nd fetch: \"{}\" (Latency: {:?}) -> Served directly from in-memory watch cache!",
         mask_secret(&token2),
         elapsed2
     );
 
     println!(
-        "  ℹ️  Notice: Client queries travel directly to the actor mailbox; supervisors incur 0% overhead.\n"
+        "  ℹ️  Notice: Valid cache hits are read directly from the watch channel with 0 message hops!\n"
     );
 
     // ------------------------------------------------------------------
@@ -222,7 +222,7 @@ async fn main() {
     // Simulate an abnormal exit/panic of the actor task
     let _ = client.simulate_crash().await;
 
-    // Brief delay: ServiceSupervisor intercepts the termination and boots replacement instance #2
+    // Brief delay: Supervisor intercepts the termination and boots replacement instance #2
     tokio::time::sleep(Duration::from_millis(80)).await;
 
     println!(
@@ -317,7 +317,7 @@ async fn main() {
     // ------------------------------------------------------------------
     println!("--- Step 8: Graceful Shutdown of the Entire Supervision Tree ---");
     println!(
-        "  🛑 Cascading graceful shutdown across RootSupervisor, ServiceSupervisors, and all child actors..."
+        "  🛑 Cascading graceful shutdown across root Supervisor, child Supervisors, and all child actors..."
     );
 
     root.shutdown().await.expect("Graceful shutdown failed");
@@ -328,7 +328,7 @@ async fn main() {
 
     println!("========================================================");
     println!("  Summary:");
-    println!("  - GenericResourceActor (TTL cache) + StatefulActor unified in one tree.");
+    println!("  - ResourceActor (TTL cache) + StatefulActor unified in one tree.");
     println!(
         "  - Clean architectural separation: Control Plane (supervisors) vs. Data Plane (clients)."
     );

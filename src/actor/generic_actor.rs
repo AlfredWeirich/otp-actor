@@ -1,14 +1,24 @@
-//! # Generic Resource & Worker Actor
+//! # Generic Resource & Worker Actor (`ResourceActor`)
 //!
 //! A completely reusable, fault-tolerant concurrent actor that executes any user-provided
 //! [`Worker`] implementation or closure to fetch, cache, and proactively refresh arbitrary resources.
-//! Supports zero-cost execution (without `Box::pin`), fluent builder configuration, eager pre-warming,
-//! and restart policies.
+//!
+//! ## Key Highlights
+//! - **Zero-Hop Cache Reads**: Fresh cached resources are published to a [`tokio::sync::watch`] channel
+//!   and served in 0 hops by [`ResourceClient::get`] without allocating a `oneshot` channel or traversing
+//!   the actor mailbox.
+//! - **Zero-Cost Worker Futures**: Accepts custom structs, standalone `async fn`s, or closures returning
+//!   native `impl Future` without `Box::pin` heap allocations.
+//! - **Single-Flight Coalescing & Backpressure**: Concurrent cache-miss callers coalesce onto a single
+//!   in-flight worker execution bounded by `max_waiters`.
+//! - **Proactive Refresh, Negative Caching & Stale-While-Error**: Automatically refreshes resources
+//!   before TTL expiration with jitter, enforces failure cooldowns, and serves stale values during transient outages.
 
 use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::{
@@ -19,23 +29,23 @@ use tokio::task::JoinSet;
 use tokio::time::Instant;
 
 use super::model::{
-    EXPIRY_BUFFER, RestartPolicy, RestartType, ServiceError, ShutdownPolicy, TaskResult,
+    EXPIRY_BUFFER, RestartPolicy, RestartType, ShutdownPolicy, SupervisorError, TaskResult,
 };
-use super::root_supervisor::RootSupervisorHandle;
-use super::service_supervisor::{
-    ChildSpec, ServiceSupervisorHandle, ShutdownSignalFn, UntypedActorFactory,
+use super::supervisor::{
+    ChildSpec, ShutdownSignalFn, SlotState, SpawnContext, SupervisorHandle, UntypedActorFactory,
 };
 
 /// Default execution timeout on asynchronous worker tasks (30 seconds).
 pub const DEFAULT_WORKER_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Error wrapper returned by generic resource clients.
-#[derive(Debug, Error, Clone)]
+/// Error wrapper returned by [`ResourceClient`] operations.
+#[non_exhaustive]
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum ResourceError<E> {
     #[error("Actor task terminated unexpectedly or is unavailable")]
     ActorUnavailable,
-    #[error("Service supervisor error: {0}")]
-    Service(#[from] ServiceError),
+    #[error("Supervisor error: {0}")]
+    Supervisor(#[from] SupervisorError),
     #[error("Worker operation failed: {0}")]
     WorkerFailed(E),
     #[error("Actor operation timed out after {0:?}")]
@@ -44,8 +54,8 @@ pub enum ResourceError<E> {
     Overloaded(usize),
 }
 
-/// Execution metadata provided to worker implementations.
-#[derive(Debug, Clone)]
+/// Execution metadata provided to [`Worker`] implementations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorkerContext {
     /// Identifier of the actor instance (increments upon supervisor auto-restart of this actor).
     pub instance_id: usize,
@@ -124,6 +134,31 @@ impl<T> TimedResource<T> {
     }
 }
 
+/// Snapshot published to the zero-hop [`watch`] channel on each successful worker refresh.
+#[derive(Clone)]
+pub(crate) struct ResourceSnapshot<T> {
+    pub(crate) resource: TimedResource<T>,
+    pub(crate) refresh_threshold: Option<Instant>,
+}
+
+/// Shared data-plane endpoint for a [`ResourceActor`] instance, combining the 0-hop [`watch`] cache
+/// receiver and the 1-hop `mpsc` command sender.
+pub(crate) struct ResourceEndpoint<T, E> {
+    pub(crate) sender: Sender<ResourceCommand<T, E>>,
+    pub(crate) cache_rx: watch::Receiver<Option<ResourceSnapshot<T>>>,
+    pub(crate) invalidated: Arc<AtomicBool>,
+}
+
+impl<T, E> Clone for ResourceEndpoint<T, E> {
+    fn clone(&self) -> Self {
+        Self {
+            sender: self.sender.clone(),
+            cache_rx: self.cache_rx.clone(),
+            invalidated: self.invalidated.clone(),
+        }
+    }
+}
+
 // ============================================================================
 // Worker Trait & Zero-Cost Abstraction
 // ============================================================================
@@ -161,7 +196,7 @@ where
     }
 }
 
-/// Message protocol processed by a [`GenericResourceActor`].
+/// Message protocol processed by a [`ResourceActor`].
 pub(crate) enum ResourceCommand<T, E> {
     /// Client request seeking the managed resource.
     GetResource {
@@ -173,16 +208,18 @@ pub(crate) enum ResourceCommand<T, E> {
     /// refresh for waiting callers, and exits cleanly with `Ok(())`.
     Shutdown,
     /// Explicit crash injection command for chaos and resilience testing.
+    #[cfg(any(test, feature = "chaos_test"))]
     SimulateCrash,
 }
 
 // ============================================================================
-// Configuration & Builders for GenericResourceActor
+// Configuration & Unified Builder for ResourceActor
 // ============================================================================
 
-/// Configuration parameters for a [`GenericResourceActor`].
+/// Configuration parameters for a [`ResourceActor`].
+#[non_exhaustive]
 #[derive(Debug, Clone)]
-pub struct ActorConfig {
+pub struct ResourceActorConfig {
     pub name: String,
     pub expiry_buffer: Duration,
     pub channel_capacity: usize,
@@ -199,7 +236,7 @@ pub struct ActorConfig {
     pub max_consecutive_failures: Option<usize>,
 }
 
-impl ActorConfig {
+impl ResourceActorConfig {
     /// Initializes default actor configuration settings with production-safe defaults.
     pub fn new(name: impl Into<String>) -> Self {
         Self {
@@ -221,149 +258,35 @@ impl ActorConfig {
     }
 }
 
-macro_rules! impl_actor_config_setters {
-    () => {
-        /// Sets the expiration safety buffer window (defaults to [`EXPIRY_BUFFER`], 2 seconds).
-        #[must_use]
-        pub fn expiry_buffer(mut self, buffer: Duration) -> Self {
-            self.config.expiry_buffer = buffer;
-            self
-        }
-
-        /// Sets the actor's mailbox channel capacity (defaults to 256; clamped to `>= 1`).
-        #[must_use]
-        pub fn channel_capacity(mut self, capacity: usize) -> Self {
-            self.config.channel_capacity = capacity.max(1);
-            self
-        }
-
-        /// Sets the maximum capacity for concurrent pending callers waiting in queue (defaults to 1024; clamped to `>= 1`).
-        #[must_use]
-        pub fn max_waiters(mut self, max: usize) -> Self {
-            self.config.max_waiters = max.max(1);
-            self
-        }
-
-        /// Enables eager pre-warming: the actor initiates fetching the resource immediately
-        /// on startup rather than waiting for the first client request.
-        #[must_use]
-        pub fn eager_prewarm(mut self, eager: bool) -> Self {
-            self.config.eager_prewarm = eager;
-            self
-        }
-
-        /// Sets the rate-limiting and backoff restart policy for the actor.
-        #[must_use]
-        pub fn restart_policy(mut self, policy: RestartPolicy) -> Self {
-            self.config.restart_policy = policy;
-            self
-        }
-
-        /// Sets the OTP restart type (`Transient`, `Permanent`, or `Temporary`).
-        #[must_use]
-        pub fn restart_type(mut self, restart_type: RestartType) -> Self {
-            self.config.restart_type = restart_type;
-            self
-        }
-
-        /// Sets the shutdown policy (`Timeout(Duration)`, `BrutalKill`, or `Infinity`).
-        #[must_use]
-        pub fn shutdown_policy(mut self, policy: ShutdownPolicy) -> Self {
-            self.config.shutdown_policy = policy;
-            self
-        }
-
-        /// Convenience method setting [`ShutdownPolicy::Timeout`] for graceful shutdown.
-        #[must_use]
-        pub fn shutdown_timeout(mut self, timeout: Duration) -> Self {
-            self.config.shutdown_policy = ShutdownPolicy::Timeout(timeout);
-            self
-        }
-
-        /// Sets an execution timeout on the asynchronous worker task.
-        #[must_use]
-        pub fn worker_timeout(mut self, timeout: Duration) -> Self {
-            self.config.worker_timeout = Some(timeout);
-            self
-        }
-
-        /// Disables execution timeout on the asynchronous worker task (allows workers to run indefinitely).
-        #[must_use]
-        pub fn no_worker_timeout(mut self) -> Self {
-            self.config.worker_timeout = None;
-            self
-        }
-
-        /// Sets the failure cooldown window (defaults to `Duration::ZERO`).
-        /// During this window following a worker failure or timeout, further calls to `get()`
-        /// will fast-fail immediately without spawning redundant worker tasks.
-        #[must_use]
-        pub fn failure_cooldown(mut self, cooldown: Duration) -> Self {
-            self.config.failure_cooldown = cooldown;
-            self
-        }
-
-        /// Sets the stale-while-error grace window (defaults to `Duration::ZERO`).
-        /// If an expired resource is within this window, callers receive the stale value
-        /// while an asynchronous background refresh attempts recovery.
-        #[must_use]
-        pub fn stale_while_error(mut self, duration: Duration) -> Self {
-            self.config.stale_while_error = duration;
-            self
-        }
-
-        /// Enables or disables proactive background timer refresh (defaults to `true`).
-        /// When enabled, the actor automatically refreshes expiring resources in the background
-        /// before their expiration buffer window is reached.
-        #[must_use]
-        pub fn proactive_refresh(mut self, enabled: bool) -> Self {
-            self.config.proactive_refresh = enabled;
-            self
-        }
-
-        /// Sets the maximum proactive refresh jitter (defaults to `Duration::ZERO`).
-        #[must_use]
-        pub fn proactive_jitter(mut self, jitter: Duration) -> Self {
-            self.config.proactive_jitter = jitter;
-            self
-        }
-
-        /// Configures a threshold of consecutive worker failures (or timeouts) after which
-        /// the actor exits with an error to trigger a full supervisor-level restart
-        /// (including `OneForAll` or `RestForOne` sibling recovery) without panicking.
-        #[must_use]
-        pub fn max_consecutive_failures(mut self, max: usize) -> Self {
-            self.config.max_consecutive_failures = Some(max);
-            self
-        }
-    };
+/// Unified fluent builder for configuring and spawning a [`ResourceActor`].
+///
+/// Configuration methods can be chained in any order, both before and after attaching a [`Worker`] via [`.worker(...)`](ResourceActorBuilder::worker).
+pub struct ResourceActorBuilder<T = (), E = (), W = ()> {
+    pub config: ResourceActorConfig,
+    worker: W,
+    _marker: PhantomData<(T, E)>,
 }
 
-/// Initial builder for a generic actor before a [`Worker`] is attached.
-pub struct ActorBuilder {
-    pub config: ActorConfig,
-}
-
-impl ActorBuilder {
-    /// Creates a new builder initialized with defaults.
+impl ResourceActorBuilder<(), (), ()> {
+    /// Creates a new [`ResourceActorBuilder`] initialized with production-safe defaults.
     pub fn new(name: impl Into<String>) -> Self {
         Self {
-            config: ActorConfig::new(name),
+            config: ResourceActorConfig::new(name),
+            worker: (),
+            _marker: PhantomData,
         }
     }
 
-    impl_actor_config_setters!();
-
-    /// Attaches a [`Worker`] implementation (custom struct, async function, or closure).
-    /// Infers resource payload type `T` and error type `E` automatically without type annotations!
+    /// Attaches a [`Worker`] implementation (custom struct, `async fn`, or closure).
+    /// Infers resource payload type `T` and error type `E` automatically.
     #[must_use]
-    pub fn worker<T, E, W>(self, worker: W) -> GenericResourceActorBuilder<T, E, W>
+    pub fn worker<T, E, W>(self, worker: W) -> ResourceActorBuilder<T, E, Arc<W>>
     where
         T: Clone + Send + Sync + 'static,
         E: Clone + Send + Sync + 'static,
         W: Worker<T, E>,
     {
-        GenericResourceActorBuilder {
+        ResourceActorBuilder {
             config: self.config,
             worker: Arc::new(worker),
             _marker: PhantomData,
@@ -371,19 +294,124 @@ impl ActorBuilder {
     }
 }
 
-/// Fully configured fluent builder ready to spawn and register a [`GenericResourceActor`].
-pub struct GenericResourceActorBuilder<T, E, W> {
-    config: ActorConfig,
-    worker: Arc<W>,
-    _marker: PhantomData<(T, E)>,
+impl<T, E, W> ResourceActorBuilder<T, E, W> {
+    /// Sets the expiration safety buffer window (defaults to [`EXPIRY_BUFFER`], 2 seconds).
+    #[must_use]
+    pub fn expiry_buffer(mut self, buffer: Duration) -> Self {
+        self.config.expiry_buffer = buffer;
+        self
+    }
+
+    /// Sets the actor's mailbox channel capacity (defaults to 256; clamped to `>= 1`).
+    #[must_use]
+    pub fn channel_capacity(mut self, capacity: usize) -> Self {
+        self.config.channel_capacity = capacity.max(1);
+        self
+    }
+
+    /// Sets the maximum capacity for concurrent pending callers waiting in queue (defaults to 1024; clamped to `>= 1`).
+    #[must_use]
+    pub fn max_waiters(mut self, max: usize) -> Self {
+        self.config.max_waiters = max.max(1);
+        self
+    }
+
+    /// Enables eager pre-warming: the actor initiates fetching the resource immediately
+    /// on startup rather than waiting for the first client request.
+    #[must_use]
+    pub fn eager_prewarm(mut self, eager: bool) -> Self {
+        self.config.eager_prewarm = eager;
+        self
+    }
+
+    /// Sets the rate-limiting and backoff restart policy for the actor.
+    #[must_use]
+    pub fn restart_policy(mut self, policy: RestartPolicy) -> Self {
+        self.config.restart_policy = policy;
+        self
+    }
+
+    /// Sets the OTP restart type (`Transient`, `Permanent`, or `Temporary`).
+    #[must_use]
+    pub fn restart_type(mut self, restart_type: RestartType) -> Self {
+        self.config.restart_type = restart_type;
+        self
+    }
+
+    /// Sets the shutdown policy (`Timeout(Duration)`, `BrutalKill`, or `Infinity`).
+    #[must_use]
+    pub fn shutdown_policy(mut self, policy: ShutdownPolicy) -> Self {
+        self.config.shutdown_policy = policy;
+        self
+    }
+
+    /// Convenience method setting [`ShutdownPolicy::Timeout`] for graceful shutdown.
+    #[must_use]
+    pub fn shutdown_timeout(mut self, timeout: Duration) -> Self {
+        self.config.shutdown_policy = ShutdownPolicy::Timeout(timeout);
+        self
+    }
+
+    /// Sets an execution timeout on the asynchronous worker task.
+    #[must_use]
+    pub fn worker_timeout(mut self, timeout: Duration) -> Self {
+        self.config.worker_timeout = Some(timeout);
+        self
+    }
+
+    /// Disables execution timeout on the asynchronous worker task (allows workers to run indefinitely).
+    #[must_use]
+    pub fn no_worker_timeout(mut self) -> Self {
+        self.config.worker_timeout = None;
+        self
+    }
+
+    /// Sets the failure cooldown window (defaults to `Duration::ZERO`).
+    /// During this window following a worker failure or timeout, further calls to `get()`
+    /// will fast-fail immediately without spawning redundant worker tasks.
+    #[must_use]
+    pub fn failure_cooldown(mut self, cooldown: Duration) -> Self {
+        self.config.failure_cooldown = cooldown;
+        self
+    }
+
+    /// Sets the stale-while-error grace window (defaults to `Duration::ZERO`).
+    /// If an expired resource is within this window, callers receive the stale value
+    /// while an asynchronous background refresh attempts recovery.
+    #[must_use]
+    pub fn stale_while_error(mut self, duration: Duration) -> Self {
+        self.config.stale_while_error = duration;
+        self
+    }
+
+    /// Enables or disables proactive background timer refresh (defaults to `true`).
+    #[must_use]
+    pub fn proactive_refresh(mut self, enabled: bool) -> Self {
+        self.config.proactive_refresh = enabled;
+        self
+    }
+
+    /// Sets the maximum proactive refresh jitter (defaults to `Duration::ZERO`).
+    #[must_use]
+    pub fn proactive_jitter(mut self, jitter: Duration) -> Self {
+        self.config.proactive_jitter = jitter;
+        self
+    }
+
+    /// Configures a threshold of consecutive worker failures (or timeouts) after which
+    /// the actor exits with an error to trigger a full supervisor-level restart
+    /// (including `OneForAll` or `RestForOne` sibling recovery) without panicking.
+    #[must_use]
+    pub fn max_consecutive_failures(mut self, max: usize) -> Self {
+        self.config.max_consecutive_failures = Some(max);
+        self
+    }
 }
 
 impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Worker<T, E>>
-    GenericResourceActorBuilder<T, E, W>
+    ResourceActorBuilder<T, E, Arc<W>>
 {
-    impl_actor_config_setters!();
-
-    /// Builds an OTP-style [`ChildSpec`] that can be passed to a [`super::service_supervisor::ServiceSupervisor`].
+    /// Builds an OTP-style [`ChildSpec`] that can be passed to a [`super::supervisor::Supervisor`].
     pub fn build_child_spec(self) -> ChildSpec {
         let mut config = self.config;
         config.channel_capacity = config.channel_capacity.max(1);
@@ -395,96 +423,81 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
         let shutdown_policy = config.shutdown_policy;
         let name = config.name.clone();
 
-        type ShutdownBinding<T, E> = (
-            std::sync::Weak<Sender<ResourceCommand<T, E>>>,
-            watch::Sender<bool>,
-        );
-        let active_shutdown_txs: Arc<std::sync::Mutex<Vec<ShutdownBinding<T, E>>>> =
-            Arc::new(std::sync::Mutex::new(Vec::new()));
-        let shutdown_txs_for_factory = active_shutdown_txs.clone();
-
-        let factory: UntypedActorFactory = Arc::new(move |new_inst| {
+        let factory: UntypedActorFactory = Arc::new(move |spawn_ctx: SpawnContext| {
             let (tx, rx) = mpsc::channel(channel_capacity);
-            let (shutdown_tx, shutdown_rx) = watch::channel(false);
-            let sender_arc = Arc::new(tx);
-            {
-                let mut guard = shutdown_txs_for_factory
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                guard.retain(|(weak_tx, watch_tx)| {
-                    weak_tx.strong_count() > 0 && !watch_tx.is_closed()
-                });
-                guard.push((Arc::downgrade(&sender_arc), shutdown_tx));
-            }
+            let (cache_tx, cache_rx) = watch::channel(None);
+            let invalidated = Arc::new(AtomicBool::new(false));
+            let endpoint = Arc::new(ResourceEndpoint {
+                sender: tx,
+                cache_rx,
+                invalidated: invalidated.clone(),
+            });
             let w = worker.clone();
             let cfg = config.clone();
             let task_handle = tokio::spawn(async move {
-                let actor =
-                    GenericResourceActor::with_shutdown_rx(cfg, rx, shutdown_rx, new_inst, w);
+                let actor = ResourceActor::with_channels(
+                    cfg,
+                    rx,
+                    cache_tx,
+                    invalidated,
+                    spawn_ctx.shutdown_rx,
+                    spawn_ctx.instance_id,
+                    w,
+                );
                 actor.run().await
             });
-            (sender_arc, task_handle)
+            (endpoint, task_handle)
         });
 
-        let shutdown_signal: ShutdownSignalFn = Arc::new(move |untyped| {
-            if let Some(cmd_tx) = untyped.downcast_ref::<Sender<ResourceCommand<T, E>>>() {
-                {
-                    let mut guard = active_shutdown_txs
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    guard.retain(|(weak_tx, watch_tx)| {
-                        if let Some(arc_tx) = weak_tx.upgrade() {
-                            if std::ptr::eq(arc_tx.as_ref(), cmd_tx) {
-                                let _ = watch_tx.send(true);
-                                return false;
-                            }
-                            !watch_tx.is_closed()
-                        } else {
-                            false
-                        }
-                    });
-                }
-                let _ = cmd_tx.try_send(ResourceCommand::Shutdown);
+        let shutdown_signal: ShutdownSignalFn = Arc::new(|untyped| {
+            if let Some(ep) = untyped.downcast_ref::<ResourceEndpoint<T, E>>() {
+                ep.invalidated.store(true, Ordering::Release);
+                let _ = ep.sender.try_send(ResourceCommand::Shutdown);
             }
         });
 
-        ChildSpec::new(name, factory, restart_policy)
+        #[allow(unused_mut)]
+        let mut spec = ChildSpec::new(name, factory, restart_policy)
             .restart_type(restart_type)
             .shutdown_policy(shutdown_policy)
-            .with_shutdown_signal(shutdown_signal)
+            .with_shutdown_signal(shutdown_signal);
+
+        #[cfg(any(test, feature = "chaos_test"))]
+        {
+            let crash_signal: ShutdownSignalFn = Arc::new(|untyped| {
+                if let Some(ep) = untyped.downcast_ref::<ResourceEndpoint<T, E>>() {
+                    ep.invalidated.store(true, Ordering::Release);
+                    let _ = ep.sender.try_send(ResourceCommand::SimulateCrash);
+                }
+            });
+            spec = spec.with_crash_signal(crash_signal);
+        }
+
+        spec
     }
 
-    /// Spawns the actor via ChildSpec on the given supervisor and returns the direct client handle.
+    /// Spawns the actor under the given [`SupervisorHandle`] and returns a direct [`ResourceClient`].
     pub async fn spawn(
         self,
-        supervisor: &ServiceSupervisorHandle,
-    ) -> Result<ResourceClient<T, E>, ServiceError> {
+        supervisor: &SupervisorHandle,
+    ) -> Result<ResourceClient<T, E>, SupervisorError> {
         let name = self.config.name.clone();
         let spec = self.build_child_spec();
         supervisor.start_child(spec).await?;
-        supervisor.get_client::<T, E>(&name).await
-    }
-
-    /// Spawns the actor via ChildSpec, registers it with the supervisor, and returns the direct client handle.
-    pub async fn spawn_and_register(
-        self,
-        supervisor: &ServiceSupervisorHandle,
-        _root: &RootSupervisorHandle,
-    ) -> Result<ResourceClient<T, E>, ServiceError> {
-        self.spawn(supervisor).await
+        supervisor.get_resource_client::<T, E>(&name).await
     }
 }
 
 impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Worker<T, E>>
-    From<GenericResourceActorBuilder<T, E, W>> for ChildSpec
+    From<ResourceActorBuilder<T, E, Arc<W>>> for ChildSpec
 {
-    fn from(builder: GenericResourceActorBuilder<T, E, W>) -> Self {
+    fn from(builder: ResourceActorBuilder<T, E, Arc<W>>) -> Self {
         builder.build_child_spec()
     }
 }
 
 // ============================================================================
-// Generic Resource Actor Implementation
+// ResourceActor Implementation
 // ============================================================================
 
 enum WorkerOutcome<T, E> {
@@ -513,10 +526,12 @@ impl<E: Clone> FailureKind<E> {
     }
 }
 
-/// Generic, fault-tolerant actor managing cached resources, cold starts, and background refreshes.
-pub struct GenericResourceActor<T = (), E = (), W = ()> {
+/// Fault-tolerant actor managing cached resources, cold starts, single-flight coalescing, and background refreshes.
+pub struct ResourceActor<T = (), E = (), W = ()> {
     name: String,
     receiver: Receiver<ResourceCommand<T, E>>,
+    cache_tx: watch::Sender<Option<ResourceSnapshot<T>>>,
+    invalidated: Arc<AtomicBool>,
     shutdown_rx: watch::Receiver<bool>,
     current_resource: Option<TimedResource<T>>,
     refresh_in_flight: bool,
@@ -541,25 +556,27 @@ pub struct GenericResourceActor<T = (), E = (), W = ()> {
     current_worker_abort: Option<tokio::task::AbortHandle>,
 }
 
-impl GenericResourceActor<(), (), ()> {
-    /// Returns a new fluent builder to configure and spawn a generic resource actor.
-    pub fn builder(name: impl Into<String>) -> ActorBuilder {
-        ActorBuilder::new(name)
+impl ResourceActor<(), (), ()> {
+    /// Returns a new fluent [`ResourceActorBuilder`] to configure and spawn a [`ResourceActor`].
+    pub fn builder(name: impl Into<String>) -> ResourceActorBuilder<(), (), ()> {
+        ResourceActorBuilder::new(name)
     }
 
-    /// Alias for `builder`: Returns a new fluent builder to configure an actor ChildSpec.
-    pub fn spec(name: impl Into<String>) -> ActorBuilder {
-        ActorBuilder::new(name)
+    /// Alias for [`ResourceActor::builder`].
+    pub fn spec(name: impl Into<String>) -> ResourceActorBuilder<(), (), ()> {
+        ResourceActorBuilder::new(name)
     }
 }
 
 impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Worker<T, E>>
-    GenericResourceActor<T, E, W>
+    ResourceActor<T, E, W>
 {
-    /// Initializes a generic resource actor instance with an explicit supervisor shutdown watch channel.
-    pub(crate) fn with_shutdown_rx(
-        config: ActorConfig,
+    /// Initializes a [`ResourceActor`] instance with its mailbox, zero-hop watch sender, and shutdown receiver.
+    pub(crate) fn with_channels(
+        config: ResourceActorConfig,
         receiver: Receiver<ResourceCommand<T, E>>,
+        cache_tx: watch::Sender<Option<ResourceSnapshot<T>>>,
+        invalidated: Arc<AtomicBool>,
         shutdown_rx: watch::Receiver<bool>,
         instance_id: usize,
         worker: Arc<W>,
@@ -567,6 +584,8 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
         Self {
             name: config.name,
             receiver,
+            cache_tx,
+            invalidated,
             shutdown_rx,
             current_resource: None,
             refresh_in_flight: false,
@@ -613,8 +632,6 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
             .unwrap_or(u64::MAX)
             .max(1);
 
-        // Hash name, instance_id, generation, and current wall-clock nanos to ensure
-        // actors with different names or across time don't collide on the same jitter.
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         self.name.hash(&mut hasher);
         self.instance_id.hash(&mut hasher);
@@ -734,21 +751,6 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
         self.next_proactive_target = Some(target);
     }
 
-    /// Shorthand constructor spawning with default configuration.
-    pub async fn spawn_and_register(
-        name: impl Into<String>,
-        worker: W,
-        expiry_buffer: Duration,
-        supervisor: &ServiceSupervisorHandle,
-        root: &RootSupervisorHandle,
-    ) -> Result<ResourceClient<T, E>, ServiceError> {
-        ActorBuilder::new(name)
-            .worker(worker)
-            .expiry_buffer(expiry_buffer)
-            .spawn_and_register(supervisor, root)
-            .await
-    }
-
     /// Main message processing loop (supervised within actor task).
     pub(crate) async fn run(mut self) -> TaskResult {
         let mut worker_tasks: JoinSet<WorkerOutcome<T, E>> = JoinSet::new();
@@ -835,6 +837,8 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
                                     panic = ?join_err,
                                     "💥 WORKER PANIC ESCALATED."
                                 );
+                                self.invalidated.store(true, Ordering::Release);
+                                self.cache_tx.send_replace(None);
                                 self.current_worker_abort = None;
                                 self.refresh_in_flight = false;
                                 self.waiters.clear();
@@ -852,6 +856,7 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
 
                 cmd_opt = self.receiver.recv() => {
                     let Some(command) = cmd_opt else {
+                        self.invalidated.store(true, Ordering::Release);
                         return Ok(());
                     };
 
@@ -883,16 +888,19 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
                         ResourceCommand::Shutdown => {
                             return self.finish_graceful_shutdown(&mut worker_tasks).await;
                         }
+                        #[cfg(any(test, feature = "chaos_test"))]
                         ResourceCommand::SimulateCrash => {
                             tracing::warn!(
                                 actor = %self.name,
                                 instance = self.instance_id,
                                 "💥 CRASH COMMAND RECEIVED: Terminating actor with crash error!"
                             );
+                            self.invalidated.store(true, Ordering::Release);
+                            self.cache_tx.send_replace(None);
                             worker_tasks.abort_all();
                             self.waiters.clear();
                             return Err(format!(
-                                "Intentional crash triggered via SimulateCrash on Actor '{}' #{}",
+                                "Intentional crash triggered via SimulateCrash on ResourceActor '{}' #{}",
                                 self.name, self.instance_id
                             ));
                         }
@@ -915,7 +923,8 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
             "🛑 Graceful shutdown initiated. Closing mailbox and completing in-flight work..."
         );
 
-        // 1. Close mailbox so no new requests can be queued
+        // 1. Mark zero-hop cache invalidated and close mailbox so no new requests can be queued
+        self.invalidated.store(true, Ordering::Release);
         self.receiver.close();
 
         // 2. Drain any requests already buffered in the channel
@@ -965,6 +974,7 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
         }
 
         // 4. Clean up any remaining waiters or background tasks
+        self.cache_tx.send_replace(None);
         for waiter in self.waiters.drain(..) {
             let _ = waiter.send(Err(ResourceError::ActorUnavailable));
         }
@@ -973,7 +983,7 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
         tracing::info!(
             actor = %self.name,
             instance = self.instance_id,
-            "✅ Actor graceful shutdown complete."
+            "✅ ResourceActor graceful shutdown complete."
         );
         Ok(())
     }
@@ -1164,9 +1174,11 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
                 max_failures,
                 "💥 Worker exceeded max_consecutive_failures via timeout; escalating to supervisor!"
             );
+            self.invalidated.store(true, Ordering::Release);
+            self.cache_tx.send_replace(None);
             self.waiters.clear();
             return Err(format!(
-                "Actor '{}' #{} exceeded max_consecutive_failures ({}) after worker timeout",
+                "ResourceActor '{}' #{} exceeded max_consecutive_failures ({}) after worker timeout",
                 self.name, self.instance_id, max_failures
             ));
         }
@@ -1190,7 +1202,8 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
         Ok(())
     }
 
-    /// Updates cache with the worker output if generation matches, and broadcasts to parked waiters.
+    /// Updates cache with the worker output if generation matches, publishes to the 0-hop `watch` channel,
+    /// and broadcasts to parked waiters.
     fn handle_refresh_complete(
         &mut self,
         generation: usize,
@@ -1225,7 +1238,7 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
                 let val = new_resource.value.clone();
                 let expires_at = new_resource.expires_at;
                 let now = Instant::now();
-                self.refresh_threshold = expires_at.map(|exp| {
+                let threshold = expires_at.map(|exp| {
                     if exp <= now {
                         now
                     } else {
@@ -1234,7 +1247,12 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
                         exp.checked_sub(effective_buffer).unwrap_or(now)
                     }
                 });
-                self.current_resource = Some(new_resource);
+                self.refresh_threshold = threshold;
+                self.current_resource = Some(new_resource.clone());
+                self.cache_tx.send_replace(Some(ResourceSnapshot {
+                    resource: new_resource,
+                    refresh_threshold: threshold,
+                }));
 
                 if self.proactive_refresh {
                     self.schedule_proactive_refresh(expires_at);
@@ -1267,9 +1285,11 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
                         max_failures,
                         "💥 Worker exceeded max_consecutive_failures; escalating to supervisor!"
                     );
+                    self.invalidated.store(true, Ordering::Release);
+                    self.cache_tx.send_replace(None);
                     self.waiters.clear();
                     return Err(format!(
-                        "Actor '{}' #{} exceeded max_consecutive_failures ({})",
+                        "ResourceActor '{}' #{} exceeded max_consecutive_failures ({})",
                         self.name, self.instance_id, max_failures
                     ));
                 }
@@ -1296,27 +1316,30 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
 }
 
 // ============================================================================
-// Direct Generic Resource Client Handle (Data Plane)
+// Direct Resource Client Handle (Zero-Hop Cache + 1-Hop Control/Miss Data Plane)
 // ============================================================================
 
-/// High-performance, direct Data Plane client for any [`GenericResourceActor`].
+/// High-performance, self-healing Data Plane client for a [`ResourceActor`].
 #[derive(Clone)]
 pub struct ResourceClient<T, E> {
     name: String,
-    sender: Arc<std::sync::RwLock<Sender<ResourceCommand<T, E>>>>,
-    supervisor: ServiceSupervisorHandle,
+    endpoint: Arc<RwLock<ResourceEndpoint<T, E>>>,
+    slot_rx: Arc<RwLock<watch::Receiver<SlotState>>>,
+    supervisor: SupervisorHandle,
 }
 
 impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static> ResourceClient<T, E> {
-    /// Creates a new direct client handle.
+    /// Creates a new direct client handle subscribed to the child's [`SlotState`] watch channel.
     pub(crate) fn new(
         name: impl Into<String>,
-        sender: Arc<std::sync::RwLock<Sender<ResourceCommand<T, E>>>>,
-        supervisor: ServiceSupervisorHandle,
+        endpoint: ResourceEndpoint<T, E>,
+        slot_rx: watch::Receiver<SlotState>,
+        supervisor: SupervisorHandle,
     ) -> Self {
         Self {
             name: name.into(),
-            sender,
+            endpoint: Arc::new(RwLock::new(endpoint)),
+            slot_rx: Arc::new(RwLock::new(slot_rx)),
             supervisor,
         }
     }
@@ -1326,108 +1349,157 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static> Resourc
         &self.name
     }
 
-    /// Resolves and updates the internal sender channel from the [`ServiceSupervisorHandle`].
-    async fn rebind_channel(&self) -> Result<(), ResourceError<E>> {
-        for retry in 0..4 {
-            match self
-                .supervisor
-                .resolve_actor_channel::<Sender<ResourceCommand<T, E>>>(&self.name)
-                .await
-            {
-                Ok(new_sender) if !new_sender.is_closed() => {
-                    *self
-                        .sender
-                        .write()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = new_sender;
-                    tracing::info!(
-                        actor = %self.name,
-                        "🔄 Channel re-established with replacement actor! Retrying direct request..."
-                    );
-                    return Ok(());
-                }
-                Ok(_) => {
-                    if retry == 0 {
-                        tokio::task::yield_now().await;
-                    } else {
-                        tokio::time::sleep(Duration::from_millis(2)).await;
-                    }
-                }
-                Err(err) => {
-                    tracing::error!(
-                        actor = %self.name,
-                        error = ?err,
-                        "❌ Failed to rebind channel."
-                    );
-                    return Err(ResourceError::Service(err));
-                }
-            }
-        }
-        Err(ResourceError::ActorUnavailable)
+    /// Returns a reference to the [`SupervisorHandle`] managing this actor.
+    pub fn supervisor(&self) -> &SupervisorHandle {
+        &self.supervisor
     }
 
-    /// Re-binds the direct channel immediately if the supervisor has already replaced the actor
-    /// (or awaits an in-progress restart via `pending_resolutions`), falling back to a brief
-    /// 60 ms delay only if the crash notification has not yet reached the supervisor.
-    async fn backoff_and_rebind(&self) -> Result<(), ResourceError<E>> {
-        const REBIND_BACKOFF: Duration = Duration::from_millis(60);
-        for first_try in [true, false] {
-            match self.rebind_channel().await {
-                Ok(()) => return Ok(()),
-                Err(ResourceError::Service(
-                    err @ (ServiceError::MaxRestartsExceeded(_, _, _)
-                    | ServiceError::ActorNotFound(_)
-                    | ServiceError::ActorTypeMismatch(_)),
-                )) => return Err(ResourceError::Service(err)),
-                Err(_) if first_try => {
-                    tokio::time::sleep(REBIND_BACKOFF).await;
-                }
-                Err(err) => return Err(err),
+    fn current_endpoint(&self) -> ResourceEndpoint<T, E> {
+        self.endpoint
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Reactively waits on the [`SlotState`] watch channel until a replacement [`ResourceActor`] instance is running,
+    /// or returns immediately if the actor was stopped or permanently failed.
+    async fn rebind_channel(
+        &self,
+        failed_sender: &Sender<ResourceCommand<T, E>>,
+    ) -> Result<(), ResourceError<E>> {
+        {
+            let current = self.current_endpoint();
+            if !current.invalidated.load(Ordering::Acquire)
+                && !current.sender.is_closed()
+                && !current.sender.same_channel(failed_sender)
+            {
+                return Ok(());
             }
         }
-        Ok(())
+
+        loop {
+            let mut rx = self
+                .slot_rx
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+
+            let wait_state = rx
+                .wait_for(|state| match state {
+                    SlotState::Running { endpoint, .. } => endpoint
+                        .downcast_ref::<ResourceEndpoint<T, E>>()
+                        .is_some_and(|ep| {
+                            !ep.invalidated.load(Ordering::Acquire)
+                                && !ep.sender.is_closed()
+                                && !ep.sender.same_channel(failed_sender)
+                        }),
+                    SlotState::Stopped | SlotState::Failed(_) => true,
+                    SlotState::Restarting { .. } => false,
+                })
+                .await
+                .ok()
+                .map(|s| s.clone());
+
+            if let Some(state_ref) = wait_state {
+                match &state_ref {
+                    SlotState::Running { endpoint, .. } => {
+                        if let Some(new_ep) = endpoint.downcast_ref::<ResourceEndpoint<T, E>>() {
+                            *self
+                                .endpoint
+                                .write()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                new_ep.clone();
+                            tracing::info!(
+                                actor = %self.name,
+                                "🔄 ResourceClient channel re-established with replacement actor!"
+                            );
+                            return Ok(());
+                        }
+                        return Err(ResourceError::Supervisor(
+                            SupervisorError::ChildTypeMismatch(self.name.clone()),
+                        ));
+                    }
+                    SlotState::Failed(err) => return Err(ResourceError::Supervisor(err.clone())),
+                    SlotState::Stopped => {
+                        return Err(ResourceError::Supervisor(SupervisorError::ChildNotFound(
+                            self.name.clone(),
+                        )));
+                    }
+                    SlotState::Restarting { .. } => unreachable!(),
+                }
+            }
+
+            // The watch::Sender in the parent supervisor was dropped (e.g. parent supervisor restarted).
+            // Re-resolve the slot from `self.supervisor`.
+            let new_rx = self
+                .supervisor
+                .resolve_child_slot(&self.name)
+                .await
+                .map_err(ResourceError::Supervisor)?;
+            *self
+                .slot_rx
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = new_rx;
+        }
     }
 
     /// Sends a one-way command to the actor, transparently rebinding if the channel was closed by a prior crash.
     async fn send_control(
         &self,
+        invalidate_cache: bool,
         make_cmd: impl Fn() -> ResourceCommand<T, E>,
     ) -> Result<(), ResourceError<E>> {
         const MAX_ATTEMPTS: usize = 3;
 
         for attempt in 1..=MAX_ATTEMPTS {
-            let current_sender = self
-                .sender
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
+            let current_ep = self.current_endpoint();
+            if invalidate_cache {
+                current_ep.invalidated.store(true, Ordering::Release);
+            }
 
-            if current_sender.send(make_cmd()).await.is_ok() {
+            if current_ep.sender.send(make_cmd()).await.is_ok() {
                 return Ok(());
             }
 
             if attempt < MAX_ATTEMPTS {
-                self.backoff_and_rebind().await?;
+                self.rebind_channel(&current_ep.sender).await?;
             }
         }
 
         Err(ResourceError::ActorUnavailable)
     }
 
-    /// Retrieves the resource directly from the actor over its direct channel (1-hop).
-    /// On channel disconnection (caused by an actor crash or restart), automatically rebinds via
-    /// the [`ServiceSupervisorHandle`] and transparently retries.
+    /// Retrieves the resource:
+    /// - **0-Hop Fast Path**: If the actor holds a fresh cached resource outside its expiration buffer,
+    ///   returns a clone directly from the [`tokio::sync::watch`] channel without any channel allocation or context switch.
+    /// - **1-Hop Coalesced Path**: On cold start, pre-expiration refresh window, or stale-while-error recovery,
+    ///   sends a direct request to the [`ResourceActor`] and transparently rebinds via [`SlotState`] on crash/restart.
     pub async fn get(&self) -> Result<T, ResourceError<E>> {
+        // 0-hop fast path via watch::Receiver
+        {
+            let current_ep = self.current_endpoint();
+            if !current_ep.invalidated.load(Ordering::Acquire)
+                && !current_ep.sender.is_closed()
+                && let Some(snapshot) = current_ep.cache_rx.borrow().as_ref()
+                && snapshot.resource.is_still_usable()
+            {
+                let needs_refresh = snapshot
+                    .refresh_threshold
+                    .is_some_and(|threshold| Instant::now() >= threshold);
+                if !needs_refresh {
+                    return Ok(snapshot.resource.value.clone());
+                }
+            }
+        }
+
         const MAX_ATTEMPTS: usize = 3;
 
         for attempt in 1..=MAX_ATTEMPTS {
-            let current_sender = self
-                .sender
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
+            let current_ep = self.current_endpoint();
 
             let (tx, rx) = oneshot::channel();
-            let send_res = current_sender
+            let send_res = current_ep
+                .sender
                 .send(ResourceCommand::GetResource { respond_to: tx })
                 .await;
 
@@ -1443,17 +1515,17 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static> Resourc
                     actor = %self.name,
                     attempt,
                     max_attempts = MAX_ATTEMPTS,
-                    "⚠️ Direct channel broken or actor restarting. Rebinding via ServiceSupervisor..."
+                    "⚠️ Direct channel broken or actor restarting. Rebinding via reactive watch slot..."
                 );
 
-                self.backoff_and_rebind().await?;
+                self.rebind_channel(&current_ep.sender).await?;
             }
         }
 
         Err(ResourceError::ActorUnavailable)
     }
 
-    /// Retrieves the resource directly from the actor with a client-side timeout deadline.
+    /// Retrieves the resource with a client-side timeout deadline.
     pub async fn get_timeout(&self, timeout: Duration) -> Result<T, ResourceError<E>> {
         tokio::time::timeout(timeout, self.get())
             .await
@@ -1462,16 +1534,19 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static> Resourc
 
     /// Proactively forces a background refresh, superseding any currently in-flight refresh.
     pub async fn force_refresh(&self) -> Result<(), ResourceError<E>> {
-        self.send_control(|| ResourceCommand::ForceRefresh).await
+        self.send_control(false, || ResourceCommand::ForceRefresh)
+            .await
     }
 
     /// Requests a graceful shutdown of the actor over its direct data-plane channel.
     pub async fn shutdown(&self) -> Result<(), ResourceError<E>> {
-        self.send_control(|| ResourceCommand::Shutdown).await
+        self.send_control(true, || ResourceCommand::Shutdown).await
     }
 
-    /// Injects an intentional crash command directly into the actor.
+    /// Injects an intentional crash command directly into the actor for resilience testing.
+    #[cfg(any(test, feature = "chaos_test"))]
     pub async fn simulate_crash(&self) -> Result<(), ResourceError<E>> {
-        self.send_control(|| ResourceCommand::SimulateCrash).await
+        self.send_control(true, || ResourceCommand::SimulateCrash)
+            .await
     }
 }

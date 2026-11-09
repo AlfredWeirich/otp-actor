@@ -5,8 +5,9 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 use tonic::{Request, Response, Status};
 
-use crate::actor::RootSupervisorHandle;
+use crate::actor::SupervisorHandle;
 use crate::remote::endpoint::MAX_GRPC_FRAME_BYTES;
+use crate::remote::error::RemoteNodeError;
 use crate::remote::proto::call_response::Result as CallResult;
 use crate::remote::proto::{
     ActorNode, ActorNodeServer, CallRequest, CallResponse, CastRequest, CastResponse,
@@ -63,6 +64,7 @@ impl ActorNode for ActorNodeService {
     )]
     async fn cast(&self, request: Request<CastRequest>) -> Result<Response<CastResponse>, Status> {
         let req = request.into_inner();
+        let timeout = req.timeout_ms.map(Duration::from_millis);
 
         let endpoint = match self.registry.resolve(&req.service_name, &req.actor_name) {
             Ok(ep) => ep,
@@ -73,7 +75,7 @@ impl ActorNode for ActorNodeService {
             }
         };
 
-        let response = endpoint.cast_bytes(&req.payload).await;
+        let response = endpoint.cast_bytes(&req.payload, timeout).await;
         Ok(Response::new(response))
     }
 }
@@ -85,7 +87,7 @@ pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct ActorNodeHandle {
     addr: SocketAddr,
     registry: ActorNodeRegistry,
-    root: Option<RootSupervisorHandle>,
+    supervisor: Option<SupervisorHandle>,
     drain_timeout: Option<Duration>,
     shutdown_tx: Option<oneshot::Sender<()>>,
     server_task: Option<tokio::task::JoinHandle<Result<(), tonic::transport::Error>>>,
@@ -96,8 +98,8 @@ impl ActorNodeHandle {
     pub async fn start(
         addr: SocketAddr,
         registry: ActorNodeRegistry,
-        root: Option<RootSupervisorHandle>,
-    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        supervisor: Option<SupervisorHandle>,
+    ) -> Result<Self, RemoteNodeError> {
         let listener = tokio::net::TcpListener::bind(addr).await?;
         let local_addr = listener.local_addr()?;
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -120,7 +122,7 @@ impl ActorNodeHandle {
         Ok(Self {
             addr: local_addr,
             registry,
-            root,
+            supervisor,
             drain_timeout: Some(DEFAULT_DRAIN_TIMEOUT),
             shutdown_tx: Some(shutdown_tx),
             server_task: Some(server_task),
@@ -128,7 +130,7 @@ impl ActorNodeHandle {
     }
 
     /// Sets the maximum duration to wait in Phase 1 for active in-flight gRPC requests to drain
-    /// before aborting remaining streams and proceeding to Phase 2 (`RootSupervisor` shutdown).
+    /// before aborting remaining streams and proceeding to Phase 2 (`Supervisor` shutdown).
     ///
     /// Defaults to [`DEFAULT_DRAIN_TIMEOUT`] (`10s`).
     #[must_use]
@@ -156,8 +158,8 @@ impl ActorNodeHandle {
 
     /// Performs a coordinated two-phase graceful shutdown:
     /// 1. Closes the gRPC server (HTTP/2 GOAWAY) and drains active in-flight requests (bounded by `drain_timeout`).
-    /// 2. If a `RootSupervisorHandle` was attached, initiates cascading actor subtree shutdown.
-    pub async fn shutdown(mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    /// 2. If a `SupervisorHandle` was attached, initiates cascading actor subtree shutdown.
+    pub async fn shutdown(mut self) -> Result<(), RemoteNodeError> {
         tracing::info!(addr = %self.addr, "Initiating Phase 1: gRPC server shutdown");
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
@@ -182,9 +184,9 @@ impl ActorNodeHandle {
             }
         }
 
-        if let Some(root) = self.root.take() {
-            tracing::info!("Initiating Phase 2: RootSupervisor cascading subtree shutdown");
-            root.shutdown().await?;
+        if let Some(supervisor) = self.supervisor.take() {
+            tracing::info!("Initiating Phase 2: Supervisor cascading subtree shutdown");
+            supervisor.shutdown().await?;
         }
 
         tracing::info!(addr = %self.addr, "Coordinated 2-phase shutdown complete");

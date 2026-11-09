@@ -4,7 +4,29 @@ use crate::remote::proto::RemoteError;
 use crate::remote::proto::remote_error::Kind;
 use std::fmt::{self, Debug, Display};
 
+/// Error encountered when starting or shutting down a remote [`crate::remote::ActorNodeHandle`].
+#[non_exhaustive]
+#[derive(Debug, thiserror::Error)]
+pub enum RemoteNodeError {
+    /// Failed to bind TCP listener socket.
+    #[error("Failed to bind TCP listener: {0}")]
+    Bind(#[from] std::io::Error),
+
+    /// Tonic gRPC server transport error.
+    #[error("gRPC server transport error: {0}")]
+    Transport(#[from] tonic::transport::Error),
+
+    /// Server background task panicked or was cancelled.
+    #[error("Server task failed to join: {0}")]
+    Join(#[from] tokio::task::JoinError),
+
+    /// Attached supervisor subtree failed to shut down cleanly.
+    #[error("Supervisor shutdown error: {0}")]
+    Supervisor(#[from] crate::actor::SupervisorError),
+}
+
 /// Error encountered when communicating with a remote actor over gRPC.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum RemoteActorError<E> {
     /// Domain-specific error returned by the remote actor's `handle` method.
@@ -24,6 +46,9 @@ pub enum RemoteActorError<E> {
 
     /// The remote actor is temporarily unavailable (e.g. recovering or restarting).
     ActorUnavailable,
+
+    /// The remote actor exceeded its restart intensity budget and was permanently terminated.
+    MaxRestartsExceeded(String),
 
     /// Operation timed out waiting for the remote node or actor.
     Timeout,
@@ -47,6 +72,9 @@ impl<E: Display> Display for RemoteActorError<E> {
             Self::ActorNotFound(act) => write!(f, "Actor '{act}' not found on remote node"),
             Self::MailboxFull => write!(f, "Remote actor mailbox is full"),
             Self::ActorUnavailable => write!(f, "Remote actor is temporarily unavailable"),
+            Self::MaxRestartsExceeded(msg) => {
+                write!(f, "Remote actor exceeded max restarts: {msg}")
+            }
             Self::Timeout => write!(f, "Remote actor operation timed out"),
             Self::Serialization(msg) => write!(f, "Serialization error: {msg}"),
             Self::Deserialization(msg) => write!(f, "Deserialization error: {msg}"),
@@ -78,6 +106,7 @@ impl<E> From<RemoteError> for RemoteActorError<E> {
             Kind::ActorNotFound => RemoteActorError::ActorNotFound(err.message),
             Kind::MailboxFull => RemoteActorError::MailboxFull,
             Kind::ActorUnavailable => RemoteActorError::ActorUnavailable,
+            Kind::MaxRestartsExceeded => RemoteActorError::MaxRestartsExceeded(err.message),
             Kind::Timeout => RemoteActorError::Timeout,
             Kind::Serialization => RemoteActorError::Serialization(err.message),
             Kind::Deserialization => RemoteActorError::Deserialization(err.message),
@@ -94,15 +123,25 @@ impl<E: ToString> From<crate::actor::ActorError<E>> for RemoteError {
                 kind: Kind::ActorUnavailable as i32,
                 message: "Actor task terminated unexpectedly or is unavailable".into(),
             },
-            crate::actor::ActorError::Service(crate::actor::ServiceError::ActorNotFound(name)) => {
-                RemoteError {
-                    kind: Kind::ActorNotFound as i32,
-                    message: name,
-                }
-            }
-            crate::actor::ActorError::Service(other_svc_err) => RemoteError {
+            crate::actor::ActorError::MailboxFull => RemoteError {
+                kind: Kind::MailboxFull as i32,
+                message: "Actor mailbox is full".into(),
+            },
+            crate::actor::ActorError::Supervisor(
+                crate::actor::SupervisorError::ChildNotFound(name),
+            ) => RemoteError {
+                kind: Kind::ActorNotFound as i32,
+                message: name,
+            },
+            crate::actor::ActorError::Supervisor(
+                crate::actor::SupervisorError::MaxRestartsExceeded(name, max, window),
+            ) => RemoteError {
+                kind: Kind::MaxRestartsExceeded as i32,
+                message: format!("Child '{name}' exceeded max restarts ({max} in {window:?})"),
+            },
+            crate::actor::ActorError::Supervisor(other_sup_err) => RemoteError {
                 kind: Kind::ActorUnavailable as i32,
-                message: other_svc_err.to_string(),
+                message: other_sup_err.to_string(),
             },
             crate::actor::ActorError::Timeout(duration) => RemoteError {
                 kind: Kind::Timeout as i32,

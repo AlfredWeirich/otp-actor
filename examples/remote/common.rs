@@ -30,7 +30,7 @@ impl StatefulActor for BankAccountActor {
     type Response = i64;
     type Error = String;
 
-    async fn on_start(&mut self, _ctx: &mut ActorContext) -> Result<(), Self::Error> {
+    async fn on_start(&mut self, _ctx: &mut ActorContext<Self>) -> Result<(), Self::Error> {
         tracing::info!(
             account = %self.account_id,
             initial_balance = self.balance,
@@ -42,7 +42,7 @@ impl StatefulActor for BankAccountActor {
     async fn handle(
         &mut self,
         msg: Self::Message,
-        ctx: &mut ActorContext,
+        ctx: &mut ActorContext<Self>,
     ) -> Result<Self::Response, Self::Error> {
         match msg {
             AccountMsg::Deposit(amount) => {
@@ -98,7 +98,7 @@ impl StatefulActor for BankAccountActor {
         }
     }
 
-    async fn on_stop(&mut self, _ctx: &mut ActorContext) {
+    async fn on_stop(&mut self, _ctx: &mut ActorContext<Self>) {
         tracing::info!(
             account = %self.account_id,
             final_balance = self.balance,

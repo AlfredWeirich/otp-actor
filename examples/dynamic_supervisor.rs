@@ -1,11 +1,11 @@
 //! # Example: Dynamic Subsystem Supervision (Dynamic Subtree)
 //!
 //! Demonstrates how an actor (`TenantManager`) dynamically spawns a **new dedicated**
-//! `ServiceSupervisor` at runtime and registers two tightly-coupled child actors
+//! child `Supervisor` at runtime and registers two tightly-coupled child actors
 //! (`DatabaseWorker` and `CacheWorker`) under it using the `OneForAll` supervision strategy.
 //!
 //! ### Key Architectural Takeaways:
-//! 1. **Dynamic Subtree Creation**: The manager actor holds a `RootSupervisorHandle`
+//! 1. **Dynamic Subtree Creation**: The manager actor holds a `SupervisorHandle`
 //!    and provisions isolated domain supervisors on demand (e.g., per-tenant, per-session).
 //! 2. **Isolated Failure Domain (`OneForAll`)**: If `DatabaseWorker` crashes, the dedicated
 //!    tenant supervisor restarts *both* `DatabaseWorker` and `CacheWorker` to guarantee
@@ -14,8 +14,8 @@
 //!    terminates the entire multi-level tree.
 
 use otp_actor::actor::{
-    ActorClient, ActorContext, RestartType, RootSupervisor, RootSupervisorHandle,
-    ServiceSupervisor, StatefulActor, StatefulActorBuilder, SupervisionStrategy,
+    ActorClient, ActorContext, RestartType, StatefulActor, StatefulActorBuilder,
+    SupervisionStrategy, Supervisor, SupervisorHandle,
 };
 use std::time::Duration;
 
@@ -42,7 +42,7 @@ impl StatefulActor for DatabaseWorker {
     async fn handle(
         &mut self,
         msg: Self::Message,
-        ctx: &mut ActorContext,
+        ctx: &mut ActorContext<Self>,
     ) -> Result<Self::Response, Self::Error> {
         match msg {
             DbMsg::Query(sql) => {
@@ -83,7 +83,7 @@ impl StatefulActor for CacheWorker {
     async fn handle(
         &mut self,
         msg: Self::Message,
-        ctx: &mut ActorContext,
+        ctx: &mut ActorContext<Self>,
     ) -> Result<Self::Response, Self::Error> {
         match msg {
             CacheMsg::Get(key) => {
@@ -105,12 +105,12 @@ struct TenantClients {
 }
 
 // ============================================================================
-// Manager Actor (Actor A): Holds RootSupervisorHandle via DI
+// Manager Actor (Actor A): Holds root SupervisorHandle via DI
 // ============================================================================
 
 #[derive(Clone)]
 struct TenantManager {
-    root: RootSupervisorHandle,
+    root: SupervisorHandle,
 }
 
 enum ManagerMsg {
@@ -125,24 +125,22 @@ impl StatefulActor for TenantManager {
     async fn handle(
         &mut self,
         msg: Self::Message,
-        _ctx: &mut ActorContext,
+        _ctx: &mut ActorContext<Self>,
     ) -> Result<Self::Response, Self::Error> {
         match msg {
             ManagerMsg::ProvisionTenant(tenant_id) => {
                 let supervisor_name = format!("tenant-{tenant_id}-service");
                 println!(
-                    "  [TenantManager] 1. Spawning dedicated ServiceSupervisor '{}' (Strategy: OneForAll)...",
+                    "  [TenantManager] 1. Spawning dedicated child Supervisor '{}' (Strategy: OneForAll)...",
                     supervisor_name
                 );
 
-                // 1. Dynamically spawn a brand new ServiceSupervisor under RootSupervisor
-                let tenant_supervisor = ServiceSupervisor::spawn_and_register_with_strategy(
-                    supervisor_name,
-                    SupervisionStrategy::OneForAll,
-                    &self.root,
-                )
-                .await
-                .map_err(|e| e.to_string())?;
+                // 1. Dynamically spawn a brand new child Supervisor under the root Supervisor
+                let tenant_supervisor = Supervisor::builder(supervisor_name)
+                    .strategy(SupervisionStrategy::OneForAll)
+                    .spawn(&self.root)
+                    .await
+                    .map_err(|e| e.to_string())?;
 
                 // 2. Register DatabaseWorker (Child B) under the new supervisor
                 let db_name = format!("db-{tenant_id}");
@@ -193,11 +191,12 @@ impl StatefulActor for TenantManager {
 async fn main() {
     println!("=== Dynamic Subtree Supervision with otp-actor ===\n");
 
-    // Step 1: Initialize the RootSupervisor
-    let root = RootSupervisor::new();
+    // Step 1: Initialize the root Supervisor
+    let root = Supervisor::new("root");
 
-    // Step 2: Start an Admin ServiceSupervisor to host our TenantManager
-    let admin_service = ServiceSupervisor::spawn_and_register("admin-service", &root)
+    // Step 2: Start an Admin child Supervisor to host our TenantManager
+    let admin_service = Supervisor::builder("admin-service")
+        .spawn(&root)
         .await
         .expect("Failed to spawn admin-service");
 
@@ -266,6 +265,6 @@ async fn main() {
     println!("--- Step 4: Hierarchical Graceful Shutdown ---");
     root.shutdown().await.expect("Shutdown failed");
     println!(
-        "✅ RootSupervisor, all ServiceSupervisors, and all dynamic sub-actors shut down cleanly."
+        "✅ Root Supervisor, all child Supervisors, and all dynamic sub-actors shut down cleanly."
     );
 }

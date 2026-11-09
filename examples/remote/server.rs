@@ -15,7 +15,7 @@
 mod common;
 
 use common::BankAccountActor;
-use otp_actor::actor::{RestartType, RootSupervisor, ServiceSupervisor, StatefulActorBuilder};
+use otp_actor::actor::{RestartType, StatefulActorBuilder, Supervisor};
 use otp_actor::remote::{ActorNodeHandle, ActorNodeRegistry};
 use std::net::SocketAddr;
 
@@ -33,8 +33,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("============================================================\n");
 
     // 1. Initialize Supervision Tree
-    let root = RootSupervisor::new();
-    let service = ServiceSupervisor::spawn_and_register("banking-service", &root).await?;
+    let root = Supervisor::new("root");
+    let service = Supervisor::builder("banking-service").spawn(&root).await?;
 
     // 2. Start initial actor instance under OTP supervision
     let initial_account = BankAccountActor {

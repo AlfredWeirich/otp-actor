@@ -26,6 +26,7 @@ pub struct RemoteActorClient<A: StatefulActor> {
     service_name: String,
     actor_name: String,
     channel: Channel,
+    client: ActorNodeClient<Channel>,
     _phantom: PhantomData<A>,
 }
 
@@ -36,10 +37,14 @@ impl<A: StatefulActor> RemoteActorClient<A> {
         service_name: impl Into<String>,
         actor_name: impl Into<String>,
     ) -> Self {
+        let client = ActorNodeClient::new(channel.clone())
+            .max_decoding_message_size(MAX_GRPC_FRAME_BYTES)
+            .max_encoding_message_size(MAX_GRPC_FRAME_BYTES);
         Self {
             service_name: service_name.into(),
             actor_name: actor_name.into(),
             channel,
+            client,
             _phantom: PhantomData,
         }
     }
@@ -120,9 +125,7 @@ impl<A: StatefulActor> RemoteActorClient<A> {
             request.set_timeout(dur);
         }
 
-        let mut client = ActorNodeClient::new(self.channel.clone())
-            .max_decoding_message_size(MAX_GRPC_FRAME_BYTES)
-            .max_encoding_message_size(MAX_GRPC_FRAME_BYTES);
+        let mut client = self.client.clone();
         let response = client.call(request).await?.into_inner();
 
         match response.result {
@@ -146,18 +149,45 @@ impl<A: StatefulActor> RemoteActorClient<A> {
     where
         A::Message: serde::Serialize,
     {
+        self.cast_internal(msg, None).await
+    }
+
+    /// Sends an asynchronous fire-and-forget notification (`cast`) with a client-side timeout deadline.
+    pub async fn cast_timeout(
+        &self,
+        msg: A::Message,
+        timeout: Duration,
+    ) -> Result<(), RemoteActorError<A::Error>>
+    where
+        A::Message: serde::Serialize,
+    {
+        tokio::time::timeout(timeout, self.cast_internal(msg, Some(timeout)))
+            .await
+            .map_err(|_| RemoteActorError::Timeout)?
+    }
+
+    async fn cast_internal(
+        &self,
+        msg: A::Message,
+        timeout: Option<Duration>,
+    ) -> Result<(), RemoteActorError<A::Error>>
+    where
+        A::Message: serde::Serialize,
+    {
         let payload =
             encode_payload(&msg).map_err(|e| RemoteActorError::Serialization(e.to_string()))?;
 
-        let request = CastRequest {
+        let mut request = tonic::Request::new(CastRequest {
             service_name: self.service_name.clone(),
             actor_name: self.actor_name.clone(),
             payload,
-        };
+            timeout_ms: timeout.map(duration_to_wire_ms),
+        });
+        if let Some(dur) = timeout {
+            request.set_timeout(dur);
+        }
 
-        let mut client = ActorNodeClient::new(self.channel.clone())
-            .max_decoding_message_size(MAX_GRPC_FRAME_BYTES)
-            .max_encoding_message_size(MAX_GRPC_FRAME_BYTES);
+        let mut client = self.client.clone();
         let response = client.cast(request).await?.into_inner();
 
         if let Some(err) = response.framework_error {
@@ -182,11 +212,17 @@ impl<A: StatefulActor> AnyActorClient<A> {
         match err {
             crate::actor::ActorError::HandlerFailed(e) => RemoteActorError::Actor(e),
             crate::actor::ActorError::ActorUnavailable => RemoteActorError::ActorUnavailable,
+            crate::actor::ActorError::MailboxFull => RemoteActorError::MailboxFull,
             crate::actor::ActorError::Timeout(_) => RemoteActorError::Timeout,
-            crate::actor::ActorError::Service(crate::actor::ServiceError::ActorNotFound(n)) => {
-                RemoteActorError::ActorNotFound(n)
-            }
-            crate::actor::ActorError::Service(_) => RemoteActorError::ActorUnavailable,
+            crate::actor::ActorError::Supervisor(
+                crate::actor::SupervisorError::ChildNotFound(n),
+            ) => RemoteActorError::ActorNotFound(n),
+            crate::actor::ActorError::Supervisor(
+                crate::actor::SupervisorError::MaxRestartsExceeded(name, max, window),
+            ) => RemoteActorError::MaxRestartsExceeded(format!(
+                "Child '{name}' exceeded max restarts ({max} in {window:?})"
+            )),
+            crate::actor::ActorError::Supervisor(_) => RemoteActorError::ActorUnavailable,
         }
     }
 
@@ -231,6 +267,24 @@ impl<A: StatefulActor> AnyActorClient<A> {
         match self {
             Self::Local(client) => client.cast(msg).await.map_err(Self::map_local_error),
             Self::Remote(client) => client.cast(msg).await,
+        }
+    }
+
+    /// Sends an asynchronous notification (`cast`) with a timeout deadline transparently to either a local or remote actor.
+    pub async fn cast_timeout(
+        &self,
+        msg: A::Message,
+        timeout: Duration,
+    ) -> Result<(), RemoteActorError<A::Error>>
+    where
+        A::Message: serde::Serialize,
+    {
+        match self {
+            Self::Local(client) => client
+                .cast_timeout(msg, timeout)
+                .await
+                .map_err(Self::map_local_error),
+            Self::Remote(client) => client.cast_timeout(msg, timeout).await,
         }
     }
 }

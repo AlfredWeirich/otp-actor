@@ -40,6 +40,8 @@ message CastRequest {
   string service_name = 1;
   string actor_name = 2;
   bytes payload = 3;
+  // Optional client-side timeout in milliseconds for enqueueing into the actor mailbox.
+  optional uint64 timeout_ms = 4;
 }
 
 // Cast acknowledgment (returns once enqueued in local actor mailbox).
@@ -59,6 +61,7 @@ message RemoteError {
     SERIALIZATION = 6;
     DESERIALIZATION = 7;
     ACTOR_PANIC = 8;
+    MAX_RESTARTS_EXCEEDED = 9;
   }
   Kind kind = 1;
   string message = 2;

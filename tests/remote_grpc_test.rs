@@ -9,8 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use otp_actor::actor::{
-    ActorContext, RestartType, RootSupervisor, ServiceSupervisor, StatefulActor,
-    StatefulActorBuilder,
+    ActorContext, RestartType, StatefulActor, StatefulActorBuilder, Supervisor,
 };
 use otp_actor::remote::{
     ActorNodeHandle, ActorNodeRegistry, AnyActorClient, RemoteActorClient, RemoteActorError,
@@ -47,7 +46,7 @@ impl StatefulActor for CalculatorActor {
     async fn handle(
         &mut self,
         msg: Self::Message,
-        ctx: &mut ActorContext,
+        ctx: &mut ActorContext<Self>,
     ) -> Result<Self::Response, Self::Error> {
         match msg {
             CalcMsg::Add(n) => {
@@ -85,7 +84,7 @@ impl StatefulActor for CalculatorActor {
         }
     }
 
-    async fn on_stop(&mut self, _ctx: &mut ActorContext) {
+    async fn on_stop(&mut self, _ctx: &mut ActorContext<Self>) {
         self.stop_counter.fetch_add(1, Ordering::SeqCst);
     }
 }
@@ -97,8 +96,8 @@ impl StatefulActor for CalculatorActor {
 #[tokio::test]
 async fn test_remote_grpc_call_cast_and_errors()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let root = RootSupervisor::new();
-    let service = ServiceSupervisor::spawn_and_register("calc-service", &root).await?;
+    let root = Supervisor::new("root");
+    let service = Supervisor::builder("calc-service").spawn(&root).await?;
 
     let stop_counter = Arc::new(AtomicUsize::new(0));
     let actor_instance = CalculatorActor {
@@ -130,11 +129,14 @@ async fn test_remote_grpc_call_cast_and_errors()
     let res = remote_client.call(CalcMsg::Sub(15)).await?;
     assert_eq!(res, 110);
 
-    // 2. Remote cast
+    // 2. Remote cast & cast_timeout
     remote_client.cast(CalcMsg::Reset).await?;
+    remote_client
+        .cast_timeout(CalcMsg::Add(5), Duration::from_secs(2))
+        .await?;
     tokio::time::sleep(Duration::from_millis(50)).await;
     let res = remote_client.call(CalcMsg::Get).await?;
-    assert_eq!(res, 0);
+    assert_eq!(res, 5);
 
     // 3. Domain error propagation
     let err = remote_client.call(CalcMsg::Divide(0)).await;
@@ -182,8 +184,8 @@ async fn test_remote_grpc_call_cast_and_errors()
 #[tokio::test]
 async fn test_remote_grpc_actor_crash_and_self_healing()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let root = RootSupervisor::new();
-    let service = ServiceSupervisor::spawn_and_register("healing-service", &root).await?;
+    let root = Supervisor::new("root");
+    let service = Supervisor::builder("healing-service").spawn(&root).await?;
 
     let stop_counter = Arc::new(AtomicUsize::new(0));
     let actor_instance = CalculatorActor {
@@ -216,7 +218,7 @@ async fn test_remote_grpc_actor_crash_and_self_healing()
     let _ = remote_client.call(CalcMsg::Crash).await;
 
     // Immediately call without manual sleep: the server-side ActorClient transparently
-    // backs off, waits for ServiceSupervisor recovery, rebinds, and processes the message!
+    // waits on its watch slot for Supervisor recovery, rebinds, and processes the message!
     let res = remote_client.call(CalcMsg::Add(20)).await?;
     assert_eq!(res, 30);
 
@@ -231,8 +233,10 @@ async fn test_remote_grpc_actor_crash_and_self_healing()
 #[tokio::test]
 async fn test_location_transparency_any_client()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let root = RootSupervisor::new();
-    let service = ServiceSupervisor::spawn_and_register("transparency-service", &root).await?;
+    let root = Supervisor::new("root");
+    let service = Supervisor::builder("transparency-service")
+        .spawn(&root)
+        .await?;
 
     let stop_counter = Arc::new(AtomicUsize::new(0));
     let local_actor = CalculatorActor {
@@ -283,8 +287,8 @@ async fn test_location_transparency_any_client()
 
 #[tokio::test]
 async fn test_remote_grpc_call_timeout() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let root = RootSupervisor::new();
-    let service = ServiceSupervisor::spawn_and_register("timeout-service", &root).await?;
+    let root = Supervisor::new("root");
+    let service = Supervisor::builder("timeout-service").spawn(&root).await?;
 
     let stop_counter = Arc::new(AtomicUsize::new(0));
     let local_actor = CalculatorActor {
@@ -335,8 +339,8 @@ async fn test_remote_grpc_call_timeout() -> Result<(), Box<dyn std::error::Error
 #[tokio::test]
 async fn test_remote_grpc_2phase_graceful_shutdown_drains_inflight_call()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let root = RootSupervisor::new();
-    let service = ServiceSupervisor::spawn_and_register("drain-service", &root).await?;
+    let root = Supervisor::new("root");
+    let service = Supervisor::builder("drain-service").spawn(&root).await?;
 
     let stop_counter = Arc::new(AtomicUsize::new(0));
     let local_actor = CalculatorActor {
@@ -402,8 +406,10 @@ async fn test_remote_grpc_2phase_graceful_shutdown_drains_inflight_call()
 #[tokio::test]
 async fn test_remote_grpc_client_initiated_graceful_stop_transient()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let root = RootSupervisor::new();
-    let service = ServiceSupervisor::spawn_and_register("transient-service", &root).await?;
+    let root = Supervisor::new("root");
+    let service = Supervisor::builder("transient-service")
+        .spawn(&root)
+        .await?;
 
     let stop_counter = Arc::new(AtomicUsize::new(0));
     let local_actor = CalculatorActor {
@@ -460,15 +466,16 @@ async fn test_remote_grpc_client_initiated_graceful_stop_transient()
 #[tokio::test]
 async fn test_remote_trailing_bytes_and_drain_timeout_and_error_symmetry()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use bincode::Options;
     use otp_actor::actor::{RestartPolicy, ShutdownPolicy};
     use otp_actor::remote::ActorNodeClient;
     use otp_actor::remote::proto::CallRequest;
     use otp_actor::remote::proto::call_response::Result as CallResult;
     use otp_actor::remote::proto::remote_error::Kind;
 
-    let root = RootSupervisor::new();
-    let service = ServiceSupervisor::spawn_and_register("hardening-service", &root).await?;
+    let root = Supervisor::new("root");
+    let service = Supervisor::builder("hardening-service")
+        .spawn(&root)
+        .await?;
 
     let stop_counter = Arc::new(AtomicUsize::new(0));
     let actor_instance = CalculatorActor {
@@ -477,13 +484,11 @@ async fn test_remote_trailing_bytes_and_drain_timeout_and_error_symmetry()
     };
 
     let local_client = StatefulActorBuilder::from_instance("calc-hardened", actor_instance)
-        .restart_policy(RestartPolicy {
-            max_restarts: 0,
-            time_window: Duration::from_secs(10),
-            initial_backoff: Duration::from_millis(10),
-            max_backoff: Duration::from_millis(50),
-            backoff_multiplier: 2.0,
-        })
+        .restart_policy(
+            RestartPolicy::new(0, Duration::from_secs(10))
+                .initial_backoff(Duration::from_millis(10))
+                .max_backoff(Duration::from_millis(50)),
+        )
         .restart_type(RestartType::Permanent)
         .shutdown_policy(ShutdownPolicy::Timeout(Duration::from_millis(50)))
         .spawn(&service)
@@ -500,6 +505,7 @@ async fn test_remote_trailing_bytes_and_drain_timeout_and_error_symmetry()
     let endpoint_url = format!("http://{node_addr}");
 
     // 1. Verify trailing garbage bytes are rejected with Deserialization error ([L-1])
+    use bincode::Options;
     let mut payload = bincode::DefaultOptions::new()
         .with_fixint_encoding()
         .reject_trailing_bytes()
@@ -544,12 +550,12 @@ async fn test_remote_trailing_bytes_and_drain_timeout_and_error_symmetry()
     let local_err = any_local.call(CalcMsg::Get).await;
     let remote_err = any_remote.call(CalcMsg::Get).await;
     assert!(
-        matches!(local_err, Err(RemoteActorError::ActorUnavailable)),
-        "Expected Local AnyActorClient to map MaxRestartsExceeded to ActorUnavailable, got {local_err:?}"
+        matches!(local_err, Err(RemoteActorError::MaxRestartsExceeded(_))),
+        "Expected Local AnyActorClient to map MaxRestartsExceeded to MaxRestartsExceeded, got {local_err:?}"
     );
     assert!(
-        matches!(remote_err, Err(RemoteActorError::ActorUnavailable)),
-        "Expected Remote AnyActorClient to map MaxRestartsExceeded to ActorUnavailable, got {remote_err:?}"
+        matches!(remote_err, Err(RemoteActorError::MaxRestartsExceeded(_))),
+        "Expected Remote AnyActorClient to map MaxRestartsExceeded to MaxRestartsExceeded, got {remote_err:?}"
     );
 
     // 3. Recover actor and verify Phase-1 drain timeout bounds hung RPCs ([M-1])

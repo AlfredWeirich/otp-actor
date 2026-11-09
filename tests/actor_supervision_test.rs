@@ -4,15 +4,15 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use otp_actor::actor::{
-    ActorContext, ChildSpec, GenericResourceActor, ResourceError, RestartPolicy, RestartTracker,
-    RestartType, RootError, RootSupervisor, ServiceError, ServiceSupervisor, ShutdownPolicy,
-    StatefulActor, StatefulActorBuilder, SupervisionStrategy, TimedResource, Worker, WorkerContext,
+    ActorContext, ActorError, CallMessage, ChildSpec, ResourceActor, ResourceError, RestartPolicy,
+    RestartTracker, RestartType, ShutdownPolicy, StatefulActor, StatefulActorBuilder,
+    SupervisionStrategy, Supervisor, SupervisorError, TimedResource, Worker, WorkerContext,
 };
 
 #[tokio::test]
 async fn test_builder_and_eager_prewarm() {
-    let root = RootSupervisor::new();
-    let service_sup = ServiceSupervisor::spawn_and_register("test-service", &root)
+    let root = Supervisor::new("root");
+    let service_sup = Supervisor::builder("test-service").spawn(&root)
         .await
         .expect("ServiceSupervisor registration failed");
 
@@ -32,12 +32,12 @@ async fn test_builder_and_eager_prewarm() {
         }
     };
 
-    let client = GenericResourceActor::builder("prewarmed-actor")
+    let client = ResourceActor::builder("prewarmed-actor")
         .worker(worker)
         .eager_prewarm(true)
         .expiry_buffer(Duration::from_secs(1))
         .channel_capacity(64)
-        .spawn_and_register(&service_sup, &root)
+        .spawn(&service_sup)
         .await
         .expect("Actor spawn failed");
 
@@ -60,27 +60,21 @@ async fn test_builder_and_eager_prewarm() {
 
 #[tokio::test]
 async fn test_crash_loop_protection() {
-    let root = RootSupervisor::new();
-    let service_sup = ServiceSupervisor::spawn_and_register("crash-service", &root)
+    let root = Supervisor::new("root");
+    let service_sup = Supervisor::builder("crash-service").spawn(&root)
         .await
         .expect("ServiceSupervisor registration failed");
 
-    let policy = RestartPolicy {
-        max_restarts: 2,
-        time_window: Duration::from_secs(2),
-        initial_backoff: Duration::from_millis(20),
-        max_backoff: Duration::from_millis(100),
-        backoff_multiplier: 2.0,
-    };
+    let policy = RestartPolicy::new(2, Duration::from_secs(2)).initial_backoff(Duration::from_millis(20)).max_backoff(Duration::from_millis(100)).backoff_multiplier(2.0);
 
     let worker = |_ctx: WorkerContext| async move {
         Ok::<_, String>(TimedResource::perpetual("test-data".to_string()))
     };
 
-    let client = GenericResourceActor::builder("crashing-actor")
+    let client = ResourceActor::builder("crashing-actor")
         .worker(worker)
         .restart_policy(policy)
-        .spawn_and_register(&service_sup, &root)
+        .spawn(&service_sup)
         .await
         .expect("Actor spawn failed");
 
@@ -103,7 +97,7 @@ async fn test_crash_loop_protection() {
 
     let res = client.get().await;
     match res {
-        Err(ResourceError::Service(err)) => {
+        Err(ResourceError::Supervisor(err)) => {
             let err_msg = err.to_string();
             assert!(
                 err_msg.contains("exceeded maximum restart threshold"),
@@ -120,8 +114,8 @@ async fn test_crash_loop_protection() {
 
 #[tokio::test]
 async fn test_sibling_isolation_during_crash() {
-    let root = RootSupervisor::new();
-    let service_sup = ServiceSupervisor::spawn_and_register("iso-service", &root)
+    let root = Supervisor::new("root");
+    let service_sup = Supervisor::builder("iso-service").spawn(&root)
         .await
         .expect("ServiceSupervisor registration failed");
 
@@ -132,15 +126,15 @@ async fn test_sibling_isolation_during_crash() {
         Ok::<_, String>(TimedResource::perpetual("data-b".to_string()))
     };
 
-    let client_a = GenericResourceActor::builder("actor-a")
+    let client_a = ResourceActor::builder("actor-a")
         .worker(worker_a)
-        .spawn_and_register(&service_sup, &root)
+        .spawn(&service_sup)
         .await
         .expect("Actor A spawn failed");
 
-    let client_b = GenericResourceActor::builder("actor-b")
+    let client_b = ResourceActor::builder("actor-b")
         .worker(worker_b)
-        .spawn_and_register(&service_sup, &root)
+        .spawn(&service_sup)
         .await
         .expect("Actor B spawn failed");
 
@@ -163,12 +157,8 @@ async fn test_sibling_isolation_during_crash() {
 
 #[tokio::test]
 async fn test_strategy_one_for_all() {
-    let root = RootSupervisor::new();
-    let service_sup = ServiceSupervisor::spawn_and_register_with_strategy(
-        "all-service",
-        SupervisionStrategy::OneForAll,
-        &root,
-    )
+    let root = Supervisor::new("root");
+    let service_sup = Supervisor::builder("all-service").strategy(SupervisionStrategy::OneForAll).spawn(&root)
     .await
     .expect("ServiceSupervisor registration failed");
 
@@ -191,21 +181,21 @@ async fn test_strategy_one_for_all() {
         )))
     };
 
-    let client_a = GenericResourceActor::builder("actor-a")
+    let client_a = ResourceActor::builder("actor-a")
         .worker(worker_a)
-        .spawn_and_register(&service_sup, &root)
+        .spawn(&service_sup)
         .await
         .expect("Actor A spawn failed");
 
-    let client_b = GenericResourceActor::builder("actor-b")
+    let client_b = ResourceActor::builder("actor-b")
         .worker(worker_b)
-        .spawn_and_register(&service_sup, &root)
+        .spawn(&service_sup)
         .await
         .expect("Actor B spawn failed");
 
-    let client_c = GenericResourceActor::builder("actor-c")
+    let client_c = ResourceActor::builder("actor-c")
         .worker(worker_c)
-        .spawn_and_register(&service_sup, &root)
+        .spawn(&service_sup)
         .await
         .expect("Actor C spawn failed");
 
@@ -228,12 +218,8 @@ async fn test_strategy_one_for_all() {
 
 #[tokio::test]
 async fn test_strategy_rest_for_one() {
-    let root = RootSupervisor::new();
-    let service_sup = ServiceSupervisor::spawn_and_register_with_strategy(
-        "rest-service",
-        SupervisionStrategy::RestForOne,
-        &root,
-    )
+    let root = Supervisor::new("root");
+    let service_sup = Supervisor::builder("rest-service").strategy(SupervisionStrategy::RestForOne).spawn(&root)
     .await
     .expect("ServiceSupervisor registration failed");
 
@@ -257,21 +243,21 @@ async fn test_strategy_rest_for_one() {
         )))
     };
 
-    let client_1 = GenericResourceActor::builder("pipe-1")
+    let client_1 = ResourceActor::builder("pipe-1")
         .worker(worker_1)
-        .spawn_and_register(&service_sup, &root)
+        .spawn(&service_sup)
         .await
         .expect("Pipe 1 spawn failed");
 
-    let client_2 = GenericResourceActor::builder("pipe-2")
+    let client_2 = ResourceActor::builder("pipe-2")
         .worker(worker_2)
-        .spawn_and_register(&service_sup, &root)
+        .spawn(&service_sup)
         .await
         .expect("Pipe 2 spawn failed");
 
-    let client_3 = GenericResourceActor::builder("pipe-3")
+    let client_3 = ResourceActor::builder("pipe-3")
         .worker(worker_3)
-        .spawn_and_register(&service_sup, &root)
+        .spawn(&service_sup)
         .await
         .expect("Pipe 3 spawn failed");
 
@@ -311,8 +297,8 @@ async fn test_strategy_rest_for_one() {
 
 #[tokio::test]
 async fn test_worker_panic_auto_recovery() {
-    let root = RootSupervisor::new();
-    let service_sup = ServiceSupervisor::spawn_and_register("panic-service", &root)
+    let root = Supervisor::new("root");
+    let service_sup = Supervisor::builder("panic-service").spawn(&root)
         .await
         .expect("ServiceSupervisor registration failed");
 
@@ -327,9 +313,9 @@ async fn test_worker_panic_auto_recovery() {
         )))
     };
 
-    let client = GenericResourceActor::builder("panicky-actor")
+    let client = ResourceActor::builder("panicky-actor")
         .worker(worker)
-        .spawn_and_register(&service_sup, &root)
+        .spawn(&service_sup)
         .await
         .expect("Actor spawn failed");
 
@@ -346,13 +332,7 @@ async fn test_worker_panic_auto_recovery() {
 
 #[test]
 fn test_backoff_overflow_prevention() {
-    let policy = RestartPolicy {
-        max_restarts: usize::MAX,
-        time_window: Duration::from_secs(u64::MAX / 4),
-        initial_backoff: Duration::from_millis(50),
-        max_backoff: Duration::from_secs(2),
-        backoff_multiplier: 2.0,
-    };
+    let policy = RestartPolicy::new(usize::MAX, Duration::from_secs(u64::MAX / 4)).initial_backoff(Duration::from_millis(50)).max_backoff(Duration::from_secs(2)).backoff_multiplier(2.0);
 
     let mut tracker = RestartTracker::new(policy);
 
@@ -366,13 +346,7 @@ fn test_backoff_overflow_prevention() {
 
 #[tokio::test(start_paused = true)]
 async fn test_backoff_decays_after_stability() {
-    let policy = RestartPolicy {
-        max_restarts: 5,
-        time_window: Duration::from_millis(10),
-        initial_backoff: Duration::from_millis(50),
-        max_backoff: Duration::from_secs(2),
-        backoff_multiplier: 2.0,
-    };
+    let policy = RestartPolicy::new(5, Duration::from_millis(10)).initial_backoff(Duration::from_millis(50)).max_backoff(Duration::from_secs(2)).backoff_multiplier(2.0);
 
     let mut tracker = RestartTracker::new(policy);
 
@@ -398,18 +372,15 @@ async fn test_backoff_decays_after_stability() {
 
 #[tokio::test]
 async fn test_supervisor_nonblocking_backoff() {
-    let root = RootSupervisor::new();
-    let service_sup = ServiceSupervisor::spawn_and_register("nonblocking-service", &root)
+    let root = Supervisor::new("root");
+    let service_sup = Supervisor::builder("nonblocking-service").spawn(&root)
         .await
         .expect("ServiceSupervisor registration failed");
 
-    let slow_policy = RestartPolicy {
-        max_restarts: 5,
-        time_window: Duration::from_secs(10),
-        initial_backoff: Duration::from_millis(500), // 500ms sleep on restart!
-        max_backoff: Duration::from_secs(2),
-        backoff_multiplier: 2.0,
-    };
+    let slow_policy = RestartPolicy::new(5, Duration::from_secs(10))
+        .initial_backoff(Duration::from_millis(500)) // 500ms sleep on restart!
+        .max_backoff(Duration::from_secs(2))
+        .backoff_multiplier(2.0);
 
     let worker_a = |ctx: WorkerContext| async move {
         Ok::<_, String>(TimedResource::perpetual(format!(
@@ -424,16 +395,16 @@ async fn test_supervisor_nonblocking_backoff() {
         )))
     };
 
-    let client_a = GenericResourceActor::builder("actor-a")
+    let client_a = ResourceActor::builder("actor-a")
         .worker(worker_a)
         .restart_policy(slow_policy)
-        .spawn_and_register(&service_sup, &root)
+        .spawn(&service_sup)
         .await
         .expect("Actor A spawn failed");
 
-    let client_b = GenericResourceActor::builder("actor-b")
+    let client_b = ResourceActor::builder("actor-b")
         .worker(worker_b)
-        .spawn_and_register(&service_sup, &root)
+        .spawn(&service_sup)
         .await
         .expect("Actor B spawn failed");
 
@@ -459,8 +430,8 @@ async fn test_supervisor_nonblocking_backoff() {
 
 #[tokio::test]
 async fn test_client_get_timeout() {
-    let root = RootSupervisor::new();
-    let service_sup = ServiceSupervisor::spawn_and_register("timeout-service", &root)
+    let root = Supervisor::new("root");
+    let service_sup = Supervisor::builder("timeout-service").spawn(&root)
         .await
         .expect("ServiceSupervisor registration failed");
 
@@ -470,9 +441,9 @@ async fn test_client_get_timeout() {
         Ok::<_, String>(TimedResource::perpetual("slow_data".to_string()))
     };
 
-    let client = GenericResourceActor::builder("slow-actor")
+    let client = ResourceActor::builder("slow-actor")
         .worker(worker)
-        .spawn_and_register(&service_sup, &root)
+        .spawn(&service_sup)
         .await
         .expect("Actor spawn failed");
 
@@ -492,7 +463,7 @@ async fn test_client_get_timeout() {
 
 #[tokio::test]
 async fn test_child_spec_builder_pattern() {
-    let root = RootSupervisor::new();
+    let root = Supervisor::new("root");
 
     // 1. Closures defined externally and passed into ChildSpecs via builder
     let worker_a = |ctx: WorkerContext| async move {
@@ -509,15 +480,15 @@ async fn test_child_spec_builder_pattern() {
     };
 
     // 2. Build ServiceSupervisor declaring ChildSpecs up-front (OTP Style!)
-    let sup = ServiceSupervisor::builder("auth-service")
+    let sup = Supervisor::builder("auth-service")
         .strategy(SupervisionStrategy::OneForOne)
         .add_child(
-            GenericResourceActor::builder("actor-a")
+            ResourceActor::builder("actor-a")
                 .worker(worker_a)
                 .eager_prewarm(true),
         )
         .add_child(
-            GenericResourceActor::builder("actor-b")
+            ResourceActor::builder("actor-b")
                 .worker(worker_b)
                 .eager_prewarm(false),
         )
@@ -527,11 +498,11 @@ async fn test_child_spec_builder_pattern() {
 
     // 3. Acquire typed ResourceClients directly from the supervisor
     let client_a = sup
-        .get_client::<String, String>("actor-a")
+        .get_resource_client::<String, String>("actor-a")
         .await
         .expect("Failed to acquire client A");
     let client_b = sup
-        .get_client::<String, String>("actor-b")
+        .get_resource_client::<String, String>("actor-b")
         .await
         .expect("Failed to acquire client B");
 
@@ -541,9 +512,9 @@ async fn test_child_spec_builder_pattern() {
 
 #[tokio::test]
 async fn test_dynamic_start_child() {
-    let root = RootSupervisor::new();
+    let root = Supervisor::new("root");
 
-    let sup = ServiceSupervisor::builder("dyn-service")
+    let sup = Supervisor::builder("dyn-service")
         .spawn(&root)
         .await
         .expect("Failed to spawn supervisor");
@@ -556,7 +527,7 @@ async fn test_dynamic_start_child() {
     };
 
     // Dynamically start a child actor at runtime from a ChildSpec
-    let spec: ChildSpec = GenericResourceActor::builder("dyn-child")
+    let spec: ChildSpec = ResourceActor::builder("dyn-child")
         .worker(worker)
         .build_child_spec();
 
@@ -565,7 +536,7 @@ async fn test_dynamic_start_child() {
         .expect("Failed to start child dynamically");
 
     let client = sup
-        .get_client::<String, String>("dyn-child")
+        .get_resource_client::<String, String>("dyn-child")
         .await
         .expect("Failed to acquire dynamic client");
 
@@ -575,7 +546,7 @@ async fn test_dynamic_start_child() {
 #[tokio::test]
 async fn test_one_for_all_survives_and_heals_after_supervisor_crash() {
     // Proves that Option B completely resolves the flaw discovered in Probe C!
-    let root = RootSupervisor::new();
+    let root = Supervisor::new("root");
 
     let worker_a = |ctx: WorkerContext| async move {
         Ok::<_, String>(TimedResource::perpetual(format!("a{}", ctx.instance_id)))
@@ -584,16 +555,16 @@ async fn test_one_for_all_survives_and_heals_after_supervisor_crash() {
         Ok::<_, String>(TimedResource::perpetual(format!("b{}", ctx.instance_id)))
     };
 
-    let sup = ServiceSupervisor::builder("coupled-service")
+    let sup = Supervisor::builder("coupled-service")
         .strategy(SupervisionStrategy::OneForAll)
-        .add_child(GenericResourceActor::builder("a").worker(worker_a))
-        .add_child(GenericResourceActor::builder("b").worker(worker_b))
+        .add_child(ResourceActor::builder("a").worker(worker_a))
+        .add_child(ResourceActor::builder("b").worker(worker_b))
         .spawn(&root)
         .await
         .expect("Failed to spawn coupled supervisor");
 
-    let client_a = sup.get_client::<String, String>("a").await.unwrap();
-    let client_b = sup.get_client::<String, String>("b").await.unwrap();
+    let client_a = sup.get_resource_client::<String, String>("a").await.unwrap();
+    let client_b = sup.get_resource_client::<String, String>("b").await.unwrap();
 
     assert_eq!(client_a.get().await.unwrap(), "a1");
     assert_eq!(client_b.get().await.unwrap(), "b1");
@@ -601,7 +572,7 @@ async fn test_one_for_all_survives_and_heals_after_supervisor_crash() {
     // 1. Crash the ServiceSupervisor itself!
     // In Option B, RootSupervisor restarts the ServiceSupervisor fresh,
     // which automatically boots its child specifications fresh!
-    let _ = root.trigger_service_crash("coupled-service").await;
+    let _ = root.trigger_child_crash("coupled-service").await;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Verify both clients transparently reconnect across the supervisor reboot
@@ -639,20 +610,20 @@ impl Worker<String, String> for CustomStructWorker {
 
 #[tokio::test]
 async fn test_child_spec_with_custom_struct_worker() {
-    let root = RootSupervisor::new();
+    let root = Supervisor::new("root");
 
     let custom_worker = CustomStructWorker {
         prefix: "db_token".to_string(),
     };
 
-    let sup = ServiceSupervisor::builder("struct-service")
-        .add_child(GenericResourceActor::builder("token-worker").worker(custom_worker))
+    let sup = Supervisor::builder("struct-service")
+        .add_child(ResourceActor::builder("token-worker").worker(custom_worker))
         .spawn(&root)
         .await
         .expect("Failed to spawn struct supervisor");
 
     let client = sup
-        .get_client::<String, String>("token-worker")
+        .get_resource_client::<String, String>("token-worker")
         .await
         .expect("Failed to get client");
 
@@ -667,7 +638,7 @@ async fn test_child_spec_with_custom_struct_worker() {
 
 #[tokio::test]
 async fn test_child_spec_with_closure_capturing_env() {
-    let root = RootSupervisor::new();
+    let root = Supervisor::new("root");
 
     // Environment state outside the actor
     let invocation_history = Arc::new(tokio::sync::Mutex::new(Vec::new()));
@@ -686,14 +657,14 @@ async fn test_child_spec_with_closure_capturing_env() {
         }
     };
 
-    let sup = ServiceSupervisor::builder("env-service")
-        .add_child(GenericResourceActor::builder("env-worker").worker(capturing_worker))
+    let sup = Supervisor::builder("env-service")
+        .add_child(ResourceActor::builder("env-worker").worker(capturing_worker))
         .spawn(&root)
         .await
         .expect("Failed to spawn env supervisor");
 
     let client = sup
-        .get_client::<String, String>("env-worker")
+        .get_resource_client::<String, String>("env-worker")
         .await
         .expect("Failed to get client");
 
@@ -711,7 +682,7 @@ async fn test_child_spec_with_closure_capturing_env() {
 
 #[tokio::test]
 async fn test_generation_guard_ignores_stale_refresh() {
-    let root = RootSupervisor::new();
+    let root = Supervisor::new("root");
 
     // Worker where gen 1 is artificially slow (200ms) and gen 2 is fast (15ms)
     let worker = |ctx: WorkerContext| async move {
@@ -724,9 +695,9 @@ async fn test_generation_guard_ignores_stale_refresh() {
         }
     };
 
-    let sup = ServiceSupervisor::builder("gen-service")
+    let sup = Supervisor::builder("gen-service")
         .add_child(
-            GenericResourceActor::builder("race-actor")
+            ResourceActor::builder("race-actor")
                 .worker(worker)
                 .eager_prewarm(true), // Starts generation 1 (slow, 200ms) immediately
         )
@@ -735,7 +706,7 @@ async fn test_generation_guard_ignores_stale_refresh() {
         .expect("Failed to spawn supervisor");
 
     let client = sup
-        .get_client::<String, String>("race-actor")
+        .get_resource_client::<String, String>("race-actor")
         .await
         .expect("Failed to get client");
 
@@ -767,7 +738,7 @@ async fn test_generation_guard_ignores_stale_refresh() {
 
 #[tokio::test]
 async fn test_actor_worker_timeout() {
-    let root = RootSupervisor::new();
+    let root = Supervisor::new("root");
 
     let worker = |ctx: WorkerContext| async move {
         if ctx.generation == 1 {
@@ -781,9 +752,9 @@ async fn test_actor_worker_timeout() {
         }
     };
 
-    let sup = ServiceSupervisor::builder("worker-timeout-service")
+    let sup = Supervisor::builder("worker-timeout-service")
         .add_child(
-            GenericResourceActor::builder("timeout-actor")
+            ResourceActor::builder("timeout-actor")
                 .worker(worker)
                 .worker_timeout(Duration::from_millis(60)),
         )
@@ -792,7 +763,7 @@ async fn test_actor_worker_timeout() {
         .expect("Failed to spawn supervisor");
 
     let client = sup
-        .get_client::<String, String>("timeout-actor")
+        .get_resource_client::<String, String>("timeout-actor")
         .await
         .expect("Failed to get client");
 
@@ -820,7 +791,7 @@ async fn test_actor_worker_timeout() {
 
 #[tokio::test]
 async fn test_actor_overloaded_backpressure() {
-    let root = RootSupervisor::new();
+    let root = Supervisor::new("root");
 
     // Slow worker so callers pile up in waiters queue
     let worker = |_ctx: WorkerContext| async move {
@@ -828,9 +799,9 @@ async fn test_actor_overloaded_backpressure() {
         Ok::<_, String>(TimedResource::perpetual("ok".to_string()))
     };
 
-    let sup = ServiceSupervisor::builder("overload-service")
+    let sup = Supervisor::builder("overload-service")
         .add_child(
-            GenericResourceActor::builder("overloaded-actor")
+            ResourceActor::builder("overloaded-actor")
                 .worker(worker)
                 .max_waiters(2), // Only allow 2 callers waiting in queue!
         )
@@ -839,7 +810,7 @@ async fn test_actor_overloaded_backpressure() {
         .expect("Failed to spawn supervisor");
 
     let client = sup
-        .get_client::<String, String>("overloaded-actor")
+        .get_resource_client::<String, String>("overloaded-actor")
         .await
         .expect("Failed to get client");
 
@@ -881,16 +852,16 @@ async fn test_actor_overloaded_backpressure() {
 
 #[tokio::test]
 async fn test_dead_waiters_pruned() {
-    let root = RootSupervisor::new();
+    let root = Supervisor::new("root");
 
     let worker = |_ctx: WorkerContext| async move {
         tokio::time::sleep(Duration::from_millis(300)).await;
         Ok::<_, String>(TimedResource::perpetual("slow_val".to_string()))
     };
 
-    let sup = ServiceSupervisor::builder("prune-service")
+    let sup = Supervisor::builder("prune-service")
         .add_child(
-            GenericResourceActor::builder("prune-actor")
+            ResourceActor::builder("prune-actor")
                 .worker(worker)
                 .max_waiters(1), // Max 1 waiter!
         )
@@ -899,7 +870,7 @@ async fn test_dead_waiters_pruned() {
         .expect("Failed to spawn supervisor");
 
     let client = sup
-        .get_client::<String, String>("prune-actor")
+        .get_resource_client::<String, String>("prune-actor")
         .await
         .expect("Failed to get client");
 
@@ -922,16 +893,10 @@ async fn test_dead_waiters_pruned() {
 
 #[tokio::test]
 async fn test_client_channel_rebind_during_slow_backoff() {
-    let root = RootSupervisor::new();
+    let root = Supervisor::new("root");
 
     // Configure a slow initial backoff of 350ms on restart!
-    let slow_policy = RestartPolicy {
-        max_restarts: 3,
-        time_window: Duration::from_secs(5),
-        initial_backoff: Duration::from_millis(350),
-        max_backoff: Duration::from_secs(1),
-        backoff_multiplier: 2.0,
-    };
+    let slow_policy = RestartPolicy::new(3, Duration::from_secs(5)).initial_backoff(Duration::from_millis(350)).max_backoff(Duration::from_secs(1)).backoff_multiplier(2.0);
 
     let worker = |ctx: WorkerContext| async move {
         Ok::<_, String>(TimedResource::perpetual(format!(
@@ -940,9 +905,9 @@ async fn test_client_channel_rebind_during_slow_backoff() {
         )))
     };
 
-    let sup = ServiceSupervisor::builder("rebind-service")
+    let sup = Supervisor::builder("rebind-service")
         .add_child(
-            GenericResourceActor::builder("rebind-actor")
+            ResourceActor::builder("rebind-actor")
                 .worker(worker)
                 .restart_policy(slow_policy),
         )
@@ -951,7 +916,7 @@ async fn test_client_channel_rebind_during_slow_backoff() {
         .expect("Failed to spawn supervisor");
 
     let client = sup
-        .get_client::<String, String>("rebind-actor")
+        .get_resource_client::<String, String>("rebind-actor")
         .await
         .expect("Failed to get client");
 
@@ -981,47 +946,41 @@ async fn test_client_channel_rebind_during_slow_backoff() {
 
 #[tokio::test]
 async fn test_root_supervisor_crash_loop_protection() {
-    let root = RootSupervisor::new();
+    let root = Supervisor::new("root");
 
-    let strict_policy = RestartPolicy {
-        max_restarts: 2,
-        time_window: Duration::from_secs(3),
-        initial_backoff: Duration::from_millis(20),
-        max_backoff: Duration::from_millis(100),
-        backoff_multiplier: 2.0,
-    };
+    let strict_policy = RestartPolicy::new(2, Duration::from_secs(3)).initial_backoff(Duration::from_millis(20)).max_backoff(Duration::from_millis(100)).backoff_multiplier(2.0);
 
-    let sup = ServiceSupervisor::builder("fragile-service")
+    let sup = Supervisor::builder("fragile-service")
         .restart_policy(strict_policy)
         .spawn(&root)
         .await
         .expect("Failed to spawn supervisor");
 
     // Crash 1: Allowed (restart 1 of 2)
-    sup.trigger_service_crash()
+    sup.simulate_crash()
         .await
         .expect("Crash 1 trigger failed");
     tokio::time::sleep(Duration::from_millis(80)).await;
-    let sender1 = root.resolve_service_channel("fragile-service").await;
+    let sender1 = root.resolve_child_channel_untyped("fragile-service").await;
     assert!(sender1.is_ok(), "Service should recover from crash 1");
 
     // Crash 2: Allowed (restart 2 of 2)
-    sup.trigger_service_crash()
+    sup.simulate_crash()
         .await
         .expect("Crash 2 trigger failed");
     tokio::time::sleep(Duration::from_millis(100)).await;
-    let sender2 = root.resolve_service_channel("fragile-service").await;
+    let sender2 = root.resolve_child_channel_untyped("fragile-service").await;
     assert!(sender2.is_ok(), "Service should recover from crash 2");
 
     // Crash 3: Exceeds threshold!
-    sup.trigger_service_crash()
+    sup.simulate_crash()
         .await
         .expect("Crash 3 trigger failed");
     tokio::time::sleep(Duration::from_millis(80)).await;
 
-    let res = root.resolve_service_channel("fragile-service").await;
+    let res = root.resolve_child_channel_untyped("fragile-service").await;
     match res {
-        Err(RootError::MaxRestartsExceeded(name, max, _)) => {
+        Err(SupervisorError::MaxRestartsExceeded(name, max, _)) => {
             assert_eq!(name, "fragile-service");
             assert_eq!(max, 2);
         }
@@ -1031,7 +990,7 @@ async fn test_root_supervisor_crash_loop_protection() {
 
 #[tokio::test]
 async fn test_proactive_timer_refresh() {
-    let root = RootSupervisor::new();
+    let root = Supervisor::new("root");
 
     let counter = Arc::new(AtomicUsize::new(0));
     let counter_clone = counter.clone();
@@ -1048,9 +1007,9 @@ async fn test_proactive_timer_refresh() {
         }
     };
 
-    let sup = ServiceSupervisor::builder("proactive-service")
+    let sup = Supervisor::builder("proactive-service")
         .add_child(
-            GenericResourceActor::builder("proactive-actor")
+            ResourceActor::builder("proactive-actor")
                 .worker(worker)
                 .eager_prewarm(true)
                 .expiry_buffer(Duration::from_millis(40))
@@ -1061,7 +1020,7 @@ async fn test_proactive_timer_refresh() {
         .expect("Failed to spawn supervisor");
 
     let client = sup
-        .get_client::<String, String>("proactive-actor")
+        .get_resource_client::<String, String>("proactive-actor")
         .await
         .expect("Failed to get client");
 
@@ -1087,7 +1046,7 @@ async fn test_proactive_timer_refresh() {
 
 #[tokio::test]
 async fn test_retry_storm_protection_and_negative_caching() {
-    let root = RootSupervisor::new();
+    let root = Supervisor::new("root");
 
     let executions = Arc::new(AtomicUsize::new(0));
     let exec_clone = executions.clone();
@@ -1101,9 +1060,9 @@ async fn test_retry_storm_protection_and_negative_caching() {
         }
     };
 
-    let sup = ServiceSupervisor::builder("storm-protection-service")
+    let sup = Supervisor::builder("storm-protection-service")
         .add_child(
-            GenericResourceActor::builder("storm-actor")
+            ResourceActor::builder("storm-actor")
                 .worker(failing_worker)
                 .failure_cooldown(Duration::from_millis(150)),
         )
@@ -1112,7 +1071,7 @@ async fn test_retry_storm_protection_and_negative_caching() {
         .expect("Failed to spawn supervisor");
 
     let client = sup
-        .get_client::<String, String>("storm-actor")
+        .get_resource_client::<String, String>("storm-actor")
         .await
         .expect("Failed to get client");
 
@@ -1168,7 +1127,7 @@ async fn test_retry_storm_protection_and_negative_caching() {
 
 #[tokio::test]
 async fn test_stale_while_error_serves_expired_cache() {
-    let root = RootSupervisor::new();
+    let root = Supervisor::new("root");
 
     let attempts = Arc::new(AtomicUsize::new(0));
     let attempts_clone = attempts.clone();
@@ -1190,9 +1149,9 @@ async fn test_stale_while_error_serves_expired_cache() {
         }
     };
 
-    let sup = ServiceSupervisor::builder("stale-cache-service")
+    let sup = Supervisor::builder("stale-cache-service")
         .add_child(
-            GenericResourceActor::builder("stale-actor")
+            ResourceActor::builder("stale-actor")
                 .worker(worker)
                 .eager_prewarm(true)
                 .expiry_buffer(Duration::from_millis(10))
@@ -1205,7 +1164,7 @@ async fn test_stale_while_error_serves_expired_cache() {
         .expect("Failed to spawn supervisor");
 
     let client = sup
-        .get_client::<String, String>("stale-actor")
+        .get_resource_client::<String, String>("stale-actor")
         .await
         .expect("Failed to get client");
 
@@ -1249,7 +1208,7 @@ async fn test_stale_while_error_serves_expired_cache() {
 
 #[tokio::test]
 async fn test_force_refresh_bypasses_failure_cooldown() {
-    let root = RootSupervisor::new();
+    let root = Supervisor::new("root");
 
     let attempts = Arc::new(AtomicUsize::new(0));
     let attempts_clone = attempts.clone();
@@ -1269,9 +1228,9 @@ async fn test_force_refresh_bypasses_failure_cooldown() {
         }
     };
 
-    let sup = ServiceSupervisor::builder("force-refresh-service")
+    let sup = Supervisor::builder("force-refresh-service")
         .add_child(
-            GenericResourceActor::builder("force-actor")
+            ResourceActor::builder("force-actor")
                 .worker(worker)
                 .failure_cooldown(Duration::from_secs(10)), // Long cooldown
         )
@@ -1280,7 +1239,7 @@ async fn test_force_refresh_bypasses_failure_cooldown() {
         .expect("Failed to spawn supervisor");
 
     let client = sup
-        .get_client::<String, String>("force-actor")
+        .get_resource_client::<String, String>("force-actor")
         .await
         .expect("Failed to get client");
 
@@ -1322,7 +1281,7 @@ fn test_ttl_duration_max_no_panic() {
 
 #[tokio::test]
 async fn test_force_refresh_aborts_in_flight_worker() {
-    let root = RootSupervisor::new();
+    let root = Supervisor::new("root");
     let was_cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let was_cancelled_clone = was_cancelled.clone();
 
@@ -1346,9 +1305,9 @@ async fn test_force_refresh_aborts_in_flight_worker() {
         }
     };
 
-    let sup = ServiceSupervisor::builder("abort-service")
+    let sup = Supervisor::builder("abort-service")
         .add_child(
-            GenericResourceActor::builder("abort-actor")
+            ResourceActor::builder("abort-actor")
                 .worker(worker)
                 .eager_prewarm(true),
         )
@@ -1357,7 +1316,7 @@ async fn test_force_refresh_aborts_in_flight_worker() {
         .expect("Failed to spawn supervisor");
 
     let client = sup
-        .get_client::<String, String>("abort-actor")
+        .get_resource_client::<String, String>("abort-actor")
         .await
         .expect("Failed to get client");
 
@@ -1380,7 +1339,7 @@ async fn test_force_refresh_aborts_in_flight_worker() {
 
 #[tokio::test]
 async fn test_retry_storm_exponential_backoff() {
-    let root = RootSupervisor::new();
+    let root = Supervisor::new("root");
     let attempts = Arc::new(AtomicUsize::new(0));
     let attempts_clone = attempts.clone();
 
@@ -1392,9 +1351,9 @@ async fn test_retry_storm_exponential_backoff() {
         }
     };
 
-    let sup = ServiceSupervisor::builder("backoff-service")
+    let sup = Supervisor::builder("backoff-service")
         .add_child(
-            GenericResourceActor::builder("backoff-actor")
+            ResourceActor::builder("backoff-actor")
                 .worker(failing_worker)
                 .proactive_refresh(true),
         )
@@ -1403,7 +1362,7 @@ async fn test_retry_storm_exponential_backoff() {
         .expect("Failed to spawn supervisor");
 
     let client = sup
-        .get_client::<String, String>("backoff-actor")
+        .get_resource_client::<String, String>("backoff-actor")
         .await
         .expect("Failed to get client");
 
@@ -1424,7 +1383,7 @@ async fn test_retry_storm_exponential_backoff() {
 
 #[tokio::test]
 async fn test_root_supervisor_shutdown_aborts_entire_tree() {
-    let root = RootSupervisor::new();
+    let root = Supervisor::new("root");
 
     let was_dropped = Arc::new(AtomicBool::new(false));
     let was_dropped_clone = was_dropped.clone();
@@ -1448,8 +1407,8 @@ async fn test_root_supervisor_shutdown_aborts_entire_tree() {
         }
     };
 
-    let sup = ServiceSupervisor::builder("shutdown-service")
-        .add_child(GenericResourceActor::builder("shutdown-actor").worker(worker))
+    let sup = Supervisor::builder("shutdown-service")
+        .add_child(ResourceActor::builder("shutdown-actor").worker(worker))
         .spawn(&root)
         .await
         .expect("Failed to spawn supervisor");
@@ -1476,18 +1435,12 @@ async fn test_root_supervisor_shutdown_aborts_entire_tree() {
 
 #[tokio::test]
 async fn test_restart_child_recovers_failed_actor() {
-    let root = RootSupervisor::new();
-    let service_sup = ServiceSupervisor::spawn_and_register("recover-service", &root)
+    let root = Supervisor::new("root");
+    let service_sup = Supervisor::builder("recover-service").spawn(&root)
         .await
         .expect("ServiceSupervisor registration failed");
 
-    let policy = RestartPolicy {
-        max_restarts: 2,
-        time_window: Duration::from_secs(2),
-        initial_backoff: Duration::from_millis(10),
-        max_backoff: Duration::from_millis(50),
-        backoff_multiplier: 2.0,
-    };
+    let policy = RestartPolicy::new(2, Duration::from_secs(2)).initial_backoff(Duration::from_millis(10)).max_backoff(Duration::from_millis(50)).backoff_multiplier(2.0);
 
     let worker = |ctx: WorkerContext| async move {
         Ok::<_, String>(TimedResource::perpetual(format!(
@@ -1496,10 +1449,10 @@ async fn test_restart_child_recovers_failed_actor() {
         )))
     };
 
-    let client = GenericResourceActor::builder("crashing-actor")
+    let client = ResourceActor::builder("crashing-actor")
         .worker(worker)
         .restart_policy(policy)
-        .spawn_and_register(&service_sup, &root)
+        .spawn(&service_sup)
         .await
         .expect("Actor spawn failed");
 
@@ -1539,15 +1492,12 @@ async fn test_restart_child_recovers_failed_actor() {
 
 #[tokio::test]
 async fn test_escalate_on_failure_triggers_root_supervisor_restart() {
-    let root = RootSupervisor::new();
+    let root = Supervisor::new("root");
 
-    let child_policy = RestartPolicy {
-        max_restarts: 1, // Only 1 restart before escalating
-        time_window: Duration::from_secs(2),
-        initial_backoff: Duration::from_millis(10),
-        max_backoff: Duration::from_millis(20),
-        backoff_multiplier: 2.0,
-    };
+    let child_policy = RestartPolicy::new(1, Duration::from_secs(2))
+        .initial_backoff(Duration::from_millis(10))
+        .max_backoff(Duration::from_millis(20))
+        .backoff_multiplier(2.0);
 
     let worker = |ctx: WorkerContext| async move {
         Ok::<_, String>(TimedResource::perpetual(format!(
@@ -1556,10 +1506,10 @@ async fn test_escalate_on_failure_triggers_root_supervisor_restart() {
         )))
     };
 
-    let service_sup = ServiceSupervisor::builder("escalating-svc")
+    let service_sup = Supervisor::builder("escalating-svc")
         .escalate_on_failure(true)
         .add_child(
-            GenericResourceActor::builder("child-actor")
+            ResourceActor::builder("child-actor")
                 .worker(worker)
                 .restart_policy(child_policy),
         )
@@ -1568,7 +1518,7 @@ async fn test_escalate_on_failure_triggers_root_supervisor_restart() {
         .expect("Spawn failed");
 
     let client = service_sup
-        .get_client::<String, String>("child-actor")
+        .get_resource_client::<String, String>("child-actor")
         .await
         .expect("Get client failed");
 
@@ -1597,40 +1547,34 @@ async fn test_escalate_on_failure_triggers_root_supervisor_restart() {
 
 #[tokio::test]
 async fn test_restart_service_recovers_failed_supervisor() {
-    let root = RootSupervisor::new();
+    let root = Supervisor::new("root");
 
-    let service_policy = RestartPolicy {
-        max_restarts: 1,
-        time_window: Duration::from_secs(2),
-        initial_backoff: Duration::from_millis(10),
-        max_backoff: Duration::from_millis(20),
-        backoff_multiplier: 2.0,
-    };
+    let service_policy = RestartPolicy::new(1, Duration::from_secs(2)).initial_backoff(Duration::from_millis(10)).max_backoff(Duration::from_millis(20)).backoff_multiplier(2.0);
 
-    let _sup = ServiceSupervisor::builder("fragile-root-svc")
+    let _sup = Supervisor::builder("fragile-root-svc")
         .restart_policy(service_policy)
         .spawn(&root)
         .await
         .expect("Spawn failed");
 
     // Crash 1: Allowed
-    root.trigger_service_crash("fragile-root-svc")
+    root.trigger_child_crash("fragile-root-svc")
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(
-        root.resolve_service_channel("fragile-root-svc")
+        root.resolve_child_channel_untyped("fragile-root-svc")
             .await
             .is_ok()
     );
 
     // Crash 2: Exceeds limit -> root marks service permanently failed
-    root.trigger_service_crash("fragile-root-svc")
+    root.trigger_child_crash("fragile-root-svc")
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
-    match root.resolve_service_channel("fragile-root-svc").await {
-        Err(RootError::MaxRestartsExceeded(name, max, _)) => {
+    match root.resolve_child_channel_untyped("fragile-root-svc").await {
+        Err(SupervisorError::MaxRestartsExceeded(name, max, _)) => {
             assert_eq!(name, "fragile-root-svc");
             assert_eq!(max, 1);
         }
@@ -1638,12 +1582,12 @@ async fn test_restart_service_recovers_failed_supervisor() {
     }
 
     // Manual operator recovery: restart_service
-    root.restart_service("fragile-root-svc")
+    root.restart_child("fragile-root-svc")
         .await
         .expect("Manual restart_service failed");
 
     // Service is restored and channel can be resolved again!
-    let channel_res = root.resolve_service_channel("fragile-root-svc").await;
+    let channel_res = root.resolve_child_channel_untyped("fragile-root-svc").await;
     assert!(
         channel_res.is_ok(),
         "Resolved channel must be Ok after manual restart_service"
@@ -1652,12 +1596,8 @@ async fn test_restart_service_recovers_failed_supervisor() {
 
 #[tokio::test]
 async fn test_max_consecutive_failures_escalates_without_panic() {
-    let root = RootSupervisor::new();
-    let service_sup = ServiceSupervisor::spawn_and_register_with_strategy(
-        "result-crash-service",
-        SupervisionStrategy::OneForAll,
-        &root,
-    )
+    let root = Supervisor::new("root");
+    let service_sup = Supervisor::builder("result-crash-service").strategy(SupervisionStrategy::OneForAll).spawn(&root)
     .await
     .expect("ServiceSupervisor registration failed");
 
@@ -1679,16 +1619,16 @@ async fn test_max_consecutive_failures_escalates_without_panic() {
         )))
     };
 
-    let client_a = GenericResourceActor::builder("actor-a")
+    let client_a = ResourceActor::builder("actor-a")
         .worker(worker_a)
         .max_consecutive_failures(1) // Escalate to supervisor after 1 worker error!
-        .spawn_and_register(&service_sup, &root)
+        .spawn(&service_sup)
         .await
         .expect("Actor A spawn failed");
 
-    let client_b = GenericResourceActor::builder("actor-b")
+    let client_b = ResourceActor::builder("actor-b")
         .worker(worker_b)
-        .spawn_and_register(&service_sup, &root)
+        .spawn(&service_sup)
         .await
         .expect("Actor B spawn failed");
 
@@ -1716,8 +1656,8 @@ async fn test_max_consecutive_failures_escalates_without_panic() {
 
 #[tokio::test]
 async fn test_restart_type_permanent_restarts_on_normal_exit() {
-    let root = RootSupervisor::new();
-    let service_sup = ServiceSupervisor::spawn_and_register("perm-service", &root)
+    let root = Supervisor::new("root");
+    let service_sup = Supervisor::builder("perm-service").spawn(&root)
         .await
         .expect("ServiceSupervisor registration failed");
 
@@ -1728,10 +1668,10 @@ async fn test_restart_type_permanent_restarts_on_normal_exit() {
         )))
     };
 
-    let client = GenericResourceActor::builder("perm-actor")
+    let client = ResourceActor::builder("perm-actor")
         .worker(worker)
         .restart_type(RestartType::Permanent)
-        .spawn_and_register(&service_sup, &root)
+        .spawn(&service_sup)
         .await
         .expect("Actor spawn failed");
 
@@ -1754,8 +1694,8 @@ async fn test_restart_type_permanent_restarts_on_normal_exit() {
 
 #[tokio::test]
 async fn test_restart_type_transient_stops_on_normal_exit_but_restarts_on_crash() {
-    let root = RootSupervisor::new();
-    let service_sup = ServiceSupervisor::spawn_and_register("trans-service", &root)
+    let root = Supervisor::new("root");
+    let service_sup = Supervisor::builder("trans-service").spawn(&root)
         .await
         .expect("ServiceSupervisor registration failed");
 
@@ -1766,10 +1706,10 @@ async fn test_restart_type_transient_stops_on_normal_exit_but_restarts_on_crash(
         )))
     };
 
-    let client = GenericResourceActor::builder("trans-actor")
+    let client = ResourceActor::builder("trans-actor")
         .worker(worker)
         .restart_type(RestartType::Transient)
-        .spawn_and_register(&service_sup, &root)
+        .spawn(&service_sup)
         .await
         .expect("Actor spawn failed");
 
@@ -1788,18 +1728,18 @@ async fn test_restart_type_transient_stops_on_normal_exit_but_restarts_on_crash(
     tokio::time::sleep(Duration::from_millis(80)).await;
 
     let res = service_sup
-        .resolve_actor_channel_untyped("trans-actor")
+        .resolve_child_channel_untyped("trans-actor")
         .await;
     assert!(
-        matches!(res, Err(ServiceError::ActorNotFound(_))),
+        matches!(res, Err(SupervisorError::ChildNotFound(_))),
         "Expected ActorNotFound after clean exit of Transient actor"
     );
 }
 
 #[tokio::test]
 async fn test_restart_type_temporary_never_restarts_even_on_crash() {
-    let root = RootSupervisor::new();
-    let service_sup = ServiceSupervisor::spawn_and_register("temp-service", &root)
+    let root = Supervisor::new("root");
+    let service_sup = Supervisor::builder("temp-service").spawn(&root)
         .await
         .expect("ServiceSupervisor registration failed");
 
@@ -1810,10 +1750,10 @@ async fn test_restart_type_temporary_never_restarts_even_on_crash() {
         )))
     };
 
-    let client = GenericResourceActor::builder("temp-actor")
+    let client = ResourceActor::builder("temp-actor")
         .worker(worker)
         .restart_type(RestartType::Temporary)
-        .spawn_and_register(&service_sup, &root)
+        .spawn(&service_sup)
         .await
         .expect("Actor spawn failed");
 
@@ -1824,18 +1764,18 @@ async fn test_restart_type_temporary_never_restarts_even_on_crash() {
     tokio::time::sleep(Duration::from_millis(80)).await;
 
     let res = service_sup
-        .resolve_actor_channel_untyped("temp-actor")
+        .resolve_child_channel_untyped("temp-actor")
         .await;
     assert!(
-        matches!(res, Err(ServiceError::ActorNotFound(_))),
+        matches!(res, Err(SupervisorError::ChildNotFound(_))),
         "Expected ActorNotFound after crash of Temporary actor"
     );
 }
 
 #[tokio::test]
 async fn test_stop_child_completes_in_flight_worker_gracefully() {
-    let root = RootSupervisor::new();
-    let service_sup = ServiceSupervisor::spawn_and_register("graceful-service", &root)
+    let root = Supervisor::new("root");
+    let service_sup = Supervisor::builder("graceful-service").spawn(&root)
         .await
         .expect("ServiceSupervisor registration failed");
 
@@ -1846,11 +1786,11 @@ async fn test_stop_child_completes_in_flight_worker_gracefully() {
     };
 
     // Configure actor as Permanent with a 500ms graceful shutdown timeout
-    let client = GenericResourceActor::builder("graceful-actor")
+    let client = ResourceActor::builder("graceful-actor")
         .worker(worker)
         .restart_type(RestartType::Permanent)
         .shutdown_timeout(Duration::from_millis(500))
-        .spawn_and_register(&service_sup, &root)
+        .spawn(&service_sup)
         .await
         .expect("Actor spawn failed");
 
@@ -1879,9 +1819,9 @@ async fn test_stop_child_completes_in_flight_worker_gracefully() {
     assert!(
         matches!(
             service_sup
-                .resolve_actor_channel_untyped("graceful-actor")
+                .resolve_child_channel_untyped("graceful-actor")
                 .await,
-            Err(ServiceError::ActorNotFound(_))
+            Err(SupervisorError::ChildNotFound(_))
         ),
         "Explicitly stopped Permanent actor must not auto-restart"
     );
@@ -1889,8 +1829,8 @@ async fn test_stop_child_completes_in_flight_worker_gracefully() {
 
 #[tokio::test]
 async fn test_shutdown_policy_timeout_aborts_hung_actor() {
-    let root = RootSupervisor::new();
-    let service_sup = ServiceSupervisor::spawn_and_register("hung-shutdown-service", &root)
+    let root = Supervisor::new("root");
+    let service_sup = Supervisor::builder("hung-shutdown-service").spawn(&root)
         .await
         .expect("ServiceSupervisor registration failed");
 
@@ -1900,11 +1840,11 @@ async fn test_shutdown_policy_timeout_aborts_hung_actor() {
         Ok::<_, String>(TimedResource::perpetual("never".to_string()))
     };
 
-    let _client = GenericResourceActor::builder("hung-actor")
+    let _client = ResourceActor::builder("hung-actor")
         .worker(worker)
         .eager_prewarm(true)
         .shutdown_policy(ShutdownPolicy::Timeout(Duration::from_millis(80)))
-        .spawn_and_register(&service_sup, &root)
+        .spawn(&service_sup)
         .await
         .expect("Actor spawn failed");
 
@@ -1928,7 +1868,7 @@ async fn test_shutdown_policy_timeout_aborts_hung_actor() {
 
 #[tokio::test]
 async fn test_root_supervisor_graceful_shutdown_cascade() {
-    let root = RootSupervisor::new();
+    let root = Supervisor::new("root");
 
     let completed = Arc::new(AtomicBool::new(false));
     let completed_clone = completed.clone();
@@ -1942,10 +1882,10 @@ async fn test_root_supervisor_graceful_shutdown_cascade() {
         }
     };
 
-    let sup = ServiceSupervisor::builder("cascade-service")
+    let sup = Supervisor::builder("cascade-service")
         .shutdown_timeout(Duration::from_secs(2))
         .add_child(
-            GenericResourceActor::builder("cascade-actor")
+            ResourceActor::builder("cascade-actor")
                 .worker(worker)
                 .eager_prewarm(true)
                 .shutdown_timeout(Duration::from_secs(1)),
@@ -1971,7 +1911,7 @@ async fn test_root_supervisor_graceful_shutdown_cascade() {
 
     // Subsequent operations on the shut-down supervisor return unavailable
     assert!(
-        sup.resolve_actor_channel_untyped("cascade-actor")
+        sup.resolve_child_channel_untyped("cascade-actor")
             .await
             .is_err()
     );
@@ -2001,7 +1941,7 @@ impl StatefulActor for CounterActor {
     async fn handle(
         &mut self,
         msg: Self::Message,
-        ctx: &mut ActorContext,
+        ctx: &mut ActorContext<Self>,
     ) -> Result<Self::Response, Self::Error> {
         match msg {
             CounterMsg::Add(delta) => {
@@ -2019,8 +1959,8 @@ impl StatefulActor for CounterActor {
 
 #[tokio::test]
 async fn test_stateful_actor_call_and_cast_with_crash_recovery() {
-    let root = RootSupervisor::new();
-    let service_sup = ServiceSupervisor::spawn_and_register("stateful-actor-service", &root)
+    let root = Supervisor::new("root");
+    let service_sup = Supervisor::builder("stateful-actor-service").spawn(&root)
         .await
         .expect("ServiceSupervisor registration failed");
 
@@ -2059,7 +1999,7 @@ impl StatefulActor for LifecycleActor {
     type Response = usize;
     type Error = String;
 
-    async fn on_start(&mut self, ctx: &mut ActorContext) -> Result<(), String> {
+    async fn on_start(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), String> {
         self.started_instances.lock().await.push(ctx.instance_id());
         Ok(())
     }
@@ -2067,21 +2007,21 @@ impl StatefulActor for LifecycleActor {
     async fn handle(
         &mut self,
         msg: Self::Message,
-        _ctx: &mut ActorContext,
+        _ctx: &mut ActorContext<Self>,
     ) -> Result<Self::Response, Self::Error> {
         self.processed += msg;
         Ok(self.processed)
     }
 
-    async fn on_stop(&mut self, _ctx: &mut ActorContext) {
+    async fn on_stop(&mut self, _ctx: &mut ActorContext<Self>) {
         self.stopped_count.fetch_add(1, Ordering::SeqCst);
     }
 }
 
 #[tokio::test]
 async fn test_stateful_actor_lifecycle_hooks_on_start_and_on_stop() {
-    let root = RootSupervisor::new();
-    let service_sup = ServiceSupervisor::spawn_and_register("lifecycle-service", &root)
+    let root = Supervisor::new("root");
+    let service_sup = Supervisor::builder("lifecycle-service").spawn(&root)
         .await
         .expect("ServiceSupervisor registration failed");
 
@@ -2119,7 +2059,7 @@ async fn test_stateful_actor_lifecycle_hooks_on_start_and_on_stop() {
 
 #[tokio::test]
 async fn test_mixed_supervision_resource_actor_and_stateful_actor_one_for_all() {
-    let root = RootSupervisor::new();
+    let root = Supervisor::new("root");
 
     let token_worker = |ctx: WorkerContext| async move {
         Ok::<_, String>(TimedResource::perpetual(format!(
@@ -2129,9 +2069,9 @@ async fn test_mixed_supervision_resource_actor_and_stateful_actor_one_for_all() 
     };
 
     // Register BOTH a GenericResourceActor and a StatefulActor in the SAME OneForAll ServiceSupervisor!
-    let sup = ServiceSupervisor::builder("mixed-pipeline-service")
+    let sup = Supervisor::builder("mixed-pipeline-service")
         .strategy(SupervisionStrategy::OneForAll)
-        .add_child(GenericResourceActor::builder("auth-token").worker(token_worker))
+        .add_child(ResourceActor::builder("auth-token").worker(token_worker))
         .add_child(StatefulActorBuilder::from_default::<CounterActor>(
             "order-counter",
         ))
@@ -2140,7 +2080,7 @@ async fn test_mixed_supervision_resource_actor_and_stateful_actor_one_for_all() 
         .expect("Failed to spawn mixed supervisor");
 
     let token_client = sup
-        .get_client::<String, String>("auth-token")
+        .get_resource_client::<String, String>("auth-token")
         .await
         .expect("Failed to get ResourceClient");
     let counter_client = sup
@@ -2175,15 +2115,15 @@ async fn test_mixed_supervision_resource_actor_and_stateful_actor_one_for_all() 
 
 #[tokio::test]
 async fn test_ttl_shorter_than_expiry_buffer_does_not_storm_refresh_on_get() {
-    let root = RootSupervisor::new();
-    let sup = ServiceSupervisor::spawn_and_register("short-ttl-service", &root)
+    let root = Supervisor::new("root");
+    let sup = Supervisor::builder("short-ttl-service").spawn(&root)
         .await
         .expect("Failed to spawn service supervisor");
 
     let call_count = Arc::new(AtomicUsize::new(0));
     let c = call_count.clone();
 
-    let client = GenericResourceActor::builder("short-ttl-actor")
+    let client = ResourceActor::builder("short-ttl-actor")
         .worker(move |_ctx: WorkerContext| {
             let c = c.clone();
             async move {
@@ -2224,13 +2164,13 @@ async fn test_ttl_shorter_than_expiry_buffer_does_not_storm_refresh_on_get() {
 
 #[tokio::test]
 async fn test_zero_channel_capacity_and_spec_poisoning_protection() {
-    let root = RootSupervisor::new();
-    let sup = ServiceSupervisor::spawn_and_register("cap-service", &root)
+    let root = Supervisor::new("root");
+    let sup = Supervisor::builder("cap-service").spawn(&root)
         .await
         .expect("Failed to spawn service supervisor");
 
     // 1. Clamping: channel_capacity(0) must not panic and must spawn successfully
-    let client = GenericResourceActor::builder("cap-zero-actor")
+    let client = ResourceActor::builder("cap-zero-actor")
         .worker(|_ctx: WorkerContext| async {
             Ok::<_, String>(TimedResource::perpetual("ok".to_string()))
         })
@@ -2255,7 +2195,7 @@ async fn test_zero_channel_capacity_and_spec_poisoning_protection() {
     );
 
     // Supervisor must remain alive and able to spawn healthy children
-    let healthy_client = GenericResourceActor::builder("healthy-after-panic")
+    let healthy_client = ResourceActor::builder("healthy-after-panic")
         .worker(|_ctx: WorkerContext| async {
             Ok::<_, String>(TimedResource::perpetual("healthy".to_string()))
         })
@@ -2281,7 +2221,7 @@ impl StatefulActor for StopDrainActor {
     async fn handle(
         &mut self,
         msg: Self::Message,
-        ctx: &mut ActorContext,
+        ctx: &mut ActorContext<Self>,
     ) -> Result<Self::Response, Self::Error> {
         self.handled_count.fetch_add(1, Ordering::SeqCst);
         if msg == 0 {
@@ -2295,8 +2235,8 @@ impl StatefulActor for StopDrainActor {
 
 #[tokio::test]
 async fn test_stateful_actor_ctx_stop_drains_all_queued_messages() {
-    let root = RootSupervisor::new();
-    let sup = ServiceSupervisor::spawn_and_register("drain-service", &root)
+    let root = Supervisor::new("root");
+    let sup = Supervisor::builder("drain-service").spawn(&root)
         .await
         .expect("Failed to spawn service supervisor");
 
@@ -2358,7 +2298,7 @@ impl StatefulActor for ExclusiveResourceSiblingActor {
     type Response = usize;
     type Error = String;
 
-    async fn on_start(&mut self, _ctx: &mut ActorContext) -> Result<(), Self::Error> {
+    async fn on_start(&mut self, _ctx: &mut ActorContext<Self>) -> Result<(), Self::Error> {
         let prev = self.active_instances.fetch_add(1, Ordering::SeqCst);
         if prev > 0 {
             self.overlap_detected.store(true, Ordering::SeqCst);
@@ -2373,7 +2313,7 @@ impl StatefulActor for ExclusiveResourceSiblingActor {
     async fn handle(
         &mut self,
         should_panic: Self::Message,
-        _ctx: &mut ActorContext,
+        _ctx: &mut ActorContext<Self>,
     ) -> Result<Self::Response, Self::Error> {
         if should_panic {
             panic!("intentional crash");
@@ -2381,7 +2321,7 @@ impl StatefulActor for ExclusiveResourceSiblingActor {
         Ok(self.instance_id)
     }
 
-    async fn on_stop(&mut self, _ctx: &mut ActorContext) {
+    async fn on_stop(&mut self, _ctx: &mut ActorContext<Self>) {
         // Simulate releasing an exclusive resource (e.g. flushing WAL / closing lock file)
         tokio::time::sleep(Duration::from_millis(50)).await;
         self.events
@@ -2394,8 +2334,8 @@ impl StatefulActor for ExclusiveResourceSiblingActor {
 
 #[tokio::test]
 async fn test_one_for_all_and_restart_child_graceful_on_stop_without_overlap() {
-    let root = RootSupervisor::new();
-    let sup = ServiceSupervisor::builder("ofa-graceful-sup")
+    let root = Supervisor::new("root");
+    let sup = Supervisor::builder("ofa-graceful-sup")
         .strategy(SupervisionStrategy::OneForAll)
         .spawn(&root)
         .await
@@ -2412,10 +2352,7 @@ async fn test_one_for_all_and_restart_child_graceful_on_stop_without_overlap() {
             overlap_detected: Arc::new(AtomicBool::new(false)),
             events: Arc::new(std::sync::Mutex::new(Vec::new())),
         })
-        .restart_policy(RestartPolicy {
-            initial_backoff: Duration::ZERO,
-            ..Default::default()
-        })
+        .restart_policy(RestartPolicy::default().initial_backoff(Duration::ZERO))
         .spawn(&sup)
         .await
         .expect("Failed to spawn actor-a");
@@ -2430,10 +2367,7 @@ async fn test_one_for_all_and_restart_child_graceful_on_stop_without_overlap() {
             overlap_detected: ob.clone(),
             events: eb.clone(),
         })
-        .restart_policy(RestartPolicy {
-            initial_backoff: Duration::ZERO,
-            ..Default::default()
-        })
+        .restart_policy(RestartPolicy::default().initial_backoff(Duration::ZERO))
         .shutdown_policy(ShutdownPolicy::Timeout(Duration::from_secs(2)))
         .spawn(&sup)
         .await
@@ -2498,15 +2432,15 @@ async fn test_one_for_all_and_restart_child_graceful_on_stop_without_overlap() {
 
 #[tokio::test]
 async fn test_duplicate_service_supervisor_does_not_boot_children() {
-    let root = RootSupervisor::new();
-    let _sup1 = ServiceSupervisor::spawn_and_register("dup-svc", &root)
+    let root = Supervisor::new("root");
+    let _sup1 = Supervisor::builder("dup-svc").spawn(&root)
         .await
         .expect("First registration should succeed");
 
     let child_booted = Arc::new(AtomicUsize::new(0));
     let cb = child_booted.clone();
 
-    let spec = GenericResourceActor::builder("side-effect-child")
+    let spec = ResourceActor::builder("side-effect-child")
         .worker(move |_ctx: WorkerContext| {
             let cb = cb.clone();
             async move {
@@ -2517,12 +2451,12 @@ async fn test_duplicate_service_supervisor_does_not_boot_children() {
         .eager_prewarm(true)
         .build_child_spec();
 
-    let dup_res = ServiceSupervisor::builder("dup-svc")
+    let dup_res = Supervisor::builder("dup-svc")
         .add_child(spec)
         .spawn(&root)
         .await;
     assert!(
-        matches!(dup_res, Err(RootError::ServiceAlreadyExists(_))),
+        matches!(dup_res, Err(SupervisorError::ChildAlreadyExists(_))),
         "Duplicate service name must be rejected by RootSupervisor"
     );
 
@@ -2538,46 +2472,43 @@ async fn test_duplicate_service_supervisor_does_not_boot_children() {
 
 #[tokio::test]
 async fn test_stopped_and_deleted_children_do_not_resurrect_on_supervisor_restart() {
-    let root = RootSupervisor::new();
-    let sup = ServiceSupervisor::builder("lifecycle-svc")
-        .restart_policy(RestartPolicy {
-            initial_backoff: Duration::from_millis(10),
-            ..Default::default()
-        })
+    let root = Supervisor::new("root");
+    let sup = Supervisor::builder("lifecycle-svc")
+        .restart_policy(RestartPolicy::default().initial_backoff(Duration::from_millis(10)))
         .spawn(&root)
         .await
         .expect("Failed to spawn service supervisor");
 
-    let _c1 = GenericResourceActor::builder("stopped-child")
+    let _c1 = ResourceActor::builder("stopped-child")
         .worker(|ctx: WorkerContext| async move {
             Ok::<_, String>(TimedResource::perpetual(format!(
                 "inst_{}",
                 ctx.instance_id
             )))
         })
-        .spawn_and_register(&sup, &root)
+        .spawn(&sup)
         .await
         .expect("Failed to spawn stopped-child");
 
-    let _c2 = GenericResourceActor::builder("deleted-child")
+    let _c2 = ResourceActor::builder("deleted-child")
         .worker(|ctx: WorkerContext| async move {
             Ok::<_, String>(TimedResource::perpetual(format!(
                 "inst_{}",
                 ctx.instance_id
             )))
         })
-        .spawn_and_register(&sup, &root)
+        .spawn(&sup)
         .await
         .expect("Failed to spawn deleted-child");
 
-    let c3 = GenericResourceActor::builder("active-child")
+    let c3 = ResourceActor::builder("active-child")
         .worker(|ctx: WorkerContext| async move {
             Ok::<_, String>(TimedResource::perpetual(format!(
                 "inst_{}",
                 ctx.instance_id
             )))
         })
-        .spawn_and_register(&sup, &root)
+        .spawn(&sup)
         .await
         .expect("Failed to spawn active-child");
 
@@ -2586,7 +2517,7 @@ async fn test_stopped_and_deleted_children_do_not_resurrect_on_supervisor_restar
     sup.delete_child("deleted-child").await.unwrap();
 
     // Crash the ServiceSupervisor so RootSupervisor respawns it from shared child_specs
-    sup.trigger_service_crash().await.unwrap();
+    sup.simulate_crash().await.unwrap();
     tokio::time::sleep(Duration::from_millis(80)).await;
 
     // Active child must be running on the respawned supervisor
@@ -2595,15 +2526,15 @@ async fn test_stopped_and_deleted_children_do_not_resurrect_on_supervisor_restar
     // Neither the stopped child nor the deleted child may resurrect!
     assert!(
         matches!(
-            sup.resolve_actor_channel_untyped("stopped-child").await,
-            Err(ServiceError::ActorNotFound(_))
+            sup.resolve_child_channel_untyped("stopped-child").await,
+            Err(SupervisorError::ChildNotFound(_))
         ),
         "Stopped child must not resurrect after ServiceSupervisor restart"
     );
     assert!(
         matches!(
-            sup.resolve_actor_channel_untyped("deleted-child").await,
-            Err(ServiceError::ActorNotFound(_))
+            sup.resolve_child_channel_untyped("deleted-child").await,
+            Err(SupervisorError::ChildNotFound(_))
         ),
         "Deleted child must not resurrect after ServiceSupervisor restart"
     );
@@ -2613,14 +2544,14 @@ async fn test_stopped_and_deleted_children_do_not_resurrect_on_supervisor_restar
 
 #[tokio::test]
 async fn test_client_control_commands_rebind_after_crash() {
-    let root = RootSupervisor::new();
-    let sup = ServiceSupervisor::spawn_and_register("rebind-ctrl-svc", &root)
+    let root = Supervisor::new("root");
+    let sup = Supervisor::builder("rebind-ctrl-svc").spawn(&root)
         .await
         .expect("Failed to spawn service supervisor");
 
     let gen_counter = Arc::new(AtomicUsize::new(0));
     let gc = gen_counter.clone();
-    let res_client = GenericResourceActor::builder("res-ctrl-actor")
+    let res_client = ResourceActor::builder("res-ctrl-actor")
         .worker(move |_ctx: WorkerContext| {
             let gc = gc.clone();
             async move {
@@ -2628,11 +2559,8 @@ async fn test_client_control_commands_rebind_after_crash() {
                 Ok::<_, String>(TimedResource::perpetual(n))
             }
         })
-        .restart_policy(RestartPolicy {
-            initial_backoff: Duration::from_millis(10),
-            ..Default::default()
-        })
-        .spawn_and_register(&sup, &root)
+        .restart_policy(RestartPolicy::default().initial_backoff(Duration::from_millis(10)))
+        .spawn(&sup)
         .await
         .expect("Failed to spawn resource actor");
 
@@ -2662,15 +2590,15 @@ async fn test_client_control_commands_rebind_after_crash() {
 
 #[tokio::test]
 async fn test_large_jitter_and_zero_ttl_do_not_cause_refresh_storm() {
-    let root = RootSupervisor::new();
-    let sup = ServiceSupervisor::spawn_and_register("h2-storm-svc", &root)
+    let root = Supervisor::new("root");
+    let sup = Supervisor::builder("h2-storm-svc").spawn(&root)
         .await
         .expect("Failed to spawn service supervisor");
 
     // 1. Large jitter (1 hour) vs 2s TTL: must clamp jitter to at most half the lead window
     let jitter_calls = Arc::new(AtomicUsize::new(0));
     let jc = jitter_calls.clone();
-    let _c_jitter = GenericResourceActor::builder("large-jitter-actor")
+    let _c_jitter = ResourceActor::builder("large-jitter-actor")
         .worker(move |_ctx: WorkerContext| {
             let jc = jc.clone();
             async move {
@@ -2682,14 +2610,14 @@ async fn test_large_jitter_and_zero_ttl_do_not_cause_refresh_storm() {
         .proactive_refresh(true)
         .proactive_jitter(Duration::from_secs(3600))
         .eager_prewarm(true)
-        .spawn_and_register(&sup, &root)
+        .spawn(&sup)
         .await
         .expect("Failed to spawn large-jitter-actor");
 
     // 2. Zero-TTL resource: must exponentially back off instead of polling at 20 Hz
     let zero_calls = Arc::new(AtomicUsize::new(0));
     let zc = zero_calls.clone();
-    let _c_zero = GenericResourceActor::builder("zero-ttl-actor")
+    let _c_zero = ResourceActor::builder("zero-ttl-actor")
         .worker(move |_ctx: WorkerContext| {
             let zc = zc.clone();
             async move {
@@ -2699,7 +2627,7 @@ async fn test_large_jitter_and_zero_ttl_do_not_cause_refresh_storm() {
         })
         .proactive_refresh(true)
         .eager_prewarm(true)
-        .spawn_and_register(&sup, &root)
+        .spawn(&sup)
         .await
         .expect("Failed to spawn zero-ttl-actor");
 
@@ -2732,7 +2660,7 @@ impl StatefulActor for HalfMutatedTimeoutActor {
     async fn handle(
         &mut self,
         sleep_dur: Self::Message,
-        _ctx: &mut ActorContext,
+        _ctx: &mut ActorContext<Self>,
     ) -> Result<Self::Response, Self::Error> {
         if !sleep_dur.is_zero() {
             // Mutate state BEFORE awaiting a slow operation that will time out!
@@ -2746,8 +2674,8 @@ impl StatefulActor for HalfMutatedTimeoutActor {
 
 #[tokio::test]
 async fn test_stateful_actor_handler_timeout_fails_fast_and_restarts_cleanly() {
-    let root = RootSupervisor::new();
-    let sup = ServiceSupervisor::spawn_and_register("m2-timeout-svc", &root)
+    let root = Supervisor::new("root");
+    let sup = Supervisor::builder("m2-timeout-svc").spawn(&root)
         .await
         .expect("Failed to spawn service supervisor");
 
@@ -2756,10 +2684,7 @@ async fn test_stateful_actor_handler_timeout_fails_fast_and_restarts_cleanly() {
         corrupted: false,
     })
     .handler_timeout(Duration::from_millis(40))
-    .restart_policy(RestartPolicy {
-        initial_backoff: Duration::from_millis(10),
-        ..Default::default()
-    })
+    .restart_policy(RestartPolicy::default().initial_backoff(Duration::from_millis(10)))
     .spawn(&sup)
     .await
     .expect("Failed to spawn timeout-actor");
@@ -2816,12 +2741,12 @@ impl StatefulActor for ShutdownOrderActor {
     async fn handle(
         &mut self,
         _msg: Self::Message,
-        _ctx: &mut ActorContext,
+        _ctx: &mut ActorContext<Self>,
     ) -> Result<Self::Response, Self::Error> {
         Ok(())
     }
 
-    async fn on_stop(&mut self, _ctx: &mut ActorContext) {
+    async fn on_stop(&mut self, _ctx: &mut ActorContext<Self>) {
         self.log
             .lock()
             .unwrap()
@@ -2833,8 +2758,8 @@ impl StatefulActor for ShutdownOrderActor {
 
 #[tokio::test]
 async fn test_sequential_graceful_shutdown_in_reverse_registration_order() {
-    let root = RootSupervisor::new();
-    let sup = ServiceSupervisor::spawn_and_register("seq-shutdown-svc", &root)
+    let root = Supervisor::new("root");
+    let sup = Supervisor::builder("seq-shutdown-svc").spawn(&root)
         .await
         .expect("Failed to spawn service supervisor");
 
@@ -2853,7 +2778,7 @@ async fn test_sequential_graceful_shutdown_in_reverse_registration_order() {
 
     // Stop the service via RootSupervisor: children must shut down strictly sequentially
     // in reverse registration order (child_3 completely stops before child_2 begins, etc.)
-    root.stop_service("seq-shutdown-svc")
+    root.stop_child("seq-shutdown-svc")
         .await
         .expect("stop_service failed");
 
@@ -2890,7 +2815,7 @@ impl StatefulActor for NonCloneMessageActor {
     async fn handle(
         &mut self,
         msg: Self::Message,
-        ctx: &mut ActorContext,
+        ctx: &mut ActorContext<Self>,
     ) -> Result<Self::Response, Self::Error> {
         self.sum += msg.0;
         Ok((self.sum, ctx.instance_id()))
@@ -2907,7 +2832,7 @@ impl StatefulActor for MidHandlerPanicActor {
     async fn handle(
         &mut self,
         msg: Self::Message,
-        ctx: &mut ActorContext,
+        ctx: &mut ActorContext<Self>,
     ) -> Result<Self::Response, Self::Error> {
         if ctx.instance_id() == 1 {
             panic!("Simulated mid-handler crash on instance 1");
@@ -2918,18 +2843,15 @@ impl StatefulActor for MidHandlerPanicActor {
 
 #[tokio::test]
 async fn test_stateful_actor_non_clone_message_rebind_and_call_retry_mid_handler() {
-    let root = RootSupervisor::new();
-    let sup = ServiceSupervisor::spawn_and_register("non-clone-svc", &root)
+    let root = Supervisor::new("root");
+    let sup = Supervisor::builder("non-clone-svc").spawn(&root)
         .await
         .expect("Failed to spawn service supervisor");
 
     // Part A: Non-Clone Message recovery across closed channel on both call() and cast()
     let non_clone_client =
         StatefulActorBuilder::from_default::<NonCloneMessageActor>("non-clone-actor")
-            .restart_policy(RestartPolicy {
-                initial_backoff: Duration::from_millis(10),
-                ..Default::default()
-            })
+            .restart_policy(RestartPolicy::default().initial_backoff(Duration::from_millis(10)))
             .spawn(&sup)
             .await
             .expect("Failed to spawn NonCloneMessageActor");
@@ -2956,10 +2878,7 @@ async fn test_stateful_actor_non_clone_message_rebind_and_call_retry_mid_handler
 
     // Part B: Mid-handler crash recovery via call_retry()
     let retry_client = StatefulActorBuilder::new("mid-panic-actor", |_inst| MidHandlerPanicActor)
-        .restart_policy(RestartPolicy {
-            initial_backoff: Duration::from_millis(10),
-            ..Default::default()
-        })
+        .restart_policy(RestartPolicy::default().initial_backoff(Duration::from_millis(10)))
         .spawn(&sup)
         .await
         .expect("Failed to spawn MidHandlerPanicActor");
@@ -2983,7 +2902,7 @@ impl StatefulActor for FlakyStartActor {
     type Response = (usize, usize);
     type Error = String;
 
-    async fn on_start(&mut self, ctx: &mut ActorContext) -> Result<(), String> {
+    async fn on_start(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), String> {
         if ctx.instance_id() == 1 {
             return Err("Transient DB connection failure during on_start".to_string());
         }
@@ -2994,7 +2913,7 @@ impl StatefulActor for FlakyStartActor {
     async fn handle(
         &mut self,
         _msg: Self::Message,
-        ctx: &mut ActorContext,
+        ctx: &mut ActorContext<Self>,
     ) -> Result<Self::Response, Self::Error> {
         Ok((ctx.instance_id(), self.rehydrated_value))
     }
@@ -3002,16 +2921,13 @@ impl StatefulActor for FlakyStartActor {
 
 #[tokio::test]
 async fn test_stateful_actor_on_start_failure_triggers_supervisor_recovery() {
-    let root = RootSupervisor::new();
-    let sup = ServiceSupervisor::spawn_and_register("flaky-start-svc", &root)
+    let root = Supervisor::new("root");
+    let sup = Supervisor::builder("flaky-start-svc").spawn(&root)
         .await
         .expect("Failed to spawn service supervisor");
 
     let client = StatefulActorBuilder::from_default::<FlakyStartActor>("flaky-start-actor")
-        .restart_policy(RestartPolicy {
-            initial_backoff: Duration::from_millis(10),
-            ..Default::default()
-        })
+        .restart_policy(RestartPolicy::default().initial_backoff(Duration::from_millis(10)))
         .spawn(&sup)
         .await
         .expect("Failed to spawn FlakyStartActor");
@@ -3036,8 +2952,8 @@ async fn test_stateful_actor_on_start_failure_triggers_supervisor_recovery() {
 
 #[tokio::test]
 async fn test_rest_for_one_overlapping_backoffs_and_failed_downstream_recovery() {
-    let root = RootSupervisor::new();
-    let sup = ServiceSupervisor::builder("rfo-overlap-svc")
+    let root = Supervisor::new("root");
+    let sup = Supervisor::builder("rfo-overlap-svc")
         .strategy(SupervisionStrategy::RestForOne)
         .spawn(&root)
         .await
@@ -3051,13 +2967,7 @@ async fn test_rest_for_one_overlapping_backoffs_and_failed_downstream_recovery()
         ev.lock().unwrap().push(format!("b_start_{}", inst));
         CounterActor::default()
     })
-    .restart_policy(RestartPolicy {
-        max_restarts: 5,
-        time_window: Duration::from_secs(5),
-        initial_backoff: Duration::from_millis(90),
-        max_backoff: Duration::from_millis(200),
-        backoff_multiplier: 1.0,
-    })
+    .restart_policy(RestartPolicy::new(5, Duration::from_secs(5)).initial_backoff(Duration::from_millis(90)).max_backoff(Duration::from_millis(200)).backoff_multiplier(1.0))
     .spawn(&sup)
     .await
     .expect("Failed to spawn actor-b");
@@ -3068,13 +2978,7 @@ async fn test_rest_for_one_overlapping_backoffs_and_failed_downstream_recovery()
         ev.lock().unwrap().push(format!("c_start_{}", inst));
         CounterActor::default()
     })
-    .restart_policy(RestartPolicy {
-        max_restarts: 1,
-        time_window: Duration::from_secs(5),
-        initial_backoff: Duration::from_millis(35),
-        max_backoff: Duration::from_millis(200),
-        backoff_multiplier: 1.0,
-    })
+    .restart_policy(RestartPolicy::new(1, Duration::from_secs(5)).initial_backoff(Duration::from_millis(35)).max_backoff(Duration::from_millis(200)).backoff_multiplier(1.0))
     .spawn(&sup)
     .await
     .expect("Failed to spawn actor-c");
@@ -3111,8 +3015,8 @@ async fn test_rest_for_one_overlapping_backoffs_and_failed_downstream_recovery()
     tokio::time::sleep(Duration::from_millis(20)).await;
     assert!(matches!(
         client_c.call_retry(CounterMsg::GetWithInstance).await,
-        Err(otp_actor::ActorError::Service(
-            ServiceError::MaxRestartsExceeded(_, _, _)
+        Err(otp_actor::ActorError::Supervisor(
+            SupervisorError::MaxRestartsExceeded(_, _, _)
         ))
     ));
 
@@ -3133,15 +3037,15 @@ async fn test_rest_for_one_overlapping_backoffs_and_failed_downstream_recovery()
 
 #[tokio::test]
 async fn test_delete_and_start_child_during_backoff_ignores_stale_timer() {
-    let root = RootSupervisor::new();
-    let sup = ServiceSupervisor::spawn_and_register("del-backoff-svc", &root)
+    let root = Supervisor::new("root");
+    let sup = Supervisor::builder("del-backoff-svc").spawn(&root)
         .await
         .expect("Failed to spawn service supervisor");
 
     let spawn_count = Arc::new(AtomicUsize::new(0));
     let sc1 = spawn_count.clone();
 
-    let client1 = GenericResourceActor::builder("recreated-child")
+    let client1 = ResourceActor::builder("recreated-child")
         .worker(move |ctx: WorkerContext| {
             let sc = sc1.clone();
             async move {
@@ -3150,10 +3054,7 @@ async fn test_delete_and_start_child_during_backoff_ignores_stale_timer() {
             }
         })
         .eager_prewarm(true)
-        .restart_policy(RestartPolicy {
-            initial_backoff: Duration::from_millis(80),
-            ..Default::default()
-        })
+        .restart_policy(RestartPolicy::default().initial_backoff(Duration::from_millis(80)))
         .spawn(&sup)
         .await
         .expect("Failed to spawn initial child");
@@ -3169,7 +3070,7 @@ async fn test_delete_and_start_child_during_backoff_ignores_stale_timer() {
     sup.delete_child("recreated-child").await.unwrap();
 
     let sc2 = spawn_count.clone();
-    let client2 = GenericResourceActor::builder("recreated-child")
+    let client2 = ResourceActor::builder("recreated-child")
         .worker(move |ctx: WorkerContext| {
             let sc = sc2.clone();
             async move {
@@ -3199,7 +3100,7 @@ async fn test_delete_and_start_child_during_backoff_ignores_stale_timer() {
 
 #[tokio::test]
 async fn test_root_restart_service_honors_shutdown_policy_without_overlap() {
-    let root = RootSupervisor::new();
+    let root = Supervisor::new("root");
 
     let active_instances = Arc::new(AtomicUsize::new(0));
     let overlap_detected = Arc::new(AtomicBool::new(false));
@@ -3220,7 +3121,7 @@ async fn test_root_restart_service_honors_shutdown_policy_without_overlap() {
     .shutdown_policy(ShutdownPolicy::Timeout(Duration::from_secs(2)))
     .build_child_spec();
 
-    let sup = ServiceSupervisor::builder("restartable-svc")
+    let sup = Supervisor::builder("restartable-svc")
         .shutdown_policy(ShutdownPolicy::Timeout(Duration::from_secs(2)))
         .add_child(child_spec)
         .spawn(&root)
@@ -3236,7 +3137,7 @@ async fn test_root_restart_service_honors_shutdown_policy_without_overlap() {
     // Manually restart the entire service via RootSupervisor:
     // Must gracefully shut down the old ServiceSupervisor and await its child's 50ms `on_stop`
     // BEFORE spawning the replacement ServiceSupervisor and its child's `on_start`!
-    root.restart_service("restartable-svc")
+    root.restart_child("restartable-svc")
         .await
         .expect("restart_service should succeed");
 
@@ -3260,14 +3161,14 @@ async fn test_root_restart_service_honors_shutdown_policy_without_overlap() {
 
 #[tokio::test]
 async fn test_resource_client_rebinds_on_actor_unavailable_and_propagates_actor_not_found() {
-    let root = RootSupervisor::new();
-    let sup = ServiceSupervisor::spawn_and_register("rebind-err-svc", &root)
+    let root = Supervisor::new("root");
+    let sup = Supervisor::builder("rebind-err-svc").spawn(&root)
         .await
         .expect("Failed to spawn service supervisor");
 
     // 1. Verify ResourceClient::get() and ActorClient::call() propagate ServiceError::ActorNotFound
     //    when an actor has been explicitly stopped.
-    let res_client = GenericResourceActor::builder("stopped-res-actor")
+    let res_client = ResourceActor::builder("stopped-res-actor")
         .worker(|_ctx: WorkerContext| async {
             Ok::<_, String>(TimedResource::perpetual("ok".to_string()))
         })
@@ -3287,9 +3188,9 @@ async fn test_resource_client_rebinds_on_actor_unavailable_and_propagates_actor_
     assert!(
         matches!(
             res_err,
-            Err(ResourceError::Service(ServiceError::ActorNotFound(_)))
+            Err(ResourceError::Supervisor(SupervisorError::ChildNotFound(_)))
         ),
-        "Expected ResourceError::Service(ServiceError::ActorNotFound), got {:?}",
+        "Expected ResourceError::Supervisor(ServiceError::ActorNotFound), got {:?}",
         res_err
     );
 
@@ -3297,11 +3198,11 @@ async fn test_resource_client_rebinds_on_actor_unavailable_and_propagates_actor_
     assert!(
         matches!(
             state_err,
-            Err(otp_actor::ActorError::Service(ServiceError::ActorNotFound(
+            Err(otp_actor::ActorError::Supervisor(SupervisorError::ChildNotFound(
                 _
             )))
         ),
-        "Expected ActorError::Service(ServiceError::ActorNotFound), got {:?}",
+        "Expected ActorError::Supervisor(ServiceError::ActorNotFound), got {:?}",
         state_err
     );
 
@@ -3310,39 +3211,51 @@ async fn test_resource_client_rebinds_on_actor_unavailable_and_propagates_actor_
 
 #[tokio::test]
 async fn test_root_supervisor_drop_aborts_services_even_with_active_handles() {
-    let root = RootSupervisor::new();
-    let sup = ServiceSupervisor::spawn_and_register("zombie-check-svc", &root)
+    let root = Supervisor::new("root");
+    let sup = Supervisor::builder("zombie-check-svc")
+        .spawn(&root)
         .await
         .expect("Failed to spawn service supervisor");
 
-    // Keep an active sender to the ServiceSupervisor's command channel that does not
-    // hold a strong reference to `RootSupervisorHandle`.
-    let kept_service_tx = root
-        .resolve_service_channel("zombie-check-svc")
+    // Keep an active untyped sender (`Arc<Sender<SupervisorCommand>>`) to the child Supervisor's
+    // command channel that does not hold a strong reference to the root `SupervisorHandle`.
+    let _kept_service_tx = root
+        .resolve_child_channel_untyped("zombie-check-svc")
         .await
         .expect("Failed to resolve service channel");
 
-    let client = StatefulActorBuilder::from_default::<CounterActor>("zombie-check-actor")
+    let actor_dropped = Arc::new(AtomicBool::new(false));
+    let actor_dropped_clone = actor_dropped.clone();
+    struct ActorDropGuard(Arc<AtomicBool>);
+    impl Drop for ActorDropGuard {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    let guard = ActorDropGuard(actor_dropped_clone);
+
+    let client = ResourceActor::builder("zombie-check-actor")
+        .worker(move |_ctx: WorkerContext| {
+            let _g = &guard;
+            async move { Ok::<_, String>(TimedResource::perpetual("ok".to_string())) }
+        })
         .spawn(&sup)
         .await
-        .expect("Failed to spawn stateful actor");
+        .expect("Failed to spawn resource actor");
 
-    assert_eq!(client.call(CounterMsg::Add(5)).await.unwrap(), (5, 1));
-    assert!(!kept_service_tx.is_closed());
+    assert_eq!(client.get().await.unwrap(), "ok");
+    assert!(!actor_dropped.load(Ordering::SeqCst));
 
-    // Drop `client`, `sup`, and `root` so all `RootSupervisorHandle` clones are dropped,
-    // while `kept_service_tx` stays alive and keeps the `ServiceSupervisor` command channel open.
-    // Without `impl Drop for SupervisedService`, `self.join_set.abort_all()` only detached the
-    // `JoinHandle` and `ServiceSupervisor` + its child actors stayed alive as zombies because
-    // `kept_service_tx` prevented channel closure.
+    // Drop `client`, `sup`, and `root` so all root `SupervisorHandle` clones are dropped,
+    // while `_kept_service_tx` stays alive and keeps the child Supervisor's command channel open.
     drop(client);
     drop(sup);
     drop(root);
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     assert!(
-        kept_service_tx.is_closed(),
-        "Expected ServiceSupervisor task to be aborted by SupervisedService::drop even when a command sender is still held"
+        actor_dropped.load(Ordering::SeqCst),
+        "Expected child Supervisor and its actors to be aborted by SupervisedChild::drop even when a command sender is still held"
     );
 }
 
@@ -3358,7 +3271,7 @@ impl StatefulActor for SlowDrainActor {
     async fn handle(
         &mut self,
         sleep_dur: Self::Message,
-        _ctx: &mut ActorContext,
+        _ctx: &mut ActorContext<Self>,
     ) -> Result<Self::Response, Self::Error> {
         if !sleep_dur.is_zero() {
             tokio::time::sleep(sleep_dur).await;
@@ -3369,8 +3282,8 @@ impl StatefulActor for SlowDrainActor {
 
 #[tokio::test]
 async fn test_stateful_actor_graceful_shutdown_drains_messages_queued_after_shutdown_envelope() {
-    let root = RootSupervisor::new();
-    let sup = ServiceSupervisor::spawn_and_register("drain-shutdown-svc", &root)
+    let root = Supervisor::new("root");
+    let sup = Supervisor::builder("drain-shutdown-svc").spawn(&root)
         .await
         .expect("Failed to spawn service supervisor");
 
@@ -3415,8 +3328,8 @@ async fn test_stateful_actor_graceful_shutdown_drains_messages_queued_after_shut
 
 #[tokio::test]
 async fn test_one_for_all_max_restarts_preserves_stopped_and_removes_temporary_siblings() {
-    let root = RootSupervisor::new();
-    let sup = ServiceSupervisor::builder("ofa-exhaust-svc")
+    let root = Supervisor::new("root");
+    let sup = Supervisor::builder("ofa-exhaust-svc")
         .strategy(SupervisionStrategy::OneForAll)
         .spawn(&root)
         .await
@@ -3434,13 +3347,7 @@ async fn test_one_for_all_max_restarts_preserves_stopped_and_removes_temporary_s
         .expect("Failed to spawn temp-sib");
 
     let crash_client = StatefulActorBuilder::from_default::<CounterActor>("crashing-sib")
-        .restart_policy(RestartPolicy {
-            max_restarts: 0,
-            time_window: Duration::from_secs(5),
-            initial_backoff: Duration::from_millis(10),
-            max_backoff: Duration::from_millis(50),
-            backoff_multiplier: 1.0,
-        })
+        .restart_policy(RestartPolicy::new(0, Duration::from_secs(5)).initial_backoff(Duration::from_millis(10)).max_backoff(Duration::from_millis(50)).backoff_multiplier(1.0))
         .spawn(&sup)
         .await
         .expect("Failed to spawn crashing-sib");
@@ -3453,20 +3360,20 @@ async fn test_one_for_all_max_restarts_preserves_stopped_and_removes_temporary_s
     tokio::time::sleep(Duration::from_millis(40)).await;
 
     assert!(matches!(
-        sup.resolve_actor_channel_untyped("crashing-sib").await,
-        Err(ServiceError::MaxRestartsExceeded(_, _, _))
+        sup.resolve_child_channel_untyped("crashing-sib").await,
+        Err(SupervisorError::MaxRestartsExceeded(_, _, _))
     ));
     assert!(
         matches!(
-            sup.resolve_actor_channel_untyped("stopped-sib").await,
-            Err(ServiceError::ActorNotFound(_))
+            sup.resolve_child_channel_untyped("stopped-sib").await,
+            Err(SupervisorError::ChildNotFound(_))
         ),
         "Explicitly stopped sibling must remain ActorNotFound, not MaxRestartsExceeded"
     );
     assert!(
         matches!(
-            sup.resolve_actor_channel_untyped("temp-sib").await,
-            Err(ServiceError::ActorNotFound(_))
+            sup.resolve_child_channel_untyped("temp-sib").await,
+            Err(SupervisorError::ChildNotFound(_))
         ),
         "Temporary sibling must be removed (ActorNotFound), not marked MaxRestartsExceeded"
     );
@@ -3476,8 +3383,8 @@ async fn test_one_for_all_max_restarts_preserves_stopped_and_removes_temporary_s
 
 #[tokio::test]
 async fn test_stop_child_prevents_overlapping_start_child_while_on_stop_running() {
-    let root = RootSupervisor::new();
-    let sup = ServiceSupervisor::spawn_and_register("stop-overlap-svc", &root)
+    let root = Supervisor::new("root");
+    let sup = Supervisor::builder("stop-overlap-svc").spawn(&root)
         .await
         .expect("Failed to spawn service supervisor");
 
@@ -3511,7 +3418,7 @@ async fn test_stop_child_prevents_overlapping_start_child_while_on_stop_running(
     // Attempting to start_child with the same name while on_stop is still running must fail with ActorAlreadyExists
     let overlap_start = sup.start_child(make_spec()).await;
     assert!(
-        matches!(overlap_start, Err(ServiceError::ActorAlreadyExists(_))),
+        matches!(overlap_start, Err(SupervisorError::ChildAlreadyExists(_))),
         "start_child must reject duplicate spawn while old instance is still running on_stop"
     );
 
@@ -3537,8 +3444,8 @@ async fn test_stop_child_prevents_overlapping_start_child_while_on_stop_running(
 #[tokio::test]
 async fn test_restart_tracker_enforces_max_restarts_when_backoff_exceeds_time_window_and_delete_service()
  {
-    let root = RootSupervisor::new();
-    let sup = ServiceSupervisor::spawn_and_register("backoff-window-svc", &root)
+    let root = Supervisor::new("root");
+    let sup = Supervisor::builder("backoff-window-svc").spawn(&root)
         .await
         .expect("Failed to spawn service supervisor");
 
@@ -3546,13 +3453,7 @@ async fn test_restart_tracker_enforces_max_restarts_when_backoff_exceeds_time_wi
     // Previously, the 45ms backoff sleep caused the first crash timestamp to age out of the 30ms
     // time_window before instance 2 even spawned, allowing infinite restarts!
     let client = StatefulActorBuilder::from_default::<CounterActor>("backoff-window-actor")
-        .restart_policy(RestartPolicy {
-            max_restarts: 1,
-            time_window: Duration::from_millis(30),
-            initial_backoff: Duration::from_millis(45),
-            max_backoff: Duration::from_millis(100),
-            backoff_multiplier: 2.0,
-        })
+        .restart_policy(RestartPolicy::new(1, Duration::from_millis(30)).initial_backoff(Duration::from_millis(45)).max_backoff(Duration::from_millis(100)).backoff_multiplier(2.0))
         .spawn(&sup)
         .await
         .expect("Failed to spawn actor");
@@ -3573,8 +3474,8 @@ async fn test_restart_tracker_enforces_max_restarts_when_backoff_exceeds_time_wi
     assert!(
         matches!(
             res,
-            Err(otp_actor::ActorError::Service(
-                ServiceError::MaxRestartsExceeded(_, 1, _)
+            Err(otp_actor::ActorError::Supervisor(
+                SupervisorError::MaxRestartsExceeded(_, 1, _)
             ))
         ),
         "Expected MaxRestartsExceeded even when backoff > time_window, got {:?}",
@@ -3582,13 +3483,282 @@ async fn test_restart_tracker_enforces_max_restarts_when_backoff_exceeds_time_wi
     );
 
     // Verify RootSupervisorHandle::delete_service gracefully stops and removes the service
-    root.delete_service("backoff-window-svc")
+    root.delete_child("backoff-window-svc")
         .await
         .expect("delete_service should succeed");
     assert!(matches!(
-        root.resolve_service_channel("backoff-window-svc").await,
-        Err(RootError::ServiceNotFound(_))
+        root.resolve_child_channel_untyped("backoff-window-svc").await,
+        Err(SupervisorError::ChildNotFound(_))
     ));
 
     let _ = root.shutdown().await;
+}
+
+
+// ============================================================================
+// v0.3.0 Feature Tests: Recursive Supervision, CallMessage, handle_cast,
+// ActorContext (client & send_after), Backpressure, and 0-Hop Resource Cache
+// ============================================================================
+
+#[tokio::test]
+async fn test_three_level_nested_supervisor_hierarchy_and_subtree_recovery() {
+    // root -> mid -> leaf -> CounterActor
+    let root = Supervisor::new("root");
+    let mid = Supervisor::builder("mid-sup")
+        .strategy(SupervisionStrategy::OneForOne)
+        .restart_policy(RestartPolicy::default().initial_backoff(Duration::from_millis(10)))
+        .spawn(&root)
+        .await
+        .expect("Failed to spawn mid-sup");
+
+    let leaf = Supervisor::builder("leaf-sup")
+        .strategy(SupervisionStrategy::OneForAll)
+        .restart_policy(RestartPolicy::default().initial_backoff(Duration::from_millis(10)))
+        .spawn(&mid)
+        .await
+        .expect("Failed to spawn leaf-sup");
+
+    let client = StatefulActorBuilder::from_default::<CounterActor>("deep-counter")
+        .spawn(&leaf)
+        .await
+        .expect("Failed to spawn deep-counter");
+
+    assert_eq!(client.call(CounterMsg::Add(10)).await.unwrap(), (10, 1));
+
+    // Crash the middle supervisor (`mid-sup`) via `root`!
+    // `root` restarts `mid-sup`, which re-spawns `leaf-sup` from its shared child_specs,
+    // which re-spawns `deep-counter` and updates the shared watch slot!
+    root.trigger_child_crash("mid-sup").await.unwrap();
+
+    // Client and leaf supervisor handle must transparently rebind without manual intervention!
+    let (total, inst) = client
+        .call_retry(CounterMsg::Add(42))
+        .await
+        .expect("Deep actor client must transparently rebind across mid-supervisor restart");
+    assert_eq!((total, inst), (42, 1));
+
+    // Verify `leaf` handle also rebound to `leaf-sup` #2 and can spawn new children
+    let sibling = StatefulActorBuilder::from_default::<CounterActor>("deep-sibling")
+        .spawn(&leaf)
+        .await
+        .expect("Rebound leaf supervisor handle must accept new children");
+    assert_eq!(sibling.call(CounterMsg::Add(7)).await.unwrap(), (7, 1));
+
+    root.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_top_level_supervisor_supports_rest_for_one_strategy() {
+    // Top-level supervisor configured directly with RestForOne
+    let root = Supervisor::with_strategy("root-rfo", SupervisionStrategy::RestForOne);
+
+    let c1 = StatefulActorBuilder::from_default::<CounterActor>("stage-1")
+        .restart_policy(RestartPolicy::default().initial_backoff(Duration::from_millis(10)))
+        .spawn(&root)
+        .await
+        .unwrap();
+    let c2 = StatefulActorBuilder::from_default::<CounterActor>("stage-2")
+        .restart_policy(RestartPolicy::default().initial_backoff(Duration::from_millis(10)))
+        .spawn(&root)
+        .await
+        .unwrap();
+    let c3 = StatefulActorBuilder::from_default::<CounterActor>("stage-3")
+        .restart_policy(RestartPolicy::default().initial_backoff(Duration::from_millis(10)))
+        .spawn(&root)
+        .await
+        .unwrap();
+
+    assert_eq!(c1.call(CounterMsg::Add(1)).await.unwrap(), (1, 1));
+    assert_eq!(c2.call(CounterMsg::Add(2)).await.unwrap(), (2, 1));
+    assert_eq!(c3.call(CounterMsg::Add(3)).await.unwrap(), (3, 1));
+
+    // Crash stage-2: stage-1 stays at instance 1, stage-2 and stage-3 restart to instance 2!
+    c2.simulate_crash().await.unwrap();
+
+    assert_eq!(
+        c2.call_retry(CounterMsg::GetWithInstance).await.unwrap(),
+        (0, 2)
+    );
+    assert_eq!(
+        c3.call_retry(CounterMsg::GetWithInstance).await.unwrap(),
+        (0, 2)
+    );
+    assert_eq!(
+        c1.call(CounterMsg::GetWithInstance).await.unwrap(),
+        (1, 1)
+    );
+
+    root.shutdown().await.unwrap();
+}
+
+#[derive(Clone, Default)]
+struct ErgonomicActor {
+    casts_received: usize,
+    ticks_received: usize,
+    value: i64,
+}
+
+#[derive(Clone, Debug)]
+enum ErgoMsg {
+    IncrementCast(usize),
+    ScheduleTick(Duration),
+    Tick,
+    GetState,
+    GetCastsCount,
+}
+
+#[derive(Clone, Debug)]
+enum ErgoResp {
+    State {
+        value: i64,
+        casts: usize,
+        ticks: usize,
+    },
+    CastsCount(usize),
+    Ack,
+}
+
+struct QueryCasts;
+
+impl From<QueryCasts> for ErgoMsg {
+    fn from(_: QueryCasts) -> Self {
+        ErgoMsg::GetCastsCount
+    }
+}
+
+impl CallMessage<ErgonomicActor> for QueryCasts {
+    type Reply = usize;
+
+    fn extract_reply(resp: ErgoResp) -> Result<Self::Reply, String> {
+        match resp {
+            ErgoResp::CastsCount(n) => Ok(n),
+            other => Err(format!("Unexpected response variant: {other:?}")),
+        }
+    }
+}
+
+impl StatefulActor for ErgonomicActor {
+    type Message = ErgoMsg;
+    type Response = ErgoResp;
+    type Error = String;
+
+    async fn handle(
+        &mut self,
+        msg: Self::Message,
+        ctx: &mut ActorContext<Self>,
+    ) -> Result<Self::Response, Self::Error> {
+        match msg {
+            ErgoMsg::IncrementCast(n) => {
+                self.value += n as i64;
+                Ok(ErgoResp::Ack)
+            }
+            ErgoMsg::ScheduleTick(delay) => {
+                ctx.send_after(delay, ErgoMsg::Tick);
+                Ok(ErgoResp::Ack)
+            }
+            ErgoMsg::Tick => {
+                self.ticks_received += 1;
+                Ok(ErgoResp::Ack)
+            }
+            ErgoMsg::GetState => Ok(ErgoResp::State {
+                value: self.value,
+                casts: self.casts_received,
+                ticks: self.ticks_received,
+            }),
+            ErgoMsg::GetCastsCount => Ok(ErgoResp::CastsCount(self.casts_received)),
+        }
+    }
+
+    async fn handle_cast(
+        &mut self,
+        msg: Self::Message,
+        ctx: &mut ActorContext<Self>,
+    ) -> Result<(), Self::Error> {
+        self.casts_received += 1;
+        let _ = self.handle(msg, ctx).await?;
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn test_handle_cast_call_message_ask_and_send_after() {
+    let root = Supervisor::new("root");
+
+    let client = StatefulActorBuilder::from_default::<ErgonomicActor>("ergo-actor")
+        .spawn(&root)
+        .await
+        .unwrap();
+
+    // 1. `cast` routes through `handle_cast`
+    client.cast(ErgoMsg::IncrementCast(5)).await.unwrap();
+    client.cast(ErgoMsg::IncrementCast(3)).await.unwrap();
+
+    // 2. `ask` with `CallMessage` unwraps the specific response variant into `usize`
+    let casts: usize = client.ask(QueryCasts).await.unwrap();
+    assert_eq!(casts, 2);
+
+    // 3. `ctx.send_after` schedules a delayed self-cast that is automatically aborted on stop
+    client
+        .call(ErgoMsg::ScheduleTick(Duration::from_millis(25)))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    match client.call(ErgoMsg::GetState).await.unwrap() {
+        ErgoResp::State {
+            value,
+            casts,
+            ticks,
+        } => {
+            assert_eq!(value, 8);
+            assert_eq!(casts, 3); // 2 IncrementCasts + 1 Tick cast via send_after
+            assert_eq!(ticks, 1);
+        }
+        other => panic!("Expected State, got {other:?}"),
+    }
+
+    root.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_try_cast_mailbox_full_and_cast_timeout() {
+    let root = Supervisor::new("root");
+
+    // Actor with channel capacity = 1 and a slow handler
+    let client = StatefulActorBuilder::new("backpressure-actor", |_inst| SlowDrainActor {
+        processed: Arc::new(AtomicUsize::new(0)),
+    })
+    .channel_capacity(1)
+    .spawn(&root)
+    .await
+    .unwrap();
+
+    // 1. Occupy the actor handler with a 200ms sleep
+    let c_active = client.clone();
+    let active_call = tokio::spawn(async move { c_active.call(Duration::from_millis(200)).await });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // 2. Fill the 1-slot mailbox buffer using `try_cast`
+    client
+        .try_cast(Duration::ZERO)
+        .expect("First try_cast into 1-slot buffer must succeed");
+
+    // 3. Next `try_cast` must fail immediately with `ActorError::MailboxFull`
+    let full_res = client.try_cast(Duration::ZERO);
+    assert!(
+        matches!(full_res, Err(ActorError::MailboxFull)),
+        "Expected ActorError::MailboxFull when mailbox is full, got {full_res:?}"
+    );
+
+    // 4. `cast_timeout` with a 20ms deadline must time out while handler is still sleeping
+    let timeout_res = client
+        .cast_timeout(Duration::ZERO, Duration::from_millis(20))
+        .await;
+    assert!(
+        matches!(timeout_res, Err(ActorError::Timeout(_))),
+        "Expected ActorError::Timeout when mailbox remains full past deadline, got {timeout_res:?}"
+    );
+
+    let _ = active_call.await.unwrap().unwrap();
+    root.shutdown().await.unwrap();
 }

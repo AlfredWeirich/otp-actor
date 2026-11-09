@@ -81,7 +81,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("   ↳ Account closed with final payout balance: {final_balance} EUR.");
     println!("   ↳ Remote actor drained its queue and stopped gracefully (on_stop executed).");
     println!(
-        "   ↳ ServiceSupervisor (RestartType::Transient) honors clean shutdown and leaves actor dead."
+        "   ↳ Supervisor (RestartType::Transient) honors clean shutdown and leaves actor dead."
     );
 
     // Verify actor is truly stopped and no longer available

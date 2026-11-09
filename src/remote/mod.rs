@@ -18,7 +18,7 @@ pub mod server;
 
 pub use client::{AnyActorClient, RemoteActorClient};
 pub use endpoint::ByteEndpoint;
-pub use error::RemoteActorError;
+pub use error::{RemoteActorError, RemoteNodeError};
 pub use proto::{ActorNodeClient, ActorNodeServer};
 pub use registry::ActorNodeRegistry;
 pub use server::{ActorNodeHandle, ActorNodeService, DEFAULT_DRAIN_TIMEOUT};

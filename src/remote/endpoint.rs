@@ -4,7 +4,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-use bincode::Options;
+use bincode::{DefaultOptions, Options};
 
 use crate::actor::{ActorClient, StatefulActor};
 use crate::remote::proto::call_response::Result as CallResult;
@@ -22,13 +22,16 @@ pub const MAX_GRPC_FRAME_BYTES: usize = (MAX_REMOTE_PAYLOAD_BYTES as usize) + 64
 /// Default backpressure timeout for remote `cast` operations before returning `MailboxFull`.
 pub const DEFAULT_REMOTE_CAST_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Encodes a value using bounded bincode options compatible with standard fixed-int encoding.
-pub(crate) fn encode_payload<T: serde::Serialize>(val: &T) -> Result<Vec<u8>, bincode::Error> {
-    bincode::DefaultOptions::new()
+fn bincode_options() -> impl Options {
+    DefaultOptions::new()
         .with_fixint_encoding()
         .reject_trailing_bytes()
         .with_limit(MAX_REMOTE_PAYLOAD_BYTES)
-        .serialize(val)
+}
+
+/// Encodes a value using bounded bincode options compatible with standard fixed-int encoding.
+pub(crate) fn encode_payload<T: serde::Serialize>(val: &T) -> Result<Vec<u8>, bincode::Error> {
+    bincode_options().serialize(val)
 }
 
 /// Decodes a value from a byte slice with an allocation cap of [`MAX_REMOTE_PAYLOAD_BYTES`],
@@ -36,11 +39,7 @@ pub(crate) fn encode_payload<T: serde::Serialize>(val: &T) -> Result<Vec<u8>, bi
 pub(crate) fn decode_payload<T: serde::de::DeserializeOwned>(
     bytes: &[u8],
 ) -> Result<T, bincode::Error> {
-    bincode::DefaultOptions::new()
-        .with_fixint_encoding()
-        .reject_trailing_bytes()
-        .with_limit(MAX_REMOTE_PAYLOAD_BYTES)
-        .deserialize(bytes)
+    bincode_options().deserialize(bytes)
 }
 
 /// Type-erased endpoint for receiving raw serialized byte messages and routing them
@@ -57,6 +56,7 @@ pub trait ByteEndpoint: Send + Sync + 'static {
     fn cast_bytes<'a>(
         &'a self,
         payload: &'a [u8],
+        timeout: Option<Duration>,
     ) -> Pin<Box<dyn Future<Output = CastResponse> + Send + 'a>>;
 }
 
@@ -125,6 +125,7 @@ where
     fn cast_bytes<'a>(
         &'a self,
         payload: &'a [u8],
+        timeout: Option<Duration>,
     ) -> Pin<Box<dyn Future<Output = CastResponse> + Send + 'a>> {
         Box::pin(async move {
             let msg: A::Message = match decode_payload(payload) {
@@ -139,22 +140,34 @@ where
                 }
             };
 
-            match tokio::time::timeout(DEFAULT_REMOTE_CAST_TIMEOUT, self.cast(msg)).await {
-                Ok(Ok(())) => CastResponse {
-                    framework_error: None,
+            match timeout {
+                Some(dur) => match self.cast_timeout(msg, dur).await {
+                    Ok(()) => CastResponse {
+                        framework_error: None,
+                    },
+                    Err(err) => CastResponse {
+                        framework_error: Some(err.into()),
+                    },
                 },
-                Ok(Err(err)) => CastResponse {
-                    framework_error: Some(err.into()),
-                },
-                Err(_) => CastResponse {
-                    framework_error: Some(RemoteError {
-                        kind: Kind::MailboxFull as i32,
-                        message: format!(
-                            "Remote actor mailbox remained full for {:?}",
-                            DEFAULT_REMOTE_CAST_TIMEOUT
-                        ),
-                    }),
-                },
+                None => {
+                    match tokio::time::timeout(DEFAULT_REMOTE_CAST_TIMEOUT, self.cast(msg)).await {
+                        Ok(Ok(())) => CastResponse {
+                            framework_error: None,
+                        },
+                        Ok(Err(err)) => CastResponse {
+                            framework_error: Some(err.into()),
+                        },
+                        Err(_) => CastResponse {
+                            framework_error: Some(RemoteError {
+                                kind: Kind::MailboxFull as i32,
+                                message: format!(
+                                    "Remote actor mailbox remained full for {:?}",
+                                    DEFAULT_REMOTE_CAST_TIMEOUT
+                                ),
+                            }),
+                        },
+                    }
+                }
             }
         })
     }
