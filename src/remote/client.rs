@@ -174,10 +174,7 @@ pub enum AnyActorClient<A: StatefulActor> {
 }
 
 impl<A: StatefulActor> AnyActorClient<A> {
-    fn map_local_error(err: crate::actor::ActorError<A::Error>) -> RemoteActorError<A::Error>
-    where
-        A::Error: ToString,
-    {
+    fn map_local_error(err: crate::actor::ActorError<A::Error>) -> RemoteActorError<A::Error> {
         match err {
             crate::actor::ActorError::HandlerFailed(e) => RemoteActorError::Actor(e),
             crate::actor::ActorError::ActorUnavailable => RemoteActorError::ActorUnavailable,
@@ -185,9 +182,7 @@ impl<A: StatefulActor> AnyActorClient<A> {
             crate::actor::ActorError::Service(crate::actor::ServiceError::ActorNotFound(n)) => {
                 RemoteActorError::ActorNotFound(n)
             }
-            crate::actor::ActorError::Service(other) => {
-                RemoteActorError::ActorPanic(other.to_string())
-            }
+            crate::actor::ActorError::Service(_) => RemoteActorError::ActorUnavailable,
         }
     }
 

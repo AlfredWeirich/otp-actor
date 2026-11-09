@@ -77,6 +77,22 @@ struct SupervisedService {
     pending_resolutions: Vec<oneshot::Sender<Result<Sender<ServiceSupervisorCommand>, RootError>>>,
 }
 
+impl Drop for SupervisedService {
+    fn drop(&mut self) {
+        // Automatically abort the service supervisor task when the root supervisor drops or terminates
+        self.abort_handle.abort();
+    }
+}
+
+/// Drop guard ensuring `term_tx.send(true)` is always broadcast when a monitored service task exits or is aborted.
+struct TermSignalGuard(watch::Sender<bool>);
+
+impl Drop for TermSignalGuard {
+    fn drop(&mut self) {
+        let _ = self.0.send(true);
+    }
+}
+
 /// The top-level Root Supervisor actor overseeing all sub-services.
 pub struct RootSupervisor {
     receiver: Receiver<RootCommand>,
@@ -229,7 +245,11 @@ impl RootSupervisor {
     }
 
     /// Executes a service supervisor restart immediately if its restart ticket matches.
-    fn execute_service_restart(&mut self, service_name: &str, expected_ticket: u64) {
+    fn execute_service_restart(
+        &mut self,
+        service_name: &str,
+        expected_ticket: u64,
+    ) -> Result<(), RootError> {
         if let Some(service_entry) = self.services.get_mut(service_name)
             && !service_entry.is_failed
             && !service_entry.is_stopping
@@ -247,14 +267,32 @@ impl RootSupervisor {
                 "[RootSupervisor] 🔄 One-for-One Restart: Spawning replacement ServiceSupervisor..."
             );
 
-            let (new_tx, task_handle) = (service_entry.factory)(new_inst);
+            let spawn_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                (service_entry.factory)(new_inst)
+            }));
+            let (new_tx, task_handle) = match spawn_res {
+                Ok(pair) => pair,
+                Err(panic_err) => {
+                    tracing::error!(
+                        service = %service_name,
+                        instance = new_inst,
+                        panic = ?panic_err,
+                        "[RootSupervisor] 💥 ServiceSupervisor factory panicked during restart!"
+                    );
+                    service_entry.is_failed = true;
+                    for waiter in service_entry.pending_resolutions.drain(..) {
+                        let _ = waiter.send(Err(RootError::RootUnavailable));
+                    }
+                    return Err(RootError::RootUnavailable);
+                }
+            };
             let abort_handle = task_handle.abort_handle();
             let (term_tx, term_rx) = watch::channel(false);
             let name_owned = service_name.to_string();
 
             self.join_set.spawn(async move {
+                let _guard = TermSignalGuard(term_tx);
                 let res = task_handle.await;
-                let _ = term_tx.send(true);
                 (name_owned, new_inst, res)
             });
 
@@ -270,6 +308,7 @@ impl RootSupervisor {
                 "[RootSupervisor] 🌐 ServiceSupervisor online & updated in root registry."
             );
         }
+        Ok(())
     }
 
     /// Main event loop of the Root Supervisor.
@@ -284,9 +323,9 @@ impl RootSupervisor {
         loop {
             tokio::select! {
                 Some((service_name, expected_ticket, maybe_respond_to)) = scheduled_restart_rx.recv() => {
-                    self.execute_service_restart(&service_name, expected_ticket);
+                    let res = self.execute_service_restart(&service_name, expected_ticket);
                     if let Some(respond_to) = maybe_respond_to {
-                        let _ = respond_to.send(Ok(()));
+                        let _ = respond_to.send(res);
                     }
                 }
 
@@ -331,8 +370,8 @@ impl RootSupervisor {
                             let (term_tx, term_rx) = watch::channel(false);
                             let name_for_task = name.clone();
                             self.join_set.spawn(async move {
+                                let _guard = TermSignalGuard(term_tx);
                                 let res = task_handle.await;
-                                let _ = term_tx.send(true);
                                 (name_for_task, inst_id, res)
                             });
 
@@ -431,8 +470,8 @@ impl RootSupervisor {
                                         let _ = tx.send((service_name, ticket, Some(respond_to))).await;
                                     });
                                 } else {
-                                    self.execute_service_restart(&service_name, ticket);
-                                    let _ = respond_to.send(Ok(()));
+                                    let res = self.execute_service_restart(&service_name, ticket);
+                                    let _ = respond_to.send(res);
                                 }
                             } else {
                                 let _ = respond_to.send(Err(RootError::ServiceNotFound(service_name)));
@@ -527,7 +566,7 @@ impl RootSupervisor {
 
                                 let s_name = service_name.clone();
                                 if backoff.is_zero() {
-                                    self.execute_service_restart(&s_name, ticket);
+                                    let _ = self.execute_service_restart(&s_name, ticket);
                                 } else {
                                     tracing::info!(
                                         service = %service_name,

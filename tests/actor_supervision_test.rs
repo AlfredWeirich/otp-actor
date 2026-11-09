@@ -3307,3 +3307,41 @@ async fn test_resource_client_rebinds_on_actor_unavailable_and_propagates_actor_
 
     let _ = root.shutdown().await;
 }
+
+#[tokio::test]
+async fn test_root_supervisor_drop_aborts_services_even_with_active_handles() {
+    let root = RootSupervisor::new();
+    let sup = ServiceSupervisor::spawn_and_register("zombie-check-svc", &root)
+        .await
+        .expect("Failed to spawn service supervisor");
+
+    // Keep an active sender to the ServiceSupervisor's command channel that does not
+    // hold a strong reference to `RootSupervisorHandle`.
+    let kept_service_tx = root
+        .resolve_service_channel("zombie-check-svc")
+        .await
+        .expect("Failed to resolve service channel");
+
+    let client = StatefulActorBuilder::from_default::<CounterActor>("zombie-check-actor")
+        .spawn(&sup)
+        .await
+        .expect("Failed to spawn stateful actor");
+
+    assert_eq!(client.call(CounterMsg::Add(5)).await.unwrap(), (5, 1));
+    assert!(!kept_service_tx.is_closed());
+
+    // Drop `client`, `sup`, and `root` so all `RootSupervisorHandle` clones are dropped,
+    // while `kept_service_tx` stays alive and keeps the `ServiceSupervisor` command channel open.
+    // Without `impl Drop for SupervisedService`, `self.join_set.abort_all()` only detached the
+    // `JoinHandle` and `ServiceSupervisor` + its child actors stayed alive as zombies because
+    // `kept_service_tx` prevented channel closure.
+    drop(client);
+    drop(sup);
+    drop(root);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    assert!(
+        kept_service_tx.is_closed(),
+        "Expected ServiceSupervisor task to be aborted by SupervisedService::drop even when a command sender is still held"
+    );
+}

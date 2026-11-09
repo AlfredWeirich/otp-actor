@@ -109,8 +109,8 @@ impl<E: ToString> From<crate::actor::ActorError<E>> for RemoteError {
                 message: format!("Actor call timed out after {duration:?}"),
             },
             crate::actor::ActorError::HandlerFailed(domain_err) => RemoteError {
-                kind: Kind::ActorPanic as i32,
-                message: domain_err.to_string(),
+                kind: Kind::Unspecified as i32,
+                message: format!("Unhandled actor domain error: {}", domain_err.to_string()),
             },
         }
     }

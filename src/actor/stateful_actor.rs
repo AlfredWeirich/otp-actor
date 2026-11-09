@@ -657,19 +657,26 @@ impl<A: StatefulActor> ActorClient<A> {
         }
     }
 
-    /// Waits briefly for supervision recovery and re-binds the direct channel, propagating permanent failures.
+    /// Re-binds the direct channel immediately if the supervisor has already replaced the actor
+    /// (or awaits an in-progress restart via `pending_resolutions`), falling back to a brief
+    /// 60 ms delay only if the crash notification has not yet reached the supervisor.
     async fn backoff_and_rebind(&self) -> Result<(), ActorError<A::Error>> {
         const REBIND_BACKOFF: Duration = Duration::from_millis(60);
-        tokio::time::sleep(REBIND_BACKOFF).await;
-        match self.rebind_channel().await {
-            Ok(()) => Ok(()),
-            Err(ActorError::Service(
-                err @ (ServiceError::MaxRestartsExceeded(_, _, _)
-                | ServiceError::ActorNotFound(_)
-                | ServiceError::ActorTypeMismatch(_)),
-            )) => Err(ActorError::Service(err)),
-            Err(_) => Ok(()),
+        for first_try in [true, false] {
+            match self.rebind_channel().await {
+                Ok(()) => return Ok(()),
+                Err(ActorError::Service(
+                    err @ (ServiceError::MaxRestartsExceeded(_, _, _)
+                    | ServiceError::ActorNotFound(_)
+                    | ServiceError::ActorTypeMismatch(_)),
+                )) => return Err(ActorError::Service(err)),
+                Err(_) if first_try => {
+                    tokio::time::sleep(REBIND_BACKOFF).await;
+                }
+                Err(_) => return Ok(()),
+            }
         }
+        Ok(())
     }
 
     /// Sends a request message (`call`) directly to the actor and awaits its response.

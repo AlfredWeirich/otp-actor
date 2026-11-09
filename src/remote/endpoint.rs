@@ -19,18 +19,19 @@ pub const MAX_REMOTE_PAYLOAD_BYTES: u64 = 4 * 1024 * 1024;
 pub(crate) fn encode_payload<T: serde::Serialize>(val: &T) -> Result<Vec<u8>, bincode::Error> {
     bincode::DefaultOptions::new()
         .with_fixint_encoding()
-        .allow_trailing_bytes()
+        .reject_trailing_bytes()
         .with_limit(MAX_REMOTE_PAYLOAD_BYTES)
         .serialize(val)
 }
 
-/// Decodes a value from a byte slice with an allocation cap of [`MAX_REMOTE_PAYLOAD_BYTES`].
+/// Decodes a value from a byte slice with an allocation cap of [`MAX_REMOTE_PAYLOAD_BYTES`],
+/// rejecting any trailing bytes.
 pub(crate) fn decode_payload<T: serde::de::DeserializeOwned>(
     bytes: &[u8],
 ) -> Result<T, bincode::Error> {
     bincode::DefaultOptions::new()
         .with_fixint_encoding()
-        .allow_trailing_bytes()
+        .reject_trailing_bytes()
         .with_limit(MAX_REMOTE_PAYLOAD_BYTES)
         .deserialize(bytes)
 }

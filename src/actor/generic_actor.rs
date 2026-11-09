@@ -1356,20 +1356,26 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static> Resourc
         }
     }
 
-    /// Waits briefly for supervision recovery and re-binds the direct channel,
-    /// propagating terminal supervisor errors immediately.
+    /// Re-binds the direct channel immediately if the supervisor has already replaced the actor
+    /// (or awaits an in-progress restart via `pending_resolutions`), falling back to a brief
+    /// 60 ms delay only if the crash notification has not yet reached the supervisor.
     async fn backoff_and_rebind(&self) -> Result<(), ResourceError<E>> {
         const REBIND_BACKOFF: Duration = Duration::from_millis(60);
-        tokio::time::sleep(REBIND_BACKOFF).await;
-        match self.rebind_channel().await {
-            Ok(()) => Ok(()),
-            Err(ResourceError::Service(
-                err @ (ServiceError::MaxRestartsExceeded(_, _, _)
-                | ServiceError::ActorNotFound(_)
-                | ServiceError::ActorTypeMismatch(_)),
-            )) => Err(ResourceError::Service(err)),
-            Err(_) => Ok(()),
+        for first_try in [true, false] {
+            match self.rebind_channel().await {
+                Ok(()) => return Ok(()),
+                Err(ResourceError::Service(
+                    err @ (ServiceError::MaxRestartsExceeded(_, _, _)
+                    | ServiceError::ActorNotFound(_)
+                    | ServiceError::ActorTypeMismatch(_)),
+                )) => return Err(ResourceError::Service(err)),
+                Err(_) if first_try => {
+                    tokio::time::sleep(REBIND_BACKOFF).await;
+                }
+                Err(_) => return Ok(()),
+            }
         }
+        Ok(())
     }
 
     /// Sends a one-way command to the actor, transparently rebinding if the channel was closed by a prior crash.

@@ -21,4 +21,4 @@ pub use endpoint::ByteEndpoint;
 pub use error::RemoteActorError;
 pub use proto::{ActorNodeClient, ActorNodeServer};
 pub use registry::ActorNodeRegistry;
-pub use server::{ActorNodeHandle, ActorNodeService};
+pub use server::{ActorNodeHandle, ActorNodeService, DEFAULT_DRAIN_TIMEOUT};

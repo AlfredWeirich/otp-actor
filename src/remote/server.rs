@@ -61,11 +61,15 @@ impl ActorNode for ActorNodeService {
     }
 }
 
+/// Default Phase-1 timeout for draining active in-flight gRPC calls during shutdown.
+pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Handle controlling an active gRPC actor node server, coordinating graceful 2-phase shutdown.
 pub struct ActorNodeHandle {
     addr: SocketAddr,
     registry: ActorNodeRegistry,
     root: Option<RootSupervisorHandle>,
+    drain_timeout: Option<Duration>,
     shutdown_tx: Option<oneshot::Sender<()>>,
     server_task: Option<tokio::task::JoinHandle<Result<(), tonic::transport::Error>>>,
 }
@@ -97,9 +101,27 @@ impl ActorNodeHandle {
             addr: local_addr,
             registry,
             root,
+            drain_timeout: Some(DEFAULT_DRAIN_TIMEOUT),
             shutdown_tx: Some(shutdown_tx),
             server_task: Some(server_task),
         })
+    }
+
+    /// Sets the maximum duration to wait in Phase 1 for active in-flight gRPC requests to drain
+    /// before aborting remaining streams and proceeding to Phase 2 (`RootSupervisor` shutdown).
+    ///
+    /// Defaults to [`DEFAULT_DRAIN_TIMEOUT`] (`10s`).
+    #[must_use]
+    pub fn with_drain_timeout(mut self, timeout: Duration) -> Self {
+        self.drain_timeout = Some(timeout);
+        self
+    }
+
+    /// Disables the Phase-1 drain timeout, waiting indefinitely for all open HTTP/2 streams to close.
+    #[must_use]
+    pub fn without_drain_timeout(mut self) -> Self {
+        self.drain_timeout = None;
+        self
     }
 
     /// The bound local address of the running node.
@@ -113,7 +135,7 @@ impl ActorNodeHandle {
     }
 
     /// Performs a coordinated two-phase graceful shutdown:
-    /// 1. Closes the gRPC server (HTTP/2 GOAWAY) and drains all active in-flight requests.
+    /// 1. Closes the gRPC server (HTTP/2 GOAWAY) and drains active in-flight requests (bounded by `drain_timeout`).
     /// 2. If a `RootSupervisorHandle` was attached, initiates cascading actor subtree shutdown.
     pub async fn shutdown(mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         tracing::info!(addr = %self.addr, "Initiating Phase 1: gRPC server shutdown");
@@ -121,8 +143,23 @@ impl ActorNodeHandle {
             let _ = tx.send(());
         }
 
-        if let Some(handle) = self.server_task.take() {
-            handle.await??;
+        if let Some(mut handle) = self.server_task.take() {
+            match self.drain_timeout {
+                Some(timeout) => match tokio::time::timeout(timeout, &mut handle).await {
+                    Ok(join_res) => join_res??,
+                    Err(_) => {
+                        tracing::warn!(
+                            addr = %self.addr,
+                            timeout = ?timeout,
+                            "Phase 1 gRPC drain timed out; aborting remaining streams and proceeding to Phase 2"
+                        );
+                        handle.abort();
+                    }
+                },
+                None => {
+                    handle.await??;
+                }
+            }
         }
 
         if let Some(root) = self.root.take() {
@@ -139,6 +176,9 @@ impl Drop for ActorNodeHandle {
     fn drop(&mut self) {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
+        }
+        if let Some(handle) = self.server_task.take() {
+            handle.abort();
         }
     }
 }

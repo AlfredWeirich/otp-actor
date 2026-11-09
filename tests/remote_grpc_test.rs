@@ -452,3 +452,121 @@ async fn test_remote_grpc_client_initiated_graceful_stop_transient()
     node.shutdown().await?;
     Ok(())
 }
+
+// ----------------------------------------------------------------------------
+// Test 7: Trailing Bytes Rejection, Error Symmetry & Phase-1 Drain Timeout
+// ----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_remote_trailing_bytes_and_drain_timeout_and_error_symmetry()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use bincode::Options;
+    use otp_actor::actor::{RestartPolicy, ShutdownPolicy};
+    use otp_actor::remote::ActorNodeClient;
+    use otp_actor::remote::proto::CallRequest;
+    use otp_actor::remote::proto::call_response::Result as CallResult;
+    use otp_actor::remote::proto::remote_error::Kind;
+
+    let root = RootSupervisor::new();
+    let service = ServiceSupervisor::spawn_and_register("hardening-service", &root).await?;
+
+    let stop_counter = Arc::new(AtomicUsize::new(0));
+    let actor_instance = CalculatorActor {
+        value: 10,
+        stop_counter: stop_counter.clone(),
+    };
+
+    let local_client = StatefulActorBuilder::from_instance("calc-hardened", actor_instance)
+        .restart_policy(RestartPolicy {
+            max_restarts: 0,
+            time_window: Duration::from_secs(10),
+            initial_backoff: Duration::from_millis(10),
+            max_backoff: Duration::from_millis(50),
+            backoff_multiplier: 2.0,
+        })
+        .restart_type(RestartType::Permanent)
+        .shutdown_policy(ShutdownPolicy::Timeout(Duration::from_millis(50)))
+        .spawn(&service)
+        .await?;
+
+    let registry = ActorNodeRegistry::new();
+    registry.register_client(local_client.clone());
+
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let node = ActorNodeHandle::start(bind_addr, registry, Some(root))
+        .await?
+        .with_drain_timeout(Duration::from_millis(50));
+    let node_addr = node.local_addr();
+    let endpoint_url = format!("http://{node_addr}");
+
+    // 1. Verify trailing garbage bytes are rejected with Deserialization error ([L-1])
+    let mut payload = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .reject_trailing_bytes()
+        .serialize(&CalcMsg::Add(5))?;
+    payload.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+
+    let mut raw_client = ActorNodeClient::connect(endpoint_url.clone()).await?;
+    let raw_resp = raw_client
+        .call(CallRequest {
+            service_name: "hardening-service".into(),
+            actor_name: "calc-hardened".into(),
+            payload,
+            timeout_ms: None,
+        })
+        .await?
+        .into_inner();
+
+    match raw_resp.result {
+        Some(CallResult::FrameworkError(err)) => {
+            assert_eq!(err.kind, Kind::Deserialization as i32);
+        }
+        other => {
+            panic!("Expected Deserialization framework error for trailing bytes, got {other:?}")
+        }
+    }
+
+    // 2. Verify AnyActorClient error symmetry on MaxRestartsExceeded ([M-2])
+    let remote_client = RemoteActorClient::<CalculatorActor>::connect(
+        &endpoint_url,
+        "hardening-service",
+        "calc-hardened",
+    )
+    .await?;
+
+    let any_local = AnyActorClient::Local(local_client.clone());
+    let any_remote = AnyActorClient::Remote(remote_client.clone());
+
+    // Crash the actor; with max_restarts = 0 it transitions immediately to MaxRestartsExceeded
+    let _ = remote_client.call(CalcMsg::Crash).await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    let local_err = any_local.call(CalcMsg::Get).await;
+    let remote_err = any_remote.call(CalcMsg::Get).await;
+    assert!(
+        matches!(local_err, Err(RemoteActorError::ActorUnavailable)),
+        "Expected Local AnyActorClient to map MaxRestartsExceeded to ActorUnavailable, got {local_err:?}"
+    );
+    assert!(
+        matches!(remote_err, Err(RemoteActorError::ActorUnavailable)),
+        "Expected Remote AnyActorClient to map MaxRestartsExceeded to ActorUnavailable, got {remote_err:?}"
+    );
+
+    // 3. Recover actor and verify Phase-1 drain timeout bounds hung RPCs ([M-1])
+    service.restart_child("calc-hardened").await?;
+    let slow_client = remote_client.clone();
+    let _hung_rpc = tokio::spawn(async move {
+        let _ = slow_client
+            .call(CalcMsg::Delay(Duration::from_secs(10)))
+            .await;
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // Shutdown must complete rapidly (within 500ms) despite the 10s RPC because drain_timeout = 50ms
+    // and the actor's ShutdownPolicy::Timeout is also 50ms.
+    tokio::time::timeout(Duration::from_millis(500), node.shutdown())
+        .await
+        .expect("Shutdown timed out despite drain_timeout")?;
+
+    Ok(())
+}
