@@ -35,7 +35,7 @@
 //!    - Supervised alongside [`ResourceActor`] and child [`Supervisor`]s under the same supervision tree.
 //!
 //! 4. **Remote Actors over gRPC** (`--features remote`, see `otp_actor::remote`):
-//!    - Extends [`StatefulActor`] messaging across processes and hosts over HTTP/2 gRPC (`proto/actor_node.proto`) with bounded `bincode` payloads (&le; 4 MiB).
+//!    - Extends [`StatefulActor`] messaging across processes and hosts over HTTP/2 gRPC (`proto/actor_node.proto`) with bounded `postcard` payloads (&le; 4 MiB).
 //!    - Location transparency via `RemoteActorClient` and `AnyActorClient` (`Local` vs. `Remote`) with host-side re-binding via `ActorClient` / `ByteEndpoint`.
 //!    - Coordinated 2-phase graceful shutdown via `ActorNodeHandle::shutdown` (HTTP/2 `GOAWAY` request drainage followed by [`SupervisorHandle::shutdown`]).
 //!

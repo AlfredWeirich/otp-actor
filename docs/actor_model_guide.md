@@ -1022,7 +1022,7 @@ The remote subsystem decouples the network wire protocol from individual actor d
 │         ▼                                                 │            │
 │  [Local Mailbox]                                          ▼            │
 │                                            RemoteActorClient<A>        │
-│                                            (bincode Serializer, ≤4 MiB)│
+│                                           (postcard Serializer, ≤4 MiB)│
 │                                                           │            │
 │                                                           ▼            │
 │                                                    Tonic gRPC Client   │
@@ -1047,7 +1047,7 @@ The remote subsystem decouples the network wire protocol from individual actor d
 │     │     │ Resolves ("banking-service", "account-9876")               │
 │     │     ▼                                                            │
 │     ├── Arc<dyn ByteEndpoint> (implemented directly for ActorClient<A>)│
-│     │     │ Decodes bounded bincode payload (≤ 4 MiB)                  │
+│     │     │ Decodes bounded postcard payload (≤ 4 MiB)                 │
 │     │     ▼                                                            │
 │     └── Supervisor ("banking-service", Strategy: OneForOne)            │
 │           │                                                            │
@@ -1081,10 +1081,11 @@ service ActorNode {
 }
 
 message CallRequest {
-  string service_name     = 1;
-  string actor_name       = 2;
-  bytes  payload          = 3; // bincode-serialized actor message (<= 4 MiB)
+  string service_name        = 1;
+  string actor_name          = 2;
+  bytes  payload             = 3; // postcard-serialized actor message (<= 4 MiB)
   optional uint64 timeout_ms = 4; // Optional per-call processing timeout
+  uint32 protocol_version    = 5; // Wire protocol version (currently 1)
 }
 
 message CallResponse {
@@ -1096,10 +1097,11 @@ message CallResponse {
 }
 
 message CastRequest {
-  string service_name     = 1;
-  string actor_name       = 2;
-  bytes  payload          = 3;
+  string service_name        = 1;
+  string actor_name          = 2;
+  bytes  payload             = 3;
   optional uint64 timeout_ms = 4; // Optional per-cast enqueue timeout
+  uint32 protocol_version    = 5; // Wire protocol version (currently 1)
 }
 
 message CastResponse {
@@ -1107,7 +1109,7 @@ message CastResponse {
 }
 ```
 
-Because message payloads are treated as opaque binary bytes encoded with bounded **`bincode`** (using Serde's `Serialize` / `Deserialize` traits), actor developers can evolve typed Rust messages freely without modifying or recompiling `.proto` schemas. Domain failures (`Err(A::Error)`) are encoded on `actor_error_payload` separately from framework errors (`RemoteError`, which uses a structured `Kind` enum for `SERVICE_NOT_FOUND`, `ACTOR_NOT_FOUND`, `MAILBOX_FULL`, `ACTOR_UNAVAILABLE`, `TIMEOUT`, `SERIALIZATION`, `DESERIALIZATION`, `ACTOR_PANIC`, and `MAX_RESTARTS_EXCEEDED`).
+Because message payloads are treated as opaque binary bytes encoded with bounded **`postcard`** (using Serde's `Serialize` / `Deserialize` traits), actor developers can evolve typed Rust messages freely without modifying or recompiling `.proto` schemas. Domain failures (`Err(A::Error)`) are encoded on `actor_error_payload` separately from framework errors (`RemoteError`, which uses a structured `Kind` enum for `SERVICE_NOT_FOUND`, `ACTOR_NOT_FOUND`, `MAILBOX_FULL`, `ACTOR_UNAVAILABLE`, `TIMEOUT`, `SERIALIZATION`, `DESERIALIZATION`, `ACTOR_PANIC`, `MAX_RESTARTS_EXCEEDED`, and `INCOMPATIBLE_PROTOCOL`).
 
 #### 2. Type-Erased Bridging via `ByteEndpoint` and `ActorNodeRegistry`
 Inside the host node, the gRPC handler receives untyped byte slices (`&[u8]`). The server cannot know at compile time what concrete Rust struct or enum corresponds to `("banking-service", "account-9876")`.
@@ -1115,8 +1117,8 @@ Inside the host node, the gRPC handler receives untyped byte slices (`&[u8]`). T
 `otp-actor` solves this through the `ByteEndpoint` trait and `ActorNodeRegistry`:
 * When an actor is spawned, its typed `ActorClient<A>` is registered into an `ActorNodeRegistry` using either `registry.register_client(client)` (which automatically uses `client.service_name()` and `client.name()`) or `registry.register(service_name, actor_name, client)`.
 * Because `otp-actor` implements `ByteEndpoint` **directly for `ActorClient<A>`** (`impl<A> ByteEndpoint for ActorClient<A>`), `ActorNodeRegistry` stores each registered actor as an `Arc<dyn ByteEndpoint>` without extra wrapper indirection.
-* Upon receiving a gRPC call, `ByteEndpoint::call_bytes` decodes the payload into `A::Message` via bounded `bincode`, forwards it through `self.call` / `self.call_timeout` into the actor's Tokio mailbox channel, awaits `Result<A::Response, ActorError<A::Error>>`, and encodes `ok_payload`, `actor_error_payload`, or `framework_error` into the `CallResponse` envelope. Similarly, `ByteEndpoint::cast_bytes` honors `timeout_ms` via `self.cast_timeout` (or `DEFAULT_REMOTE_CAST_TIMEOUT = 5s`).
-* **DoS Protection:** Both client-side encoding and server-side decoding enforce a strict payload size cap (`MAX_REMOTE_PAYLOAD_BYTES = 4 * 1024 * 1024` = **4 MiB**, aligned with tonic's default HTTP/2 frame limit) via `bincode::DefaultOptions::new().with_fixint_encoding().reject_trailing_bytes().with_limit(...)`, rejecting oversized payloads, trailing garbage bytes, or length-prefix allocation bombs before allocation.
+* Upon receiving a gRPC call, `ByteEndpoint::call_bytes` decodes the payload into `A::Message` via bounded `postcard`, forwards it through `self.call` / `self.call_timeout` into the actor's Tokio mailbox channel, awaits `Result<A::Response, ActorError<A::Error>>`, and encodes `ok_payload`, `actor_error_payload`, or `framework_error` into the `CallResponse` envelope. Similarly, `ByteEndpoint::cast_bytes` honors `timeout_ms` via `self.cast_timeout` (or `DEFAULT_REMOTE_CAST_TIMEOUT = 5s`).
+* **DoS Protection:** Both client-side encoding and server-side decoding enforce a strict payload size cap (`MAX_REMOTE_PAYLOAD_BYTES = 4 * 1024 * 1024` = **4 MiB**, aligned with tonic's default HTTP/2 frame limit) using a bounded `postcard` serialization flavor (`BoundedVec`) and `postcard::take_from_bytes` with explicit size and trailing-byte checks, rejecting oversized payloads or trailing garbage bytes before unbounded allocation.
 
 #### 3. Complete Location Transparency with `AnyActorClient<A>`
 In large-scale distributed architectures, components frequently migrate between monolithic co-location and separate microservice pods. If client code had to change its invocation style depending on where an actor runs, architectural refactoring would be cumbersome.
@@ -1137,6 +1139,8 @@ Both `RemoteActorClient<A>` and `AnyActorClient<A>` expose matching asynchronous
 * `.cast_timeout(msg, duration)` $\rightarrow$ Bounds cast enqueueing with both a client-side deadline and wire `timeout_ms` propagation.
 
 A caller can accept an `AnyActorClient<MyActor>` and invoke `.call(...)`, `.call_timeout(...)`, `.cast(...)`, or `.cast_timeout(...)` completely oblivious to whether the request traverses a fast in-memory Tokio channel or an HTTP/2 TCP connection across availability zones. Controlled actor shutdown over gRPC is intentionally modeled explicitly via domain messages whose `StatefulActor::handle` invokes `ctx.stop()` (rather than an unauthenticated generic stop RPC).
+
+> **Transport Security & Authorization:** In production deployments across untrusted networks, configure TLS, per-request timeout caps, and token/mTLS authentication using `ActorNodeHandle::builder(addr, registry).server(tls_server).authorizer(...)` (or `ActorNodeHandle::start_with(...)` / `.start_with_interceptor(...)`) on the server, paired with `RemoteActorClient::connect_with(tls_endpoint, ...).with_request_metadata(...)` on the client.
 
 ---
 
@@ -1205,4 +1209,4 @@ When an actor node is decommissioned (during rolling deployments or cluster re-b
 
 *(Note: For cross-network deployments over untrusted networks, wrap the underlying `tonic::transport::Server` and client `Endpoint` with TLS, as `ActorNodeHandle::start` binds plaintext HTTP/2 TCP by default.)*
 
-Through this combination of a universal binary wire contract, bounded `bincode` bridging, location-transparent clients, local supervision self-healing, and coordinated two-phase teardown, `otp-actor` elevates the classic Erlang/OTP actor model into a modern, distributed, type-safe Rust foundation.
+Through this combination of a universal binary wire contract, bounded `postcard` bridging, location-transparent clients, local supervision self-healing, and coordinated two-phase teardown, `otp-actor` elevates the classic Erlang/OTP actor model into a modern, distributed, type-safe Rust foundation.

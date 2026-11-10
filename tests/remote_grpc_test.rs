@@ -505,11 +505,7 @@ async fn test_remote_trailing_bytes_and_drain_timeout_and_error_symmetry()
     let endpoint_url = format!("http://{node_addr}");
 
     // 1. Verify trailing garbage bytes are rejected with Deserialization error ([L-1])
-    use bincode::Options;
-    let mut payload = bincode::DefaultOptions::new()
-        .with_fixint_encoding()
-        .reject_trailing_bytes()
-        .serialize(&CalcMsg::Add(5))?;
+    let mut payload = postcard::to_stdvec(&CalcMsg::Add(5))?;
     payload.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
 
     let mut raw_client = ActorNodeClient::connect(endpoint_url.clone()).await?;
@@ -519,6 +515,7 @@ async fn test_remote_trailing_bytes_and_drain_timeout_and_error_symmetry()
             actor_name: "calc-hardened".into(),
             payload,
             timeout_ms: None,
+            protocol_version: otp_actor::remote::REMOTE_PROTOCOL_VERSION,
         })
         .await?
         .into_inner();
@@ -575,4 +572,197 @@ async fn test_remote_trailing_bytes_and_drain_timeout_and_error_symmetry()
         .expect("Shutdown timed out despite drain_timeout")?;
 
     Ok(())
+}
+
+// ============================================================================
+// In-Process Unit Tests for gRPC Service Hardening (No TCP Sockets Required)
+// ============================================================================
+
+#[tokio::test]
+async fn test_service_protocol_version_and_unknown_error_mapping() {
+    use otp_actor::remote::proto::call_response::Result as CallResult;
+    use otp_actor::remote::proto::remote_error::Kind;
+    use otp_actor::remote::proto::{ActorNode, CallRequest, CastRequest, RemoteError};
+    use otp_actor::remote::{ActorNodeService, REMOTE_PROTOCOL_VERSION};
+
+    let registry = ActorNodeRegistry::new();
+    let service = ActorNodeService::new(registry);
+
+    // 1. Incompatible protocol version on Call returns Kind::IncompatibleProtocol
+    let resp = service
+        .call(tonic::Request::new(CallRequest {
+            service_name: "svc".into(),
+            actor_name: "act".into(),
+            payload: Vec::new(),
+            timeout_ms: None,
+            protocol_version: REMOTE_PROTOCOL_VERSION + 42,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+
+    match resp.result {
+        Some(CallResult::FrameworkError(err)) => {
+            assert_eq!(err.kind, Kind::IncompatibleProtocol as i32);
+            let mapped = RemoteActorError::<String>::from(err);
+            assert!(
+                matches!(mapped, RemoteActorError::IncompatibleProtocol(ref m) if m.contains("Unsupported protocol version")),
+                "Expected IncompatibleProtocol, got {mapped:?}"
+            );
+        }
+        other => panic!("Expected IncompatibleProtocol framework error, got {other:?}"),
+    }
+
+    // 2. Incompatible protocol version on Cast returns Kind::IncompatibleProtocol
+    let cast_resp = service
+        .cast(tonic::Request::new(CastRequest {
+            service_name: "svc".into(),
+            actor_name: "act".into(),
+            payload: Vec::new(),
+            timeout_ms: None,
+            protocol_version: 0,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+
+    let err = cast_resp
+        .framework_error
+        .expect("Expected framework_error on version mismatch");
+    assert_eq!(err.kind, Kind::IncompatibleProtocol as i32);
+
+    // 3. Unrecognized future RemoteError.kind maps to RemoteActorError::Unknown (not ActorPanic)
+    let unknown_mapped = RemoteActorError::<String>::from(RemoteError {
+        kind: 9999,
+        message: "future error variant".into(),
+    });
+    assert!(
+        matches!(
+            unknown_mapped,
+            RemoteActorError::Unknown { kind: 9999, ref message } if message == "future error variant"
+        ),
+        "Expected Unknown error variant, got {unknown_mapped:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_service_authorizer_label_sanitization_and_timeout_clamping() {
+    use otp_actor::remote::proto::call_response::Result as CallResult;
+    use otp_actor::remote::proto::remote_error::Kind;
+    use otp_actor::remote::proto::{ActorNode, CallRequest};
+    use otp_actor::remote::{ActorNodeService, REMOTE_PROTOCOL_VERSION};
+
+    let root = Supervisor::new("root");
+    let svc = Supervisor::builder("auth-svc").spawn(&root).await.unwrap();
+    let calc = StatefulActorBuilder::from_default::<CalculatorActor>("calc")
+        .spawn(&svc)
+        .await
+        .unwrap();
+
+    let registry = ActorNodeRegistry::new();
+    registry.register("auth-svc", "calc", calc);
+
+    let service = ActorNodeService::new(registry)
+        .with_max_request_timeout(Some(Duration::from_millis(40)))
+        .with_authorizer(Arc::new(|metadata, _ext, _svc, _actor| {
+            match metadata.get("authorization") {
+                Some(val) if val == "Bearer secret-token" => Ok(()),
+                _ => Err(tonic::Status::unauthenticated("missing or invalid token")),
+            }
+        }));
+
+    let get_payload = postcard::to_stdvec(&CalcMsg::Get).unwrap();
+
+    // 1. Unauthenticated request is rejected before routing
+    let unauth_err = service
+        .call(tonic::Request::new(CallRequest {
+            service_name: "auth-svc".into(),
+            actor_name: "calc".into(),
+            payload: get_payload.clone(),
+            timeout_ms: None,
+            protocol_version: REMOTE_PROTOCOL_VERSION,
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(unauth_err.code(), tonic::Code::Unauthenticated);
+
+    // 2. Authenticated request succeeds
+    let mut auth_req = tonic::Request::new(CallRequest {
+        service_name: "auth-svc".into(),
+        actor_name: "calc".into(),
+        payload: get_payload,
+        timeout_ms: None,
+        protocol_version: REMOTE_PROTOCOL_VERSION,
+    });
+    auth_req
+        .metadata_mut()
+        .insert("authorization", "Bearer secret-token".parse().unwrap());
+    let ok_resp = service.call(auth_req).await.unwrap().into_inner();
+    assert!(matches!(ok_resp.result, Some(CallResult::OkPayload(_))));
+
+    // 3. Control characters & long untrusted names are sanitized in ServiceNotFound/ActorNotFound
+    let long_evil_service = format!("evil\n\r\x1b[31m{}", "x".repeat(200));
+    let mut evil_req = tonic::Request::new(CallRequest {
+        service_name: long_evil_service,
+        actor_name: "calc".into(),
+        payload: Vec::new(),
+        timeout_ms: None,
+        protocol_version: REMOTE_PROTOCOL_VERSION,
+    });
+    evil_req
+        .metadata_mut()
+        .insert("authorization", "Bearer secret-token".parse().unwrap());
+    let evil_resp = service.call(evil_req).await.unwrap().into_inner();
+    match evil_resp.result {
+        Some(CallResult::FrameworkError(err)) => {
+            assert_eq!(err.kind, Kind::ServiceNotFound as i32);
+            assert!(!err.message.contains('\n'));
+            assert!(!err.message.contains('\r'));
+            assert!(!err.message.contains('\x1b'));
+            assert!(err.message.ends_with('…'));
+        }
+        other => panic!("Expected sanitized ServiceNotFound error, got {other:?}"),
+    }
+
+    // 4. Server clamps excessive client timeout_ms via max_request_timeout (40ms)
+    let delay_payload = postcard::to_stdvec(&CalcMsg::Delay(Duration::from_secs(5))).unwrap();
+    let mut slow_req = tonic::Request::new(CallRequest {
+        service_name: "auth-svc".into(),
+        actor_name: "calc".into(),
+        payload: delay_payload,
+        timeout_ms: Some(60_000),
+        protocol_version: REMOTE_PROTOCOL_VERSION,
+    });
+    slow_req
+        .metadata_mut()
+        .insert("authorization", "Bearer secret-token".parse().unwrap());
+
+    let start = std::time::Instant::now();
+    let timeout_resp = service.call(slow_req).await.unwrap().into_inner();
+    assert!(
+        start.elapsed() < Duration::from_millis(300),
+        "Server max_request_timeout should have clamped 60s request to 40ms"
+    );
+    match timeout_resp.result {
+        Some(CallResult::FrameworkError(err)) => {
+            assert_eq!(err.kind, Kind::Timeout as i32);
+        }
+        other => panic!("Expected Timeout framework error, got {other:?}"),
+    }
+
+    // 5. Tonic Status timeout mapping distinguishes timeout vs plain cancellation
+    assert!(matches!(
+        RemoteActorError::<String>::from(tonic::Status::deadline_exceeded("deadline")),
+        RemoteActorError::Timeout
+    ));
+    assert!(matches!(
+        RemoteActorError::<String>::from(tonic::Status::cancelled("Timeout expired")),
+        RemoteActorError::Timeout
+    ));
+    assert!(matches!(
+        RemoteActorError::<String>::from(tonic::Status::cancelled("user cancelled")),
+        RemoteActorError::Transport(_)
+    ));
+
+    root.shutdown().await.unwrap();
 }

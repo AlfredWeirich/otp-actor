@@ -1,6 +1,6 @@
 # Release Notes — `otp-actor` v0.3.0
 
-**Release Date:** 2026-11-09  
+**Release Date:** 2026-11-10  
 **Minimum Supported Rust Version (MSRV):** Rust 1.88 (`edition = "2024"`)
 
 `otp-actor` **0.3.0** is a major architectural release that unifies the supervision tree into a single recursive `Supervisor`, replaces `mpsc` channel polling with a reactive `tokio::sync::watch` data plane (including 0-hop cache reads for `ResourceActor`), expands `StatefulActor` ergonomics with `handle_cast`, `CallMessage::ask()`, `send_after()`, and non-blocking backpressure (`try_cast()`), and gates chaos-testing hooks behind a dedicated `chaos_test` Cargo feature.
@@ -28,7 +28,7 @@
   - `get_resource_client::<T, E>(name) -> Result<ResourceClient<T, E>, SupervisorError>`
   - `get_actor_client::<A>(name) -> Result<ActorClient<A>, SupervisorError>`
   - `get_supervisor(name) -> Result<SupervisorHandle, SupervisorError>`
-- **Hardened Child Watch State Updates:** `Supervisor` uses `watch::Sender::send_replace(...)` on every slot state transition (`Running`, `Restarting`, `Stopped`, `Failed`) and `ResourceActor` uses `send_replace(...)` on its cache channel so state updates are never dropped even when `receiver_count() == 0`.
+- **Hardened Child Watch State Updates & Factory Panic Isolation:** `Supervisor` uses `watch::Sender::send_replace(...)` on every slot state transition (`Running`, `Restarting`, `Stopped`, `Failed`), isolates child factory panics into `SupervisorError::FactoryPanicked(name, reason)` instead of crashing the supervisor task, tracks monotonic supervisor-wide `spawn_id`s to prevent stale-exit ABA races, and provides `SupervisorHandle::request_shutdown()` for non-blocking self-shutdown from inside an actor handler.
 - **Future-Proof Policies & Trackers:**
   - Marked `SupervisionStrategy`, `RestartType`, `ShutdownPolicy`, `RestartPolicy`, `SupervisorError`, `ResourceActorConfig`, `StatefulActorConfig`, `ResourceError`, `ActorError`, `RemoteActorError`, and `RemoteNodeError` as `#[non_exhaustive]`.
   - Added `RestartPolicy::new(max_restarts, time_window)` and fluent setters (`max_restarts`, `time_window`, `initial_backoff`, `max_backoff`, `backoff_multiplier`).
@@ -52,6 +52,8 @@
 - **Watch Rebinding:** `ActorClient` holds a reactive `watch::Receiver<SlotState>` (and re-resolves from `SupervisorHandle` if the managing supervisor itself restarts).
 
 ### 4. Remote gRPC Improvements (`--features remote`, `proto/actor_node.proto`)
+- **Bounded `postcard` 1.1.3 Wire Serialization:** Switched remote payload serialization from `bincode` to `postcard` (`default-features = false, features = ["use-std"]`) with a bounded serialization flavor (`BoundedVec`, 4 MiB cap) and `postcard::take_from_bytes` trailing-byte rejection.
+- **Protocol Versioning, Timeout Caps & Auth Hooks:** Added `uint32 protocol_version = 5` (`REMOTE_PROTOCOL_VERSION = 1`) and `INCOMPATIBLE_PROTOCOL = 10` to `actor_node.proto`, added `DEFAULT_REMOTE_CALL_TIMEOUT` (30s) and `MAX_REMOTE_REQUEST_TIMEOUT` (300s) server-side timeout guards, sanitized untrusted service/actor names in tracing and error messages, and added `ActorNodeBuilder` (`server(...)`, `authorizer(...)`, `start_with_interceptor(...)`) alongside `RemoteActorClient::connect_with` and `with_request_metadata`.
 - Added `optional uint64 timeout_ms = 4` to `CastRequest`, propagated end-to-end by `RemoteActorClient::cast_timeout` and `AnyActorClient::cast_timeout` into `ByteEndpoint::cast_bytes`.
 - Added `MAX_RESTARTS_EXCEEDED = 9` to `RemoteError::Kind` and `RemoteActorError::MaxRestartsExceeded(String)` for symmetric reporting when a supervised remote actor exhausts its restart budget.
 - Added `RemoteNodeError` for structured error reporting from `ActorNodeHandle::start` and `ActorNodeHandle::shutdown`.
@@ -145,10 +147,12 @@ otp-actor = { version = "0.3.0", features = ["chaos_test"] }
 ## Verification
 
 All checks were run and passed cleanly for `0.3.0`:
-- `cargo test --test actor_supervision_test --all-features`: **67 / 67 passed**
-- `cargo test --test remote_grpc_test --features remote`: **7 / 7 passed**
+- `cargo test --lib --all-features`: **1 / 1 passed**
+- `cargo test --test actor_supervision_test --all-features`: **72 / 72 passed**
+- `cargo test --test remote_grpc_test --features remote`: **9 / 9 passed**
 - `cargo test --doc --all-features`: **4 / 4 passed**
 - `cargo clippy --all-targets --all-features -- -D warnings`: **0 warnings**
 - `cargo clippy --lib --no-default-features -- -D warnings`: **0 warnings**
 - `cargo doc --no-deps --all-features`: **0 warnings**
+- `cargo package --offline --allow-dirty`: **35 files packaged and verified**
 - All examples compile (`cargo check --examples --all-features`) and non-interactive demos (`simple`, `dynamic_child`, `dynamic_supervisor`, `remote_all_in_one`) were executed and passed.

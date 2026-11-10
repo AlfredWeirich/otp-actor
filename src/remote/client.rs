@@ -1,14 +1,19 @@
 //! Strongly typed remote actor client communicating over gRPC with Location Transparency.
 
 use std::marker::PhantomData;
+use std::sync::Arc;
 use std::time::Duration;
 use tonic::transport::{Channel, Endpoint};
 
 use crate::actor::{ActorClient, StatefulActor};
-use crate::remote::endpoint::{MAX_GRPC_FRAME_BYTES, decode_payload, encode_payload};
+use crate::remote::endpoint::{
+    MAX_GRPC_FRAME_BYTES, REMOTE_PROTOCOL_VERSION, decode_payload, encode_payload,
+};
 use crate::remote::error::RemoteActorError;
 use crate::remote::proto::call_response::Result as CallResult;
 use crate::remote::proto::{ActorNodeClient, CallRequest, CastRequest};
+
+type MetadataInjector = Arc<dyn Fn(&mut tonic::metadata::MetadataMap) + Send + Sync>;
 
 /// Safely converts a [`Duration`] into non-overflowing milliseconds, clamping sub-millisecond
 /// non-zero durations to `1ms` so they do not truncate to `0ms` on the wire.
@@ -27,6 +32,7 @@ pub struct RemoteActorClient<A: StatefulActor> {
     actor_name: String,
     channel: Channel,
     client: ActorNodeClient<Channel>,
+    metadata_injector: Option<MetadataInjector>,
     _phantom: PhantomData<A>,
 }
 
@@ -45,6 +51,7 @@ impl<A: StatefulActor> RemoteActorClient<A> {
             actor_name: actor_name.into(),
             channel,
             client,
+            metadata_injector: None,
             _phantom: PhantomData,
         }
     }
@@ -56,8 +63,28 @@ impl<A: StatefulActor> RemoteActorClient<A> {
         actor_name: impl Into<String>,
     ) -> Result<Self, tonic::transport::Error> {
         let ep = Endpoint::from_shared(endpoint.into())?;
-        let channel = ep.connect().await?;
+        Self::connect_with(ep, service_name, actor_name).await
+    }
+
+    /// Connects using a pre-configured Tonic [`Endpoint`] (e.g. with TLS, keepalive, or timeouts).
+    pub async fn connect_with(
+        endpoint: Endpoint,
+        service_name: impl Into<String>,
+        actor_name: impl Into<String>,
+    ) -> Result<Self, tonic::transport::Error> {
+        let channel = endpoint.connect().await?;
         Ok(Self::new(channel, service_name, actor_name))
+    }
+
+    /// Attaches a per-request metadata hook invoked before every `call` and `cast`
+    /// (for example to inject `authorization` bearer tokens or correlation headers).
+    #[must_use]
+    pub fn with_request_metadata<F>(mut self, injector: F) -> Self
+    where
+        F: Fn(&mut tonic::metadata::MetadataMap) + Send + Sync + 'static,
+    {
+        self.metadata_injector = Some(Arc::new(injector));
+        self
     }
 
     /// Access the underlying gRPC HTTP/2 channel.
@@ -120,9 +147,13 @@ impl<A: StatefulActor> RemoteActorClient<A> {
             actor_name: self.actor_name.clone(),
             payload,
             timeout_ms: timeout.map(duration_to_wire_ms),
+            protocol_version: REMOTE_PROTOCOL_VERSION,
         });
         if let Some(dur) = timeout {
             request.set_timeout(dur);
+        }
+        if let Some(injector) = &self.metadata_injector {
+            injector(request.metadata_mut());
         }
 
         let mut client = self.client.clone();
@@ -182,9 +213,13 @@ impl<A: StatefulActor> RemoteActorClient<A> {
             actor_name: self.actor_name.clone(),
             payload,
             timeout_ms: timeout.map(duration_to_wire_ms),
+            protocol_version: REMOTE_PROTOCOL_VERSION,
         });
         if let Some(dur) = timeout {
             request.set_timeout(dur);
+        }
+        if let Some(injector) = &self.metadata_injector {
+            injector(request.metadata_mut());
         }
 
         let mut client = self.client.clone();

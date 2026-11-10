@@ -5,7 +5,7 @@ A **fault-tolerant actor framework** for [Tokio](https://tokio.rs), inspired by 
 1. **A unified, recursive supervision tree** (`Supervisor` → child `Supervisor`s / actors to arbitrary depth) that detects controlled error exits (`TaskResult::Err`) and task panics, applies restart strategies (`OneForOne`, `OneForAll`, `RestForOne`) at *every* level, honors OTP child restart rules (`RestartType::Permanent`, `Transient`, `Temporary`) and graceful shutdown policies (`ShutdownPolicy::Timeout`, `BrutalKill`, `Infinity`), and protects against crash loops with rate limiting and exponential backoff.
 2. **A generic, reusable "resource actor" (`ResourceActor`)** that fetches, caches and proactively refreshes *any* kind of expiring resource (OAuth tokens, database credentials, config snapshots, signed URLs, …) with **0-hop lock-free `watch` cache reads** (`ResourceClient::get()`) and delegates refreshes to a user-supplied `Worker` — a struct, an `async fn`, or a closure.
 3. **A zero-cost stateful actor (`StatefulActor`)** (modeled after Erlang's `gen_server`) for general-purpose state machines with typed `call` (request/response), `cast` / `try_cast` / `cast_timeout` (fire-and-forget), `CallMessage<A>` (`ask` per-request response types), `ActorContext<Self>` (`client()`, `supervisor()`, `send_after()`), `on_start` / `on_stop` lifecycle hooks, and a zero-polling `watch`-backed self-healing client architecture (`ActorClient`).
-4. **Remote actors over gRPC (`RemoteActorClient`, `ActorNodeHandle`, `AnyActorClient`)** (optional `--features remote`) providing complete location transparency, a universal Protobuf wire contract ([`proto/actor_node.proto`](proto/actor_node.proto)), bounded `bincode` payload serialization via Serde, network self-healing across actor crashes without connection drops, and coordinated 2-phase graceful shutdown.
+4. **Remote actors over gRPC (`RemoteActorClient`, `ActorNodeHandle`, `AnyActorClient`)** (optional `--features remote`) providing complete location transparency, a universal Protobuf wire contract ([`proto/actor_node.proto`](proto/actor_node.proto)), bounded `postcard` payload serialization via Serde, network self-healing across actor crashes without connection drops, and coordinated 2-phase graceful shutdown.
 
 In-process clients talk **directly** to actors over their own 1-hop Tokio channel (or 0-hop `watch` snapshot for fresh `ResourceActor` cache hits), while remote clients communicate over multiplexed HTTP/2 gRPC into server-side endpoints. In both modes, supervisors are strictly confined to lifecycle management (the *control plane*) and publish per-child `watch::Receiver<SlotState>` handles so clients re-bind with **zero polling and zero sleep loops** after a crash.
 
@@ -123,7 +123,7 @@ flowchart TD
 
 - **Data plane** —
   - **In-process:** `ResourceClient::get()` checks a local **0-hop `tokio::sync::watch` cache snapshot** first; on cold starts or near expiry it sends straight to the actor's mailbox over a direct 1-hop `mpsc` channel. `ActorClient::call()` / `ask()` / `cast()` communicate directly with the actor's bounded `mpsc` mailbox.
-  - **Remote (`--features remote`):** `RemoteActorClient` sends requests over multiplexed HTTP/2 gRPC to `ActorNodeService`, where `ActorClient<A>` (implementing the type-erased `ByteEndpoint` trait) decodes the `bincode` payload and forwards it directly into the local actor's mailbox.
+  - **Remote (`--features remote`):** `RemoteActorClient` sends requests over multiplexed HTTP/2 gRPC to `ActorNodeService`, where `ActorClient<A>` (implementing the type-erased `ByteEndpoint` trait) decodes the `postcard` payload and forwards it directly into the local actor's mailbox.
   - In both cases, **no supervisor is ever in the message request path**.
 - **Control plane** — `Supervisor`s own child `JoinHandle`s, detect exits/panics, execute restart strategies (`OneForOne`, `OneForAll`, `RestForOne`) at *any* depth, and maintain a reactive `watch::Sender<SlotState>` per child slot. When a direct `mpsc` channel closes after a crash, clients (and child `SupervisorHandle`s) reactively await `SlotState::Running` over their `watch::Receiver<SlotState>`—rebinding in 0 ms with **zero polling** (and re-resolving via the managing `SupervisorHandle` only if the parent supervisor itself was restarted).
 
@@ -134,7 +134,7 @@ flowchart TD
 | `Supervisor`, `SupervisorBuilder`, `SupervisorHandle`, `ChildSpec`, `SpawnContext`, `SlotState` | [`src/actor/supervisor.rs`](src/actor/supervisor.rs) | Unified recursive supervisor (leaf actors and child supervisors to arbitrary depth). Applies `SupervisionStrategy`, tracks restart intensity & wave tickets, publishes reactive `watch::Receiver<SlotState>` slots, and provides typed accessors (`get_resource_client`, `get_actor_client`, `get_supervisor`). |
 | `ResourceActor`, `ResourceActorBuilder`, `ResourceActorConfig`, `ResourceClient`, `Worker`, `TimedResource`, `WorkerContext`, `ResourceError` | [`src/actor/generic_actor.rs`](src/actor/generic_actor.rs) | Caching/refreshing resource actor with 0-hop `watch` cache reads, fluent builder, worker abstraction, and self-healing `ResourceClient`. |
 | `StatefulActor`, `StatefulActorBuilder`, `StatefulActorConfig`, `CallMessage`, `ActorClient`, `ActorContext`, `ActorControl`, `ActorError` | [`src/actor/stateful_actor.rs`](src/actor/stateful_actor.rs) | Zero-cost general-purpose stateful actor (`gen_server` style) with `handle` / `handle_cast` / `ask`, `ActorContext<Self>` timers & handles, backpressure (`try_cast`), and self-healing `ActorClient`. |
-| `RemoteActorClient`, `AnyActorClient`, `ActorNodeHandle`, `ActorNodeService`, `ActorNodeRegistry`, `ByteEndpoint`, `RemoteActorError`, `RemoteNodeError` | [`src/remote/mod.rs`](src/remote/mod.rs) | gRPC remote actors (`--features remote`): bounded `bincode` endpoint bridge, typed remote client, location transparency, coordinated 2-phase shutdown. |
+| `RemoteActorClient`, `AnyActorClient`, `ActorNodeHandle`, `ActorNodeService`, `ActorNodeRegistry`, `ByteEndpoint`, `RemoteActorError`, `RemoteNodeError` | [`src/remote/mod.rs`](src/remote/mod.rs) | gRPC remote actors (`--features remote`): bounded `postcard` endpoint bridge, typed remote client, location transparency, coordinated 2-phase shutdown. |
 | Protobuf Schema & Build Script | [`proto/actor_node.proto`](proto/actor_node.proto) & [`build.rs`](build.rs) | Compact universal gRPC actor wire contract (`Call`, `Cast`, `RemoteError`), compiled automatically via `tonic-prost-build`. |
 | `SupervisionStrategy`, `RestartPolicy`, `RestartTracker`, `RestartType`, `ShutdownPolicy`, `SupervisorError`, `TaskResult`, `EXPIRY_BUFFER`, `DEFAULT_SHUTDOWN_TIMEOUT` | [`src/actor/model.rs`](src/actor/model.rs) | Shared domain model: strategies, `#[non_exhaustive]` policies & errors, restart types, shutdown policies, backoff computation, task exit results. |
 | Demo | [`examples/otp_actor.rs`](examples/otp_actor.rs) | Eight-phase walkthrough with simulated GCP tokens and a database secret. |
@@ -144,8 +144,8 @@ flowchart TD
 | Remote All-in-One Showcase | [`examples/remote/all_in_one.rs`](examples/remote/all_in_one.rs) | Full remote lifecycle: hosting, gRPC client calls, crash self-healing, client-initiated `ctx.stop()`, and 2-phase shutdown. |
 | Remote Server Node (Rechner B) | [`examples/remote/server.rs`](examples/remote/server.rs) | Standalone daemon hosting actors under OTP supervision over network gRPC (default: `http://127.0.0.1:50051`, override via `REMOTE_ADDR`). |
 | Remote Client (Rechner A) | [`examples/remote/client.rs`](examples/remote/client.rs) | Lightweight client invoking remote actors with location transparency and testing crash recovery. |
-| Integration tests | [`tests/actor_supervision_test.rs`](tests/actor_supervision_test.rs) | 67 tests covering recursive supervision, 0-hop caching, stateful actors, restart types, graceful shutdown, timeouts, backpressure, and more. |
-| Remote gRPC tests | [`tests/remote_grpc_test.rs`](tests/remote_grpc_test.rs) | 7 integration tests covering TCP transport, location transparency, crash recovery, timeouts, cast backpressure, trailing-byte rejection, and 2-phase drainage. |
+| Integration tests | [`tests/actor_supervision_test.rs`](tests/actor_supervision_test.rs) | 72 tests covering recursive supervision, 0-hop caching, stateful actors, restart types, graceful shutdown, timeouts, backpressure, and factory panic isolation. |
+| Remote gRPC tests | [`tests/remote_grpc_test.rs`](tests/remote_grpc_test.rs) | 9 tests covering TCP/HTTP2 transport, location transparency, crash recovery, protocol versioning, request authorization, label sanitization, timeouts, and 2-phase drainage. |
 
 ---
 
@@ -155,11 +155,11 @@ flowchart TD
 
 - **Rust 1.88 or newer** (the crate uses `edition = "2024"` and `let`-chains).
 - No system dependencies for standard in-memory usage. Runtime library dependencies are minimal:
-  - [`tokio`](https://crates.io/crates/tokio) 1 (`rt`, `rt-multi-thread`, `sync`, `time`, `macros`)
+  - [`tokio`](https://crates.io/crates/tokio) 1 (`rt`, `sync`, `time`, `macros`)
   - [`thiserror`](https://crates.io/crates/thiserror) 2
   - [`tracing`](https://crates.io/crates/tracing) 0.1
 - **Optional gRPC Remote Actors (`--features remote`):**
-  - Requires standard `libprotoc` (or `protox`) on build; pulls in `tonic`, `prost`, `serde`, and `bincode`.
+  - Requires standard `libprotoc` (or `protox`) on build; pulls in `tonic`, `prost`, `serde`, and `postcard`.
 
 ### Build, run, test
 
@@ -188,7 +188,7 @@ cargo run --example remote_server --features remote
 # Terminal 2 (Rechner A / Client):
 cargo run --example remote_client --features remote
 
-# Run all 74 core & remote integration tests (+ 4 doc-tests = 78 total)
+# Run all 81 core & remote tests (+ 4 doc-tests = 85 total)
 cargo test --all-features
 
 # Optimized build
@@ -399,7 +399,7 @@ Key properties:
 | `.shutdown_timeout(d)` | — | Shorthand for `.shutdown_policy(ShutdownPolicy::Timeout(d))`. |
 | `.worker_timeout(d)` | `30 s` (`DEFAULT_WORKER_TIMEOUT`) | Abort a worker run that exceeds `d` → `ResourceError::Timeout(Duration)`. |
 | `.no_worker_timeout()` | — | Disables the execution timeout, allowing workers to run indefinitely. |
-| `.failure_cooldown(d)` | `0` (disabled) | After a failed fetch, fast-fail new callers for `d` instead of hammering the backend (negative caching). |
+| `.failure_cooldown(d)` | `1 s` (`DEFAULT_FAILURE_COOLDOWN`) | After a failed fetch, fast-fail new callers for `d` instead of hammering the backend (negative caching). |
 | `.stale_while_error(d)` | `0` (disabled) | Keep serving an expired value for up to `d` while a refresh recovers. |
 | `.proactive_refresh(b)` | `true` | Refresh in the background via a timer before expiry, even without client traffic. |
 | `.proactive_jitter(d)` | `0` | Randomly start proactive refreshes up to `d` earlier (clamped to at most half the refresh lead time, with entropy-hashed jitter) to avoid thundering herds across many actors. |
@@ -621,7 +621,7 @@ tokio = { version = "1", features = ["full"] }
                                  │
                                  │ gRPC / HTTP/2 (otp_actor.remote.v1)
                                  │ CallRequest / CastRequest { service_name,
-                                 │   actor_name, payload (bincode), timeout_ms }
+                                 │   actor_name, payload (postcard), timeout_ms}
                                  ▼
  ┌─────────────────────────────────────────────────────────────────┐
  │                         Remote Machine B                        │
@@ -632,7 +632,7 @@ tokio = { version = "1", features = ["full"] }
  │     │     │              -> Arc<dyn ByteEndpoint>)              │
  │     │     │                                                     │
  │     │     └── ActorClient<BankAccount> (impl ByteEndpoint)      │
- │     │           │ Decodes bincode payload (≤ 4 MiB)             │
+ │     │           │ Decodes postcard payload (≤ 4 MiB)            │
  │     ▼           ▼                                               │
  │   Supervisor "bank-service" (OneForOne, RestartType::Transient) │
  │     └── BankAccount ("acc-42", balance: 1000)                   │
@@ -641,7 +641,7 @@ tokio = { version = "1", features = ["full"] }
 
 The remote subsystem is built around four core principles:
 1. **Universal Protobuf Wire Contract ([`proto/actor_node.proto`](proto/actor_node.proto))**: A single schema-agnostic `ActorNode` service (`Call` and `Cast` RPCs, both supporting optional `timeout_ms`) transports arbitrary typed messages without modifying or recompiling `.proto` files per actor type.
-2. **Type-Erased Byte Bridging & DoS Defense (`ByteEndpoint`)**: `ByteEndpoint` is implemented directly for `ActorClient<A>`, decoding `bincode` payloads (`DefaultOptions::new().with_fixint_encoding().reject_trailing_bytes().with_limit(MAX_REMOTE_PAYLOAD_BYTES)`) with a strict **4 MiB** limit (`MAX_REMOTE_PAYLOAD_BYTES`) and forwarding them directly to the actor mailbox. Both `Ok(A::Response)` and domain errors `Err(A::Error)` are serialized symmetrically across the wire.
+2. **Type-Erased Byte Bridging & DoS Defense (`ByteEndpoint`)**: `ByteEndpoint` is implemented directly for `ActorClient<A>`, decoding `postcard` payloads via `postcard::take_from_bytes` with a strict **4 MiB** limit (`MAX_REMOTE_PAYLOAD_BYTES`) and trailing-byte rejection, and forwarding them directly to the actor mailbox. Both `Ok(A::Response)` and domain errors `Err(A::Error)` are serialized symmetrically across the wire.
 3. **Location Transparency (`AnyActorClient<A>`)**: Enum unifier (`AnyActorClient::Local(ActorClient<A>)` | `AnyActorClient::Remote(RemoteActorClient<A>)`) exposing `.call()`, `.call_timeout()`, `.cast()`, and `.cast_timeout()`, mapping local `ActorError<A::Error>` variants (including `MailboxFull` and `MaxRestartsExceeded`) symmetrically into `RemoteActorError<A::Error>`.
 4. **Coordinated 2-Phase Graceful Shutdown**: `ActorNodeHandle::shutdown()` returns `Result<(), RemoteNodeError>`, emits HTTP/2 `GOAWAY`, awaits `serve_with_incoming_shutdown` until active in-flight RPCs drain (bounded by `with_drain_timeout(...)`, default `DEFAULT_DRAIN_TIMEOUT = 10s`), and then calls `SupervisorHandle::shutdown()` so child supervisors and actors stop recursively in reverse registration order according to each `ShutdownPolicy`.
 
@@ -669,6 +669,7 @@ message CallRequest {
   string actor_name = 2;
   bytes payload = 3;
   optional uint64 timeout_ms = 4;
+  uint32 protocol_version = 5;
 }
 
 // Universal call response envelope carrying the outcome.
@@ -686,6 +687,7 @@ message CastRequest {
   string actor_name = 2;
   bytes payload = 3;
   optional uint64 timeout_ms = 4;
+  uint32 protocol_version = 5;
 }
 
 // Cast acknowledgment (returns once enqueued in local actor mailbox).
@@ -706,6 +708,7 @@ message RemoteError {
     DESERIALIZATION = 7;
     ACTOR_PANIC = 8;
     MAX_RESTARTS_EXCEEDED = 9;
+    INCOMPATIBLE_PROTOCOL = 10;
   }
   Kind kind = 1;
   string message = 2;
@@ -1020,7 +1023,8 @@ Because children are owned by their supervisor, a supervisor crash also replaces
 | `restart_child(name)` | Manually recovers a failed or stopped child (and dependent siblings under `OneForAll` / `RestForOne`), gracefully awaiting termination of any running instance before spawning the replacement. |
 | `stop_child(name)` | Gracefully stops a supervised child according to its `ShutdownPolicy` and disables auto-restart on supervisor reboot. |
 | `delete_child(name)` | Gracefully stops (if running) and completely removes a child's specification and state from the supervisor. |
-| `shutdown()` | Sequentially shuts down all supervised children in reverse registration order and terminates this supervisor (cascading recursively into child supervisors). |
+| `request_shutdown()` | Enqueues graceful shutdown without waiting for completion (safe to call from inside a child actor's message handler via `ctx.supervisor()` without deadlocking). |
+| `shutdown()` | Sequentially shuts down all supervised children in reverse registration order and terminates this supervisor (cascading recursively into child supervisors). Do not `.await` from inside a supervised child's own message handler; use `request_shutdown()` instead. |
 | `resolve_child_channel::<S>(name)` / `resolve_child_channel_untyped(name)` | Low-level endpoint lookup. |
 | `trigger_child_crash(name)` | Chaos *(requires `chaos_test` or test cfg)*: terminates a supervised child with a crash error (`TaskResult::Err`). |
 | `simulate_crash()` | Chaos *(requires `chaos_test` or test cfg)*: terminates this supervisor with a crash error (`TaskResult::Err`). |
@@ -1085,6 +1089,7 @@ pub enum SupervisorError {
     ChildTypeMismatch(String),
     SupervisorUnavailable,
     MaxRestartsExceeded(String, usize, Duration),
+    FactoryPanicked(String, String),
 }
 ```
 
@@ -1155,8 +1160,8 @@ The output is intentionally verbose (emoji-tagged log lines such as `🔥 Eager 
 ## Testing
 
 ```bash
-cargo test                                            # core suite + doc-tests (67 + 4 = 71)
-cargo test --all-features                             # all core & remote gRPC tests + doc-tests (67 + 7 + 4 = 78)
+cargo test                                            # core suite + doc-tests (72 + 4 = 76)
+cargo test --all-features                             # core, remote gRPC, codec unit & doc-tests (72 + 9 + 1 + 4 = 86)
 cargo test --test actor_supervision_test              # core integration suite only
 cargo test --test remote_grpc_test --features remote  # remote gRPC suite only
 cargo test test_strategy_rest_for_one -- --nocapture  # a single test with logs
@@ -1164,18 +1169,18 @@ cargo test test_strategy_rest_for_one -- --nocapture  # a single test with logs
 
 *(Note: `[dev-dependencies]` enables `otp-actor = { path = ".", features = ["chaos_test"] }`, so integration tests, doc-tests, and examples can call chaos hooks out of the box without exposing them in default production builds.)*
 
-> **Remote test suite ([`tests/remote_grpc_test.rs`](tests/remote_grpc_test.rs)):** 7 end-to-end TCP/HTTP2 integration tests covering request/response `call`, `cast`, `cast_timeout`, domain error round-tripping, location transparency (`AnyActorClient`), crash recovery over an active channel, timeout enforcement, trailing-byte rejection, and coordinated 2-phase graceful shutdown.
+> **Remote test suite ([`tests/remote_grpc_test.rs`](tests/remote_grpc_test.rs)):** 9 tests (7 end-to-end TCP/HTTP2 integration tests + 2 in-process gRPC service unit tests) covering request/response `call`, `cast`, `cast_timeout`, domain error round-tripping, location transparency (`AnyActorClient`), crash recovery over an active channel, wire protocol version checks, request authorization hooks, untrusted label sanitization, timeout clamping, trailing-byte rejection, and coordinated 2-phase graceful shutdown.
 
-The integration suite in [`tests/actor_supervision_test.rs`](tests/actor_supervision_test.rs) covers 67 deterministic tests:
+The integration suite in [`tests/actor_supervision_test.rs`](tests/actor_supervision_test.rs) covers 72 deterministic tests:
 
 | Topic | Tests |
 | --- | --- |
-| Builder & caching | `test_builder_and_eager_prewarm`, `test_proactive_timer_refresh`, `test_stale_while_error_serves_expired_cache`, `test_force_refresh_bypasses_failure_cooldown`, `test_ttl_duration_max_no_panic`, `test_force_refresh_aborts_in_flight_worker`, `test_ttl_shorter_than_expiry_buffer_does_not_storm_refresh_on_get`, `test_large_jitter_and_zero_ttl_do_not_cause_refresh_storm` |
+| Builder & caching | `test_builder_and_eager_prewarm`, `test_proactive_timer_refresh`, `test_stale_while_error_serves_expired_cache`, `test_force_refresh_bypasses_failure_cooldown`, `test_ttl_duration_max_no_panic`, `test_force_refresh_aborts_in_flight_worker`, `test_ttl_shorter_than_expiry_buffer_does_not_storm_refresh_on_get`, `test_large_jitter_and_zero_ttl_do_not_cause_refresh_storm`, `test_default_failure_cooldown_fast_fails_second_call`, `test_stale_while_error_background_refresh_throttled_when_cooldown_zero` |
 | Strategies & recursive tree | `test_strategy_one_for_all`, `test_strategy_rest_for_one`, `test_top_level_supervisor_supports_rest_for_one_strategy`, `test_three_level_nested_supervisor_hierarchy_and_subtree_recovery`, `test_rest_for_one_overlapping_backoffs_and_failed_downstream_recovery`, `test_sibling_isolation_during_crash`, `test_root_supervisor_shutdown_aborts_entire_tree`, `test_one_for_all_and_restart_child_graceful_on_stop_without_overlap`, `test_duplicate_service_supervisor_does_not_boot_children` |
-| Restart types & graceful shutdown | `test_restart_type_permanent_restarts_on_normal_exit`, `test_restart_type_transient_stops_on_normal_exit_but_restarts_on_crash`, `test_restart_type_temporary_never_restarts_even_on_crash`, `test_stop_child_completes_in_flight_worker_gracefully`, `test_stop_child_prevents_overlapping_start_child_while_on_stop_running`, `test_shutdown_policy_timeout_aborts_hung_actor`, `test_root_supervisor_graceful_shutdown_cascade`, `test_sequential_graceful_shutdown_in_reverse_registration_order`, `test_stopped_and_deleted_children_do_not_resurrect_on_supervisor_restart`, `test_root_supervisor_drop_aborts_services_even_with_active_handles` |
+| Restart types & graceful shutdown | `test_restart_type_permanent_restarts_on_normal_exit`, `test_restart_type_transient_stops_on_normal_exit_but_restarts_on_crash`, `test_restart_type_temporary_never_restarts_even_on_crash`, `test_stop_child_completes_in_flight_worker_gracefully`, `test_stop_child_prevents_overlapping_start_child_while_on_stop_running`, `test_shutdown_policy_timeout_aborts_hung_actor`, `test_root_supervisor_graceful_shutdown_cascade`, `test_sequential_graceful_shutdown_in_reverse_registration_order`, `test_stopped_and_deleted_children_do_not_resurrect_on_supervisor_restart`, `test_root_supervisor_drop_aborts_services_even_with_active_handles`, `test_request_shutdown_from_actor_handler_does_not_deadlock` |
 | Stateful actors (`StatefulActor`) | `test_stateful_actor_call_and_cast_with_crash_recovery`, `test_handle_cast_call_message_ask_and_send_after`, `test_try_cast_mailbox_full_and_cast_timeout`, `test_stateful_actor_lifecycle_hooks_on_start_and_on_stop`, `test_mixed_supervision_resource_actor_and_stateful_actor_one_for_all`, `test_stateful_actor_ctx_stop_drains_all_queued_messages`, `test_stateful_actor_graceful_shutdown_drains_messages_queued_after_shutdown_envelope`, `test_stateful_actor_handler_timeout_fails_fast_and_restarts_cleanly`, `test_stateful_actor_non_clone_message_rebind_and_call_retry_mid_handler`, `test_stateful_actor_on_start_failure_triggers_supervisor_recovery` |
 | Crash-loop & backoff | `test_crash_loop_protection`, `test_root_supervisor_crash_loop_protection`, `test_backoff_overflow_prevention`, `test_backoff_decays_after_stability`, `test_supervisor_nonblocking_backoff`, `test_retry_storm_exponential_backoff`, `test_restart_tracker_enforces_max_restarts_when_backoff_exceeds_time_window_and_delete_service`, `test_one_for_all_max_restarts_preserves_stopped_and_removes_temporary_siblings` |
-| Recovery & manual intervention | `test_worker_panic_auto_recovery`, `test_max_consecutive_failures_escalates_without_panic`, `test_one_for_all_survives_and_heals_after_supervisor_crash`, `test_client_channel_rebind_during_slow_backoff`, `test_client_control_commands_rebind_after_crash`, `test_restart_child_recovers_failed_actor`, `test_restart_service_recovers_failed_supervisor`, `test_root_restart_service_honors_shutdown_policy_without_overlap`, `test_delete_and_start_child_during_backoff_ignores_stale_timer`, `test_escalate_on_failure_triggers_root_supervisor_restart` |
+| Recovery & manual intervention | `test_worker_panic_auto_recovery`, `test_max_consecutive_failures_escalates_without_panic`, `test_one_for_all_survives_and_heals_after_supervisor_crash`, `test_client_channel_rebind_during_slow_backoff`, `test_client_control_commands_rebind_after_crash`, `test_restart_child_recovers_failed_actor`, `test_restart_service_recovers_failed_supervisor`, `test_root_restart_service_honors_shutdown_policy_without_overlap`, `test_delete_and_start_child_during_backoff_ignores_stale_timer`, `test_escalate_on_failure_triggers_root_supervisor_restart`, `test_factory_panic_returns_factory_panicked_and_allows_recovery`, `test_factory_panic_during_auto_recovery_retries_and_escalates` |
 | Child specs | `test_child_spec_builder_pattern`, `test_dynamic_start_child`, `test_child_spec_with_custom_struct_worker`, `test_child_spec_with_closure_capturing_env`, `test_zero_channel_capacity_and_spec_poisoning_protection` |
 | Timeouts & load | `test_client_get_timeout`, `test_actor_worker_timeout`, `test_actor_overloaded_backpressure`, `test_dead_waiters_pruned`, `test_resource_client_rebinds_on_actor_unavailable_and_propagates_actor_not_found` |
 | Race safety | `test_generation_guard_ignores_stale_refresh` |
@@ -1207,7 +1212,7 @@ The integration suite in [`tests/actor_supervision_test.rs`](tests/actor_supervi
 │   └── remote                          # optional (`--features remote`) distributed gRPC subsystem
 │       ├── mod.rs                      # module docs + public re-exports
 │       ├── client.rs                   # RemoteActorClient, AnyActorClient
-│       ├── endpoint.rs                 # ByteEndpoint trait + bounded bincode codec (MAX_REMOTE_PAYLOAD_BYTES)
+│       ├── endpoint.rs                 # ByteEndpoint trait + bounded postcard codec (MAX_REMOTE_PAYLOAD_BYTES)
 │       ├── error.rs                    # RemoteActorError, RemoteNodeError + gRPC status mapping
 │       ├── proto.rs                    # generated tonic/prost bindings
 │       ├── registry.rs                 # ActorNodeRegistry
@@ -1223,8 +1228,8 @@ The integration suite in [`tests/actor_supervision_test.rs`](tests/actor_supervi
 │       ├── server.rs                   # standalone gRPC server node
 │       └── client.rs                   # standalone gRPC client
 └── tests
-    ├── actor_supervision_test.rs       # 67 core integration tests
-    └── remote_grpc_test.rs             # 7 gRPC remote integration tests (`--features remote`)
+    ├── actor_supervision_test.rs       # 72 core integration tests
+    └── remote_grpc_test.rs             # 9 gRPC remote tests (`--features remote`)
 ```
 
 The public API is re-exported from the crate root and `otp_actor::actor`:
@@ -1232,8 +1237,8 @@ The public API is re-exported from the crate root and `otp_actor::actor`:
 ```rust
 use otp_actor::{
     // resource actors & clients
-    DEFAULT_WORKER_TIMEOUT, ResourceActor, ResourceActorBuilder, ResourceActorConfig,
-    ResourceClient, ResourceError, TimedResource, Worker, WorkerContext,
+    DEFAULT_FAILURE_COOLDOWN, DEFAULT_WORKER_TIMEOUT, ResourceActor, ResourceActorBuilder,
+    ResourceActorConfig, ResourceClient, ResourceError, TimedResource, Worker, WorkerContext,
     // stateful actors & clients (StatefulActor)
     ActorClient, ActorContext, ActorControl, ActorError, CallMessage, StatefulActor,
     StatefulActorBuilder, StatefulActorConfig,
@@ -1247,9 +1252,10 @@ use otp_actor::{
 
 // With `--features remote`:
 use otp_actor::remote::{
-    ActorNodeClient, ActorNodeHandle, ActorNodeRegistry, ActorNodeServer, ActorNodeService,
-    AnyActorClient, ByteEndpoint, DEFAULT_DRAIN_TIMEOUT, RemoteActorClient, RemoteActorError,
-    RemoteNodeError,
+    ActorNodeBuilder, ActorNodeClient, ActorNodeHandle, ActorNodeRegistry, ActorNodeServer,
+    ActorNodeService, AnyActorClient, Authorizer, ByteEndpoint, DEFAULT_DRAIN_TIMEOUT,
+    DEFAULT_REMOTE_CALL_TIMEOUT, MAX_REMOTE_REQUEST_TIMEOUT, REMOTE_PROTOCOL_VERSION,
+    RemoteActorClient, RemoteActorError, RemoteNodeError,
 };
 ```
 
@@ -1273,7 +1279,7 @@ use otp_actor::remote::{
 ## Known Limitations & Design Notes
 
 - **In-process & Distributed execution.** Core actors run in-process over 0-hop `watch` cache snapshots and high-throughput Tokio mpsc channels with zero network overhead. When distributed cross-process, cross-container, or cross-network communication is needed, the optional `remote` feature (`--features remote`) provides HTTP/2 gRPC actor nodes and location-transparent clients (`AnyActorClient`).
-- **Remote wire format & transport security.** Remote payloads are encoded with bounded `bincode` (≤ 4 MiB), so both client and server nodes should share matching Rust message schemas (not intended for schema-evolving polyglot contracts). `ActorNodeHandle` binds plaintext HTTP/2 TCP by default; terminate TLS via `tonic::transport::Server` / `Endpoint` (or a service mesh) when traversing untrusted networks.
+- **Remote wire format & transport security.** Remote payloads are encoded with bounded `postcard` (≤ 4 MiB) inside a versioned Protobuf envelope (`protocol_version = 1`), so both client and server nodes should share matching Rust message schemas (not intended for schema-evolving polyglot contracts). `ActorNodeHandle::start` binds plaintext HTTP/2 TCP by default; use `ActorNodeHandle::builder` / `ActorNodeHandle::start_with` (passing a TLS-configured `tonic::transport::Server` and optional `Authorizer` / Tonic interceptor) alongside `RemoteActorClient::connect_with` / `with_request_metadata` (or a service mesh) when traversing untrusted networks.
 - **Secret redaction in `Debug`.** `TimedResource<T>` redacts its inner `value` (`"<redacted>"`) in `fmt::Debug` output so cached tokens or credentials are never accidentally leaked into logs.
 - **Hybrid failure signaling (`TaskResult` + panic isolation).** Supervision is triggered both by controlled error exits (`TaskResult::Err`, such as `max_consecutive_failures`, `handler_timeout`, `ctx.fail()`, `escalate_on_failure`, or `simulate_crash()`) and by uncaught task/factory panics (`JoinError::is_panic()` / `catch_unwind`) when compiled with `panic = "unwind"`.
 - **Restarts reset in-memory actor state (by design).** Actors and child supervisors are re-created from their configured factories with clean initial state to prevent crash loops caused by corrupted state (see [State lifecycle on restart & persistence patterns](#state-lifecycle-on-restart--persistence-patterns)). Use `on_start` to rehydrate state from external persistence if durable state is needed.

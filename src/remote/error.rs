@@ -61,6 +61,12 @@ pub enum RemoteActorError<E> {
 
     /// The remote actor panicked or crashed while handling the message.
     ActorPanic(String),
+
+    /// The client and remote server speak incompatible wire protocol versions.
+    IncompatibleProtocol(String),
+
+    /// Unrecognized framework error code received from a newer or incompatible node.
+    Unknown { kind: i32, message: String },
 }
 
 impl<E: Display> Display for RemoteActorError<E> {
@@ -79,18 +85,33 @@ impl<E: Display> Display for RemoteActorError<E> {
             Self::Serialization(msg) => write!(f, "Serialization error: {msg}"),
             Self::Deserialization(msg) => write!(f, "Deserialization error: {msg}"),
             Self::ActorPanic(msg) => write!(f, "Remote actor panicked or crashed: {msg}"),
+            Self::IncompatibleProtocol(msg) => write!(f, "Incompatible remote protocol: {msg}"),
+            Self::Unknown { kind, message } => {
+                write!(f, "Unknown remote framework error (kind={kind}): {message}")
+            }
         }
     }
 }
 
 impl<E: Debug + Display> std::error::Error for RemoteActorError<E> {}
 
+fn status_is_timeout(status: &tonic::Status) -> bool {
+    if status.code() == tonic::Code::DeadlineExceeded {
+        return true;
+    }
+    let mut source = std::error::Error::source(status);
+    while let Some(err) = source {
+        if err.is::<tonic::TimeoutExpired>() {
+            return true;
+        }
+        source = err.source();
+    }
+    status.code() == tonic::Code::Cancelled && status.message() == "Timeout expired"
+}
+
 impl<E> From<tonic::Status> for RemoteActorError<E> {
     fn from(status: tonic::Status) -> Self {
-        if status.code() == tonic::Code::DeadlineExceeded
-            || (status.code() == tonic::Code::Cancelled
-                && status.message().contains("Timeout expired"))
-        {
+        if status_is_timeout(&status) {
             Self::Timeout
         } else {
             Self::Transport(status)
@@ -100,18 +121,22 @@ impl<E> From<tonic::Status> for RemoteActorError<E> {
 
 impl<E> From<RemoteError> for RemoteActorError<E> {
     fn from(err: RemoteError) -> Self {
-        let kind = Kind::try_from(err.kind).unwrap_or(Kind::Unspecified);
-        match kind {
-            Kind::ServiceNotFound => RemoteActorError::ServiceNotFound(err.message),
-            Kind::ActorNotFound => RemoteActorError::ActorNotFound(err.message),
-            Kind::MailboxFull => RemoteActorError::MailboxFull,
-            Kind::ActorUnavailable => RemoteActorError::ActorUnavailable,
-            Kind::MaxRestartsExceeded => RemoteActorError::MaxRestartsExceeded(err.message),
-            Kind::Timeout => RemoteActorError::Timeout,
-            Kind::Serialization => RemoteActorError::Serialization(err.message),
-            Kind::Deserialization => RemoteActorError::Deserialization(err.message),
-            Kind::ActorPanic => RemoteActorError::ActorPanic(err.message),
-            Kind::Unspecified => RemoteActorError::ActorPanic(err.message),
+        match Kind::try_from(err.kind) {
+            Ok(Kind::ServiceNotFound) => RemoteActorError::ServiceNotFound(err.message),
+            Ok(Kind::ActorNotFound) => RemoteActorError::ActorNotFound(err.message),
+            Ok(Kind::MailboxFull) => RemoteActorError::MailboxFull,
+            Ok(Kind::ActorUnavailable) => RemoteActorError::ActorUnavailable,
+            Ok(Kind::MaxRestartsExceeded) => RemoteActorError::MaxRestartsExceeded(err.message),
+            Ok(Kind::Timeout) => RemoteActorError::Timeout,
+            Ok(Kind::Serialization) => RemoteActorError::Serialization(err.message),
+            Ok(Kind::Deserialization) => RemoteActorError::Deserialization(err.message),
+            Ok(Kind::ActorPanic) => RemoteActorError::ActorPanic(err.message),
+            Ok(Kind::IncompatibleProtocol) => RemoteActorError::IncompatibleProtocol(err.message),
+            Ok(Kind::Unspecified) => RemoteActorError::ActorPanic(err.message),
+            Err(_) => RemoteActorError::Unknown {
+                kind: err.kind,
+                message: err.message,
+            },
         }
     }
 }

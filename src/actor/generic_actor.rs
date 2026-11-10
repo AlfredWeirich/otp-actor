@@ -38,6 +38,9 @@ use super::supervisor::{
 /// Default execution timeout on asynchronous worker tasks (30 seconds).
 pub const DEFAULT_WORKER_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Default cooldown window applied after a worker failure or timeout (1 second).
+pub const DEFAULT_FAILURE_COOLDOWN: Duration = Duration::from_secs(1);
+
 /// Error wrapper returned by [`ResourceClient`] operations.
 #[non_exhaustive]
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -249,7 +252,7 @@ impl ResourceActorConfig {
             restart_type: RestartType::default(),
             shutdown_policy: ShutdownPolicy::default(),
             worker_timeout: Some(DEFAULT_WORKER_TIMEOUT),
-            failure_cooldown: Duration::ZERO,
+            failure_cooldown: DEFAULT_FAILURE_COOLDOWN,
             stale_while_error: Duration::ZERO,
             proactive_refresh: true,
             proactive_jitter: Duration::ZERO,
@@ -262,7 +265,7 @@ impl ResourceActorConfig {
 ///
 /// Configuration methods can be chained in any order, both before and after attaching a [`Worker`] via [`.worker(...)`](ResourceActorBuilder::worker).
 pub struct ResourceActorBuilder<T = (), E = (), W = ()> {
-    pub config: ResourceActorConfig,
+    config: ResourceActorConfig,
     worker: W,
     _marker: PhantomData<(T, E)>,
 }
@@ -366,7 +369,7 @@ impl<T, E, W> ResourceActorBuilder<T, E, W> {
         self
     }
 
-    /// Sets the failure cooldown window (defaults to `Duration::ZERO`).
+    /// Sets the failure cooldown window (defaults to [`DEFAULT_FAILURE_COOLDOWN`], 1 second).
     /// During this window following a worker failure or timeout, further calls to `get()`
     /// will fast-fail immediately without spawning redundant worker tasks.
     #[must_use]
@@ -623,6 +626,30 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
         }
     }
 
+    /// Computes exponential retry backoff delay after worker failures (100ms..=30s).
+    fn failure_backoff_delay(&self) -> Duration {
+        let exp = self.failure_count.saturating_sub(1).min(9) as u32;
+        Duration::from_millis(100)
+            .saturating_mul(1 << exp)
+            .min(Duration::from_secs(30))
+    }
+
+    /// Indicates whether a background refresh triggered while serving a cached or stale
+    /// value should be throttled due to an active cooldown, failure backoff, or scheduled retry.
+    fn is_background_refresh_throttled(&self) -> bool {
+        if self.is_in_failure_cooldown() {
+            return true;
+        }
+        let Some((failed_at, _)) = &self.last_failure else {
+            return false;
+        };
+        if failed_at.elapsed() < self.failure_backoff_delay() {
+            return true;
+        }
+        self.next_proactive_target
+            .is_some_and(|target| Instant::now() < target)
+    }
+
     /// Computes bounded pseudo-random jitter in milliseconds within `0..max_jitter`.
     fn compute_jitter_ms(&self, max_jitter: Duration) -> u64 {
         if max_jitter.is_zero() {
@@ -724,10 +751,7 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
 
         // Exponential backoff based on consecutive failures:
         // 1st: 100ms, 2nd: 200ms, 3rd: 400ms, 4th: 800ms, 5th: 1.6s ... capped at 30s
-        let exp = self.failure_count.saturating_sub(1).min(9) as u32;
-        let backoff = Duration::from_millis(100)
-            .saturating_mul(1 << exp)
-            .min(Duration::from_secs(30));
+        let backoff = self.failure_backoff_delay();
 
         let retry_delay = remaining_cooldown.max(backoff);
         let now = Instant::now();
@@ -995,6 +1019,7 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
         worker_tasks: &mut JoinSet<WorkerOutcome<T, E>>,
     ) {
         let in_cooldown = self.is_in_failure_cooldown();
+        let bg_throttled = self.is_background_refresh_throttled();
 
         // 1. Fresh or still usable resource
         if let Some(res) = &self.current_resource {
@@ -1007,11 +1032,11 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
                 };
 
                 if should_refresh && !self.refresh_in_flight {
-                    if in_cooldown {
+                    if bg_throttled {
                         tracing::debug!(
                             actor = %self.name,
                             instance = self.instance_id,
-                            "Resource approaching expiration, but cooldown is active; skipping background refresh."
+                            "Resource approaching expiration, but failure cooldown/backoff is active; skipping background refresh."
                         );
                     } else {
                         tracing::debug!(
@@ -1037,7 +1062,7 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
                 );
                 let _ = respond_to.send(Ok(res.value.clone()));
 
-                if !self.refresh_in_flight && !in_cooldown {
+                if !self.refresh_in_flight && !bg_throttled {
                     tracing::info!(
                         actor = %self.name,
                         instance = self.instance_id,

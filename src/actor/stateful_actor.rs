@@ -99,6 +99,15 @@ impl<A: StatefulActor> ActorContext<A> {
     }
 
     /// Returns a handle to the parent [`SupervisorHandle`] managing this actor.
+    ///
+    /// # Deadlock Warning
+    ///
+    /// Do **not** `.await` [`SupervisorHandle::shutdown`], [`SupervisorHandle::stop_child`],
+    /// or [`SupervisorHandle::delete_child`] (targeting this actor) directly from inside a
+    /// message handler: the supervisor waits for the current handler to return before completing
+    /// those operations, which will deadlock until the actor's [`super::model::ShutdownPolicy`]
+    /// timeout expires. Use [`SupervisorHandle::request_shutdown`] or [`ActorContext::stop`]
+    /// instead.
     pub fn supervisor(&self) -> &SupervisorHandle {
         &self.supervisor
     }
@@ -549,7 +558,14 @@ impl<A: StatefulActor> StatefulActorRunner<A> {
                     }
                 }
                 ActorEnvelope::Cast { msg } => {
-                    let _ = self.execute_cast(msg, ctx).await;
+                    if let Err(err) = self.execute_cast(msg, ctx).await {
+                        tracing::warn!(
+                            actor = %self.config.name,
+                            instance = self.instance_id,
+                            error = ?err,
+                            "StatefulActor cast handler returned error during shutdown drain."
+                        );
+                    }
                     if let ActorControl::Fail(reason) = &ctx.control {
                         return Err(reason.clone());
                     }
@@ -665,7 +681,14 @@ impl<A: StatefulActor> StatefulActorRunner<A> {
                         }
 
                         ActorEnvelope::Cast { msg } => {
-                            let _ = self.execute_cast(msg, &mut ctx).await;
+                            if let Err(err) = self.execute_cast(msg, &mut ctx).await {
+                                tracing::warn!(
+                                    actor = %self.config.name,
+                                    instance = self.instance_id,
+                                    error = ?err,
+                                    "StatefulActor cast handler returned error."
+                                );
+                            }
                             if !matches!(ctx.control, ActorControl::Continue) {
                                 self.receiver.close();
                             }

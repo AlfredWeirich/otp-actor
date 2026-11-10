@@ -756,7 +756,8 @@ async fn test_actor_worker_timeout() {
         .add_child(
             ResourceActor::builder("timeout-actor")
                 .worker(worker)
-                .worker_timeout(Duration::from_millis(60)),
+                .worker_timeout(Duration::from_millis(60))
+                .failure_cooldown(Duration::ZERO),
         )
         .spawn(&root)
         .await
@@ -1355,6 +1356,7 @@ async fn test_retry_storm_exponential_backoff() {
         .add_child(
             ResourceActor::builder("backoff-actor")
                 .worker(failing_worker)
+                .failure_cooldown(Duration::ZERO)
                 .proactive_refresh(true),
         )
         .spawn(&root)
@@ -3760,5 +3762,376 @@ async fn test_try_cast_mailbox_full_and_cast_timeout() {
     );
 
     let _ = active_call.await.unwrap().unwrap();
+    root.shutdown().await.unwrap();
+}
+
+// ============================================================================
+// Pre-Release Hardening Regression Tests (v0.3.0)
+// ============================================================================
+
+#[tokio::test]
+async fn test_default_failure_cooldown_fast_fails_second_call() {
+    let root = Supervisor::new("root");
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_clone = attempts.clone();
+
+    let client = ResourceActor::builder("default-cooldown-actor")
+        .worker(move |_ctx: WorkerContext| {
+            let a = attempts_clone.clone();
+            async move {
+                a.fetch_add(1, Ordering::SeqCst);
+                Err::<TimedResource<String>, _>("backend down".to_string())
+            }
+        })
+        .proactive_refresh(false)
+        .spawn(&root)
+        .await
+        .unwrap();
+
+    // First call triggers worker attempt #1 and fails
+    let err1 = client.get().await.unwrap_err();
+    assert!(matches!(err1, ResourceError::WorkerFailed(ref m) if m == "backend down"));
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+    // Immediate second call fast-fails within DEFAULT_FAILURE_COOLDOWN (1s) without invoking worker again
+    let err2 = client.get().await.unwrap_err();
+    assert!(matches!(err2, ResourceError::WorkerFailed(ref m) if m == "backend down"));
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        1,
+        "Default failure cooldown must prevent immediate duplicate worker execution"
+    );
+
+    root.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_stale_while_error_background_refresh_throttled_when_cooldown_zero() {
+    let root = Supervisor::new("root");
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_clone = attempts.clone();
+
+    let client = ResourceActor::builder("stale-throttle-actor")
+        .worker(move |ctx: WorkerContext| {
+            let a = attempts_clone.clone();
+            async move {
+                a.fetch_add(1, Ordering::SeqCst);
+                if ctx.generation == 1 {
+                    Ok::<_, String>(TimedResource::with_ttl(
+                        "cached-v1".to_string(),
+                        Duration::from_millis(80),
+                    ))
+                } else {
+                    Err("upstream error".to_string())
+                }
+            }
+        })
+        .failure_cooldown(Duration::ZERO)
+        .stale_while_error(Duration::from_secs(5))
+        .proactive_refresh(false)
+        .spawn(&root)
+        .await
+        .unwrap();
+
+    assert_eq!(client.get().await.unwrap(), "cached-v1");
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+    // Wait past the 80ms TTL so resource enters stale_while_error window
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Rapid concurrent/sequential calls while worker fails:
+    // Caller must get stale value immediately, and background refresh must be throttled
+    // by failure_backoff_delay (100ms) rather than spawning 1 worker per get() call.
+    for _ in 0..6 {
+        assert_eq!(client.get().await.unwrap(), "cached-v1");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        2,
+        "Expected only 1 background refresh attempt during 100ms failure backoff window"
+    );
+
+    root.shutdown().await.unwrap();
+}
+
+#[derive(Clone, Default)]
+struct SelfShutdownActor;
+
+impl StatefulActor for SelfShutdownActor {
+    type Message = ();
+    type Response = &'static str;
+    type Error = String;
+
+    async fn handle(
+        &mut self,
+        _msg: Self::Message,
+        ctx: &mut ActorContext<Self>,
+    ) -> Result<Self::Response, Self::Error> {
+        ctx.supervisor()
+            .request_shutdown()
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok("shutdown-requested")
+    }
+}
+
+#[tokio::test]
+async fn test_request_shutdown_from_actor_handler_does_not_deadlock() {
+    let root = Supervisor::new("root");
+    let sup = Supervisor::builder("self-stop-svc")
+        .shutdown_timeout(Duration::from_secs(5))
+        .spawn(&root)
+        .await
+        .unwrap();
+
+    let client = StatefulActorBuilder::from_default::<SelfShutdownActor>("trigger-actor")
+        .shutdown_timeout(Duration::from_secs(5))
+        .spawn(&sup)
+        .await
+        .unwrap();
+
+    let resp = tokio::time::timeout(Duration::from_millis(300), client.call(()))
+        .await
+        .expect("request_shutdown from inside handler must not deadlock")
+        .unwrap();
+    assert_eq!(resp, "shutdown-requested");
+
+    // Wait briefly for supervisor shutdown to finish tearing down the service supervisor
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        sup.resolve_child_channel_untyped("trigger-actor")
+            .await
+            .is_err()
+    );
+
+    root.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_factory_panic_returns_factory_panicked_and_allows_recovery() {
+    let root = Supervisor::new("root");
+
+    // 1. Boot-time factory panic sets child slot to FactoryPanicked and allows start_child / restart_child recovery
+    let should_panic = Arc::new(AtomicBool::new(true));
+    let flag_boot = should_panic.clone();
+    let boot_spec = ChildSpec::new(
+        "boot-panicker",
+        Arc::new(move |spawn_ctx| {
+            if flag_boot.load(Ordering::SeqCst) {
+                panic!("boot factory explosion");
+            }
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(4);
+            let mut shutdown_rx = spawn_ctx.shutdown_rx;
+            let handle = tokio::spawn(async move {
+                tokio::select! {
+                    _ = shutdown_rx.changed() => Ok(()),
+                    _ = rx.recv() => Ok(()),
+                }
+            });
+            (Arc::new(tx), handle)
+        }),
+        RestartPolicy::default(),
+    );
+
+    let sup = Supervisor::builder("boot-panic-svc")
+        .add_child(boot_spec)
+        .spawn(&root)
+        .await
+        .unwrap();
+
+    let boot_err = sup
+        .resolve_child_channel_untyped("boot-panicker")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            boot_err,
+            SupervisorError::FactoryPanicked(ref name, ref msg)
+                if name == "boot-panicker" && msg.contains("boot factory explosion")
+        ),
+        "Expected FactoryPanicked on boot panic, got {boot_err:?}"
+    );
+
+    // Recover the failed boot child via restart_child once panic condition is cleared
+    should_panic.store(false, Ordering::SeqCst);
+    sup.restart_child("boot-panicker")
+        .await
+        .expect("restart_child should recover boot-panicked child");
+    assert!(
+        sup.resolve_child_channel_untyped("boot-panicker")
+            .await
+            .is_ok()
+    );
+
+    // 2. Dynamic start_child factory panic returns Err(FactoryPanicked) immediately
+    let dyn_spec = ChildSpec::new(
+        "dyn-panicker",
+        Arc::new(|_spawn_ctx| -> (otp_actor::actor::UntypedSender, tokio::task::JoinHandle<otp_actor::actor::TaskResult>) {
+            panic!("dynamic start boom");
+        }),
+        RestartPolicy::default(),
+    );
+    let start_err = sup.start_child(dyn_spec).await.unwrap_err();
+    assert!(
+        matches!(
+            start_err,
+            SupervisorError::FactoryPanicked(ref name, ref msg)
+                if name == "dyn-panicker" && msg.contains("dynamic start boom")
+        ),
+        "Expected FactoryPanicked on start_child panic, got {start_err:?}"
+    );
+
+    // 3. Manual restart_child factory panic returns Err(FactoryPanicked) and allows start_child replacement
+    let restart_panic = Arc::new(AtomicBool::new(false));
+    let flag_restart = restart_panic.clone();
+    let flakey_spec = ChildSpec::new(
+        "flakey-child",
+        Arc::new(move |spawn_ctx| {
+            if flag_restart.load(Ordering::SeqCst) {
+                panic!("manual restart boom");
+            }
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(4);
+            let mut shutdown_rx = spawn_ctx.shutdown_rx;
+            let handle = tokio::spawn(async move {
+                tokio::select! {
+                    _ = shutdown_rx.changed() => Ok(()),
+                    _ = rx.recv() => Ok(()),
+                }
+            });
+            (Arc::new(tx), handle)
+        }),
+        RestartPolicy::default(),
+    );
+    sup.start_child(flakey_spec).await.unwrap();
+
+    restart_panic.store(true, Ordering::SeqCst);
+    let restart_err = sup.restart_child("flakey-child").await.unwrap_err();
+    assert!(
+        matches!(
+            restart_err,
+            SupervisorError::FactoryPanicked(ref name, ref msg)
+                if name == "flakey-child" && msg.contains("manual restart boom")
+        ),
+        "Expected FactoryPanicked on manual restart panic, got {restart_err:?}"
+    );
+
+    // Permanently failed child slot can be replaced directly via start_child with the same name
+    let replacement_spec = ChildSpec::new(
+        "flakey-child",
+        Arc::new(|spawn_ctx| {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(4);
+            let mut shutdown_rx = spawn_ctx.shutdown_rx;
+            let handle = tokio::spawn(async move {
+                tokio::select! {
+                    _ = shutdown_rx.changed() => Ok(()),
+                    _ = rx.recv() => Ok(()),
+                }
+            });
+            (Arc::new(tx), handle)
+        }),
+        RestartPolicy::default(),
+    );
+    sup.start_child(replacement_spec)
+        .await
+        .expect("start_child must allow replacing a permanently failed child");
+    assert!(
+        sup.resolve_child_channel_untyped("flakey-child")
+            .await
+            .is_ok()
+    );
+
+    root.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_factory_panic_during_auto_recovery_retries_and_escalates() {
+    let root = Supervisor::new("root");
+
+    // 1. Non-escalating supervisor retries factory panic up to max_restarts and marks FactoryPanicked
+    let factory_calls = Arc::new(AtomicUsize::new(0));
+    let calls_clone = factory_calls.clone();
+    let spec = ChildSpec::new(
+        "crash-then-panic",
+        Arc::new(move |_spawn_ctx| {
+            let n = calls_clone.fetch_add(1, Ordering::SeqCst);
+            if n > 0 {
+                panic!("factory crashed on attempt {n}");
+            }
+            let (tx, _rx) = tokio::sync::mpsc::channel::<()>(1);
+            let handle = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(15)).await;
+                Err("initial worker failure".to_string())
+            });
+            (Arc::new(tx), handle)
+        }),
+        RestartPolicy::new(2, Duration::from_secs(10))
+            .initial_backoff(Duration::from_millis(10))
+            .max_backoff(Duration::from_millis(20)),
+    );
+
+    let sup = Supervisor::builder("auto-panic-svc")
+        .add_child(spec)
+        .spawn(&root)
+        .await
+        .unwrap();
+
+    // Wait for initial crash + 2 retries + permanent failure
+    tokio::time::sleep(Duration::from_millis(180)).await;
+    // Initial spawn (n=0) + 2 allowed restarts (n=1, n=2) = 3 factory invocations
+    assert_eq!(factory_calls.load(Ordering::SeqCst), 3);
+
+    let err = sup
+        .resolve_child_channel_untyped("crash-then-panic")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            SupervisorError::FactoryPanicked(ref name, ref msg)
+                if name == "crash-then-panic" && msg.contains("factory crashed on attempt 2")
+        ),
+        "Expected FactoryPanicked after exhausting restart budget on factory panic, got {err:?}"
+    );
+
+    // 2. Escalating child supervisor propagates persistent factory panic to parent supervisor
+    let esc_calls = Arc::new(AtomicUsize::new(0));
+    let esc_clone = esc_calls.clone();
+    let esc_spec = ChildSpec::new(
+        "escalating-panicker",
+        Arc::new(move |_spawn_ctx| {
+            let n = esc_clone.fetch_add(1, Ordering::SeqCst);
+            if n > 0 {
+                panic!("escalating factory panic");
+            }
+            let (tx, _rx) = tokio::sync::mpsc::channel::<()>(1);
+            let handle = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(15)).await;
+                Err("trigger escalation".to_string())
+            });
+            (Arc::new(tx), handle)
+        }),
+        RestartPolicy::new(1, Duration::from_secs(10)).initial_backoff(Duration::ZERO),
+    );
+
+    let _child_sup = Supervisor::builder("escalating-sub-sup")
+        .escalate_on_failure(true)
+        .restart_policy(RestartPolicy::new(0, Duration::from_secs(10)))
+        .add_child(esc_spec)
+        .spawn(&root)
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    let parent_err = root
+        .resolve_child_channel_untyped("escalating-sub-sup")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(parent_err, SupervisorError::MaxRestartsExceeded(ref name, _, _) if name == "escalating-sub-sup"),
+        "Parent supervisor should detect child supervisor escalation, got {parent_err:?}"
+    );
+
     root.shutdown().await.unwrap();
 }

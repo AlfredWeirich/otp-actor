@@ -7,8 +7,10 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::time::Instant;
 
-/// Safety margin threshold: Asynchronous refresh requests are triggered before actual expiration.
-/// Set to 2 seconds for this demonstration (typically 5 minutes / 300s in production environments).
+/// Default safety margin before resource expiration when proactive background refresh is triggered (2 seconds).
+///
+/// Override per actor via [`super::generic_actor::ResourceActorBuilder::expiry_buffer`] for
+/// longer-lived credentials (e.g., 60–300 seconds for OAuth2 tokens).
 pub const EXPIRY_BUFFER: Duration = Duration::from_secs(2);
 
 /// Default grace period granted to an actor or child supervisor during graceful shutdown (5 seconds).
@@ -257,4 +259,6 @@ pub enum SupervisorError {
         "Child '{0}' exceeded maximum restart threshold ({1} restarts within {2:?}) and is permanently failed"
     )]
     MaxRestartsExceeded(String, usize, Duration),
+    #[error("Child '{0}' factory panicked during spawn: {1}")]
+    FactoryPanicked(String, String),
 }
