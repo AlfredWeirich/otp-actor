@@ -9,8 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use otp_actor::actor::{
-    ActorContext, RestartType, RootSupervisor, ServiceSupervisor, StatefulActor,
-    StatefulActorBuilder,
+    ActorContext, RestartType, StatefulActor, StatefulActorBuilder, Supervisor,
 };
 use otp_actor::remote::{
     ActorNodeHandle, ActorNodeRegistry, AnyActorClient, RemoteActorClient, RemoteActorError,
@@ -47,7 +46,7 @@ impl StatefulActor for CalculatorActor {
     async fn handle(
         &mut self,
         msg: Self::Message,
-        ctx: &mut ActorContext,
+        ctx: &mut ActorContext<Self>,
     ) -> Result<Self::Response, Self::Error> {
         match msg {
             CalcMsg::Add(n) => {
@@ -85,7 +84,7 @@ impl StatefulActor for CalculatorActor {
         }
     }
 
-    async fn on_stop(&mut self, _ctx: &mut ActorContext) {
+    async fn on_stop(&mut self, _ctx: &mut ActorContext<Self>) {
         self.stop_counter.fetch_add(1, Ordering::SeqCst);
     }
 }
@@ -97,8 +96,8 @@ impl StatefulActor for CalculatorActor {
 #[tokio::test]
 async fn test_remote_grpc_call_cast_and_errors()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let root = RootSupervisor::new();
-    let service = ServiceSupervisor::spawn_and_register("calc-service", &root).await?;
+    let root = Supervisor::new("root");
+    let service = Supervisor::builder("calc-service").spawn(&root).await?;
 
     let stop_counter = Arc::new(AtomicUsize::new(0));
     let actor_instance = CalculatorActor {
@@ -130,11 +129,14 @@ async fn test_remote_grpc_call_cast_and_errors()
     let res = remote_client.call(CalcMsg::Sub(15)).await?;
     assert_eq!(res, 110);
 
-    // 2. Remote cast
+    // 2. Remote cast & cast_timeout
     remote_client.cast(CalcMsg::Reset).await?;
+    remote_client
+        .cast_timeout(CalcMsg::Add(5), Duration::from_secs(2))
+        .await?;
     tokio::time::sleep(Duration::from_millis(50)).await;
     let res = remote_client.call(CalcMsg::Get).await?;
-    assert_eq!(res, 0);
+    assert_eq!(res, 5);
 
     // 3. Domain error propagation
     let err = remote_client.call(CalcMsg::Divide(0)).await;
@@ -182,8 +184,8 @@ async fn test_remote_grpc_call_cast_and_errors()
 #[tokio::test]
 async fn test_remote_grpc_actor_crash_and_self_healing()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let root = RootSupervisor::new();
-    let service = ServiceSupervisor::spawn_and_register("healing-service", &root).await?;
+    let root = Supervisor::new("root");
+    let service = Supervisor::builder("healing-service").spawn(&root).await?;
 
     let stop_counter = Arc::new(AtomicUsize::new(0));
     let actor_instance = CalculatorActor {
@@ -216,7 +218,7 @@ async fn test_remote_grpc_actor_crash_and_self_healing()
     let _ = remote_client.call(CalcMsg::Crash).await;
 
     // Immediately call without manual sleep: the server-side ActorClient transparently
-    // backs off, waits for ServiceSupervisor recovery, rebinds, and processes the message!
+    // waits on its watch slot for Supervisor recovery, rebinds, and processes the message!
     let res = remote_client.call(CalcMsg::Add(20)).await?;
     assert_eq!(res, 30);
 
@@ -231,8 +233,10 @@ async fn test_remote_grpc_actor_crash_and_self_healing()
 #[tokio::test]
 async fn test_location_transparency_any_client()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let root = RootSupervisor::new();
-    let service = ServiceSupervisor::spawn_and_register("transparency-service", &root).await?;
+    let root = Supervisor::new("root");
+    let service = Supervisor::builder("transparency-service")
+        .spawn(&root)
+        .await?;
 
     let stop_counter = Arc::new(AtomicUsize::new(0));
     let local_actor = CalculatorActor {
@@ -283,8 +287,8 @@ async fn test_location_transparency_any_client()
 
 #[tokio::test]
 async fn test_remote_grpc_call_timeout() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let root = RootSupervisor::new();
-    let service = ServiceSupervisor::spawn_and_register("timeout-service", &root).await?;
+    let root = Supervisor::new("root");
+    let service = Supervisor::builder("timeout-service").spawn(&root).await?;
 
     let stop_counter = Arc::new(AtomicUsize::new(0));
     let local_actor = CalculatorActor {
@@ -335,8 +339,8 @@ async fn test_remote_grpc_call_timeout() -> Result<(), Box<dyn std::error::Error
 #[tokio::test]
 async fn test_remote_grpc_2phase_graceful_shutdown_drains_inflight_call()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let root = RootSupervisor::new();
-    let service = ServiceSupervisor::spawn_and_register("drain-service", &root).await?;
+    let root = Supervisor::new("root");
+    let service = Supervisor::builder("drain-service").spawn(&root).await?;
 
     let stop_counter = Arc::new(AtomicUsize::new(0));
     let local_actor = CalculatorActor {
@@ -402,8 +406,10 @@ async fn test_remote_grpc_2phase_graceful_shutdown_drains_inflight_call()
 #[tokio::test]
 async fn test_remote_grpc_client_initiated_graceful_stop_transient()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let root = RootSupervisor::new();
-    let service = ServiceSupervisor::spawn_and_register("transient-service", &root).await?;
+    let root = Supervisor::new("root");
+    let service = Supervisor::builder("transient-service")
+        .spawn(&root)
+        .await?;
 
     let stop_counter = Arc::new(AtomicUsize::new(0));
     let local_actor = CalculatorActor {
@@ -460,15 +466,16 @@ async fn test_remote_grpc_client_initiated_graceful_stop_transient()
 #[tokio::test]
 async fn test_remote_trailing_bytes_and_drain_timeout_and_error_symmetry()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use bincode::Options;
     use otp_actor::actor::{RestartPolicy, ShutdownPolicy};
     use otp_actor::remote::ActorNodeClient;
     use otp_actor::remote::proto::CallRequest;
     use otp_actor::remote::proto::call_response::Result as CallResult;
     use otp_actor::remote::proto::remote_error::Kind;
 
-    let root = RootSupervisor::new();
-    let service = ServiceSupervisor::spawn_and_register("hardening-service", &root).await?;
+    let root = Supervisor::new("root");
+    let service = Supervisor::builder("hardening-service")
+        .spawn(&root)
+        .await?;
 
     let stop_counter = Arc::new(AtomicUsize::new(0));
     let actor_instance = CalculatorActor {
@@ -477,13 +484,11 @@ async fn test_remote_trailing_bytes_and_drain_timeout_and_error_symmetry()
     };
 
     let local_client = StatefulActorBuilder::from_instance("calc-hardened", actor_instance)
-        .restart_policy(RestartPolicy {
-            max_restarts: 0,
-            time_window: Duration::from_secs(10),
-            initial_backoff: Duration::from_millis(10),
-            max_backoff: Duration::from_millis(50),
-            backoff_multiplier: 2.0,
-        })
+        .restart_policy(
+            RestartPolicy::new(0, Duration::from_secs(10))
+                .initial_backoff(Duration::from_millis(10))
+                .max_backoff(Duration::from_millis(50)),
+        )
         .restart_type(RestartType::Permanent)
         .shutdown_policy(ShutdownPolicy::Timeout(Duration::from_millis(50)))
         .spawn(&service)
@@ -500,10 +505,7 @@ async fn test_remote_trailing_bytes_and_drain_timeout_and_error_symmetry()
     let endpoint_url = format!("http://{node_addr}");
 
     // 1. Verify trailing garbage bytes are rejected with Deserialization error ([L-1])
-    let mut payload = bincode::DefaultOptions::new()
-        .with_fixint_encoding()
-        .reject_trailing_bytes()
-        .serialize(&CalcMsg::Add(5))?;
+    let mut payload = postcard::to_stdvec(&CalcMsg::Add(5))?;
     payload.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
 
     let mut raw_client = ActorNodeClient::connect(endpoint_url.clone()).await?;
@@ -513,6 +515,7 @@ async fn test_remote_trailing_bytes_and_drain_timeout_and_error_symmetry()
             actor_name: "calc-hardened".into(),
             payload,
             timeout_ms: None,
+            protocol_version: otp_actor::remote::REMOTE_PROTOCOL_VERSION,
         })
         .await?
         .into_inner();
@@ -544,12 +547,12 @@ async fn test_remote_trailing_bytes_and_drain_timeout_and_error_symmetry()
     let local_err = any_local.call(CalcMsg::Get).await;
     let remote_err = any_remote.call(CalcMsg::Get).await;
     assert!(
-        matches!(local_err, Err(RemoteActorError::ActorUnavailable)),
-        "Expected Local AnyActorClient to map MaxRestartsExceeded to ActorUnavailable, got {local_err:?}"
+        matches!(local_err, Err(RemoteActorError::MaxRestartsExceeded(_))),
+        "Expected Local AnyActorClient to map MaxRestartsExceeded to MaxRestartsExceeded, got {local_err:?}"
     );
     assert!(
-        matches!(remote_err, Err(RemoteActorError::ActorUnavailable)),
-        "Expected Remote AnyActorClient to map MaxRestartsExceeded to ActorUnavailable, got {remote_err:?}"
+        matches!(remote_err, Err(RemoteActorError::MaxRestartsExceeded(_))),
+        "Expected Remote AnyActorClient to map MaxRestartsExceeded to MaxRestartsExceeded, got {remote_err:?}"
     );
 
     // 3. Recover actor and verify Phase-1 drain timeout bounds hung RPCs ([M-1])
@@ -569,4 +572,197 @@ async fn test_remote_trailing_bytes_and_drain_timeout_and_error_symmetry()
         .expect("Shutdown timed out despite drain_timeout")?;
 
     Ok(())
+}
+
+// ============================================================================
+// In-Process Unit Tests for gRPC Service Hardening (No TCP Sockets Required)
+// ============================================================================
+
+#[tokio::test]
+async fn test_service_protocol_version_and_unknown_error_mapping() {
+    use otp_actor::remote::proto::call_response::Result as CallResult;
+    use otp_actor::remote::proto::remote_error::Kind;
+    use otp_actor::remote::proto::{ActorNode, CallRequest, CastRequest, RemoteError};
+    use otp_actor::remote::{ActorNodeService, REMOTE_PROTOCOL_VERSION};
+
+    let registry = ActorNodeRegistry::new();
+    let service = ActorNodeService::new(registry);
+
+    // 1. Incompatible protocol version on Call returns Kind::IncompatibleProtocol
+    let resp = service
+        .call(tonic::Request::new(CallRequest {
+            service_name: "svc".into(),
+            actor_name: "act".into(),
+            payload: Vec::new(),
+            timeout_ms: None,
+            protocol_version: REMOTE_PROTOCOL_VERSION + 42,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+
+    match resp.result {
+        Some(CallResult::FrameworkError(err)) => {
+            assert_eq!(err.kind, Kind::IncompatibleProtocol as i32);
+            let mapped = RemoteActorError::<String>::from(err);
+            assert!(
+                matches!(mapped, RemoteActorError::IncompatibleProtocol(ref m) if m.contains("Unsupported protocol version")),
+                "Expected IncompatibleProtocol, got {mapped:?}"
+            );
+        }
+        other => panic!("Expected IncompatibleProtocol framework error, got {other:?}"),
+    }
+
+    // 2. Incompatible protocol version on Cast returns Kind::IncompatibleProtocol
+    let cast_resp = service
+        .cast(tonic::Request::new(CastRequest {
+            service_name: "svc".into(),
+            actor_name: "act".into(),
+            payload: Vec::new(),
+            timeout_ms: None,
+            protocol_version: 0,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+
+    let err = cast_resp
+        .framework_error
+        .expect("Expected framework_error on version mismatch");
+    assert_eq!(err.kind, Kind::IncompatibleProtocol as i32);
+
+    // 3. Unrecognized future RemoteError.kind maps to RemoteActorError::Unknown (not ActorPanic)
+    let unknown_mapped = RemoteActorError::<String>::from(RemoteError {
+        kind: 9999,
+        message: "future error variant".into(),
+    });
+    assert!(
+        matches!(
+            unknown_mapped,
+            RemoteActorError::Unknown { kind: 9999, ref message } if message == "future error variant"
+        ),
+        "Expected Unknown error variant, got {unknown_mapped:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_service_authorizer_label_sanitization_and_timeout_clamping() {
+    use otp_actor::remote::proto::call_response::Result as CallResult;
+    use otp_actor::remote::proto::remote_error::Kind;
+    use otp_actor::remote::proto::{ActorNode, CallRequest};
+    use otp_actor::remote::{ActorNodeService, REMOTE_PROTOCOL_VERSION};
+
+    let root = Supervisor::new("root");
+    let svc = Supervisor::builder("auth-svc").spawn(&root).await.unwrap();
+    let calc = StatefulActorBuilder::from_default::<CalculatorActor>("calc")
+        .spawn(&svc)
+        .await
+        .unwrap();
+
+    let registry = ActorNodeRegistry::new();
+    registry.register("auth-svc", "calc", calc);
+
+    let service = ActorNodeService::new(registry)
+        .with_max_request_timeout(Some(Duration::from_millis(40)))
+        .with_authorizer(Arc::new(|metadata, _ext, _svc, _actor| {
+            match metadata.get("authorization") {
+                Some(val) if val == "Bearer secret-token" => Ok(()),
+                _ => Err(tonic::Status::unauthenticated("missing or invalid token")),
+            }
+        }));
+
+    let get_payload = postcard::to_stdvec(&CalcMsg::Get).unwrap();
+
+    // 1. Unauthenticated request is rejected before routing
+    let unauth_err = service
+        .call(tonic::Request::new(CallRequest {
+            service_name: "auth-svc".into(),
+            actor_name: "calc".into(),
+            payload: get_payload.clone(),
+            timeout_ms: None,
+            protocol_version: REMOTE_PROTOCOL_VERSION,
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(unauth_err.code(), tonic::Code::Unauthenticated);
+
+    // 2. Authenticated request succeeds
+    let mut auth_req = tonic::Request::new(CallRequest {
+        service_name: "auth-svc".into(),
+        actor_name: "calc".into(),
+        payload: get_payload,
+        timeout_ms: None,
+        protocol_version: REMOTE_PROTOCOL_VERSION,
+    });
+    auth_req
+        .metadata_mut()
+        .insert("authorization", "Bearer secret-token".parse().unwrap());
+    let ok_resp = service.call(auth_req).await.unwrap().into_inner();
+    assert!(matches!(ok_resp.result, Some(CallResult::OkPayload(_))));
+
+    // 3. Control characters & long untrusted names are sanitized in ServiceNotFound/ActorNotFound
+    let long_evil_service = format!("evil\n\r\x1b[31m{}", "x".repeat(200));
+    let mut evil_req = tonic::Request::new(CallRequest {
+        service_name: long_evil_service,
+        actor_name: "calc".into(),
+        payload: Vec::new(),
+        timeout_ms: None,
+        protocol_version: REMOTE_PROTOCOL_VERSION,
+    });
+    evil_req
+        .metadata_mut()
+        .insert("authorization", "Bearer secret-token".parse().unwrap());
+    let evil_resp = service.call(evil_req).await.unwrap().into_inner();
+    match evil_resp.result {
+        Some(CallResult::FrameworkError(err)) => {
+            assert_eq!(err.kind, Kind::ServiceNotFound as i32);
+            assert!(!err.message.contains('\n'));
+            assert!(!err.message.contains('\r'));
+            assert!(!err.message.contains('\x1b'));
+            assert!(err.message.ends_with('…'));
+        }
+        other => panic!("Expected sanitized ServiceNotFound error, got {other:?}"),
+    }
+
+    // 4. Server clamps excessive client timeout_ms via max_request_timeout (40ms)
+    let delay_payload = postcard::to_stdvec(&CalcMsg::Delay(Duration::from_secs(5))).unwrap();
+    let mut slow_req = tonic::Request::new(CallRequest {
+        service_name: "auth-svc".into(),
+        actor_name: "calc".into(),
+        payload: delay_payload,
+        timeout_ms: Some(60_000),
+        protocol_version: REMOTE_PROTOCOL_VERSION,
+    });
+    slow_req
+        .metadata_mut()
+        .insert("authorization", "Bearer secret-token".parse().unwrap());
+
+    let start = std::time::Instant::now();
+    let timeout_resp = service.call(slow_req).await.unwrap().into_inner();
+    assert!(
+        start.elapsed() < Duration::from_millis(300),
+        "Server max_request_timeout should have clamped 60s request to 40ms"
+    );
+    match timeout_resp.result {
+        Some(CallResult::FrameworkError(err)) => {
+            assert_eq!(err.kind, Kind::Timeout as i32);
+        }
+        other => panic!("Expected Timeout framework error, got {other:?}"),
+    }
+
+    // 5. Tonic Status timeout mapping distinguishes timeout vs plain cancellation
+    assert!(matches!(
+        RemoteActorError::<String>::from(tonic::Status::deadline_exceeded("deadline")),
+        RemoteActorError::Timeout
+    ));
+    assert!(matches!(
+        RemoteActorError::<String>::from(tonic::Status::cancelled("Timeout expired")),
+        RemoteActorError::Timeout
+    ));
+    assert!(matches!(
+        RemoteActorError::<String>::from(tonic::Status::cancelled("user cancelled")),
+        RemoteActorError::Transport(_)
+    ));
+
+    root.shutdown().await.unwrap();
 }

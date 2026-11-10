@@ -11,7 +11,7 @@
 mod common;
 
 use common::{AccountMsg, BankAccountActor};
-use otp_actor::actor::{RestartType, RootSupervisor, ServiceSupervisor, StatefulActorBuilder};
+use otp_actor::actor::{RestartType, StatefulActorBuilder, Supervisor};
 use otp_actor::remote::{ActorNodeHandle, ActorNodeRegistry, RemoteActorClient, RemoteActorError};
 use std::net::SocketAddr;
 
@@ -31,8 +31,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // ------------------------------------------------------------------------
     // Step 1: Initialize Supervision Tree on Server Node
     // ------------------------------------------------------------------------
-    let root = RootSupervisor::new();
-    let service = ServiceSupervisor::spawn_and_register("banking-service", &root).await?;
+    let root = Supervisor::new("root");
+    let service = Supervisor::builder("banking-service").spawn(&root).await?;
 
     let initial_account = BankAccountActor {
         account_id: "ACC-9876".into(),
@@ -104,7 +104,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let _ = remote_client.call(AccountMsg::SimulateCrash).await;
 
     println!("[Client] Immediately dispatching new request over the existing gRPC channel...");
-    // The server-side ActorClient automatically backs off, waits for ServiceSupervisor
+    // The server-side ActorClient automatically waits on its watch slot for Supervisor
     // to re-spawn the actor with initial state (1000), rebinds, and processes the deposit!
     let resurrected_balance = remote_client.call(AccountMsg::Deposit(250)).await?;
     println!(
@@ -127,7 +127,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Wait a brief tick for actor exit event to be processed by supervisor
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    // Verify actor is now dead and ServiceSupervisor (RestartType::Transient) did not resurrect it!
+    // Verify actor is now dead and Supervisor (RestartType::Transient) did not resurrect it!
     match remote_client.call(AccountMsg::GetBalance).await {
         Err(RemoteActorError::ActorNotFound(_) | RemoteActorError::ActorUnavailable) => {
             println!(

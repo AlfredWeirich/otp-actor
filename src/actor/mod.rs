@@ -1,29 +1,29 @@
 //! # Hierarchical OTP Supervision Tree & Actor System
 //!
 //! Provides a resilient, multi-level actor framework modeled after Erlang/OTP principles:
-//! - **Control Plane**: [`RootSupervisor`] and [`ServiceSupervisor`] managing lifecycle,
+//! - **Control Plane**: Recursive [`Supervisor`] managing lifecycle,
 //!   supervision strategies ([`SupervisionStrategy::OneForOne`], [`SupervisionStrategy::OneForAll`],
 //!   [`SupervisionStrategy::RestForOne`]), restart rules ([`RestartType`]), bounded shutdown policies
 //!   ([`ShutdownPolicy`]), rate-limited exponential backoff ([`RestartPolicy`], [`RestartTracker`]),
-//!   and hierarchical subtree recovery.
+//!   and arbitrary-depth subtree recovery.
 //! - **Data Plane**: [`ResourceClient`] and [`ActorClient`] communicating directly with
-//!   [`GenericResourceActor`] and [`StatefulActor`] over 1-hop bounded channels with zero
-//!   supervisor overhead in the hot path, transparent channel rebinding across actor and supervisor
+//!   [`ResourceActor`] and [`StatefulActor`] over 0-hop `watch` caches and 1-hop bounded channels with zero
+//!   supervisor overhead in the hot path, reactive zero-polling channel rebinding across actor and supervisor
 //!   restarts, proactive cache refreshes, and zero-cost worker execution via native `impl Future`.
 //!
-//! ## Example: Generic Resource Actor
+//! ## Example: Resource Actor
 //! ```rust
 //! use std::time::Duration;
 //! use otp_actor::actor::{
-//!     GenericResourceActor, RootSupervisor, ServiceSupervisor, TimedResource, WorkerContext,
+//!     ResourceActor, Supervisor, TimedResource, WorkerContext,
 //! };
 //!
 //! # #[tokio::main(flavor = "current_thread")]
 //! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! let root = RootSupervisor::new();
-//! let service = ServiceSupervisor::spawn_and_register("auth-service", &root).await?;
+//! let root = Supervisor::new_root();
+//! let service = Supervisor::spawn_child("auth-service", &root).await?;
 //!
-//! let client = GenericResourceActor::builder("api-token")
+//! let client = ResourceActor::builder("api-token")
 //!     .worker(|ctx: WorkerContext| async move {
 //!         Ok::<_, String>(TimedResource::with_ttl(
 //!             format!("token-gen-{}", ctx.generation),
@@ -42,8 +42,7 @@
 //! ## Example: Stateful Actor (`gen_server` style)
 //! ```rust
 //! use otp_actor::actor::{
-//!     ActorContext, RestartType, RootSupervisor, ServiceSupervisor,
-//!     StatefulActor, StatefulActorBuilder,
+//!     ActorContext, RestartType, StatefulActor, StatefulActorBuilder, Supervisor,
 //! };
 //!
 //! #[derive(Clone, Default)]
@@ -64,7 +63,7 @@
 //!     async fn handle(
 //!         &mut self,
 //!         msg: Self::Message,
-//!         _ctx: &mut ActorContext,
+//!         _ctx: &mut ActorContext<Self>,
 //!     ) -> Result<Self::Response, Self::Error> {
 //!         match msg {
 //!             RegistryMsg::Insert(item) => {
@@ -78,8 +77,8 @@
 //!
 //! # #[tokio::main(flavor = "current_thread")]
 //! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! let root = RootSupervisor::new();
-//! let service = ServiceSupervisor::spawn_and_register("registry-service", &root).await?;
+//! let root = Supervisor::new_root();
+//! let service = Supervisor::spawn_child("registry-service", &root).await?;
 //!
 //! let client = StatefulActorBuilder::from_default::<RegistryActor>("registry")
 //!     .restart_type(RestartType::Permanent)
@@ -97,26 +96,23 @@
 
 pub mod generic_actor;
 pub mod model;
-pub mod root_supervisor;
-pub mod service_supervisor;
 pub mod stateful_actor;
+pub mod supervisor;
 
 // Re-export primary types for a convenient public API
 pub use generic_actor::{
-    ActorBuilder, ActorConfig, DEFAULT_WORKER_TIMEOUT, GenericResourceActor,
-    GenericResourceActorBuilder, ResourceClient, ResourceError, TimedResource, Worker,
-    WorkerContext,
+    DEFAULT_FAILURE_COOLDOWN, DEFAULT_WORKER_TIMEOUT, ResourceActor, ResourceActorBuilder,
+    ResourceActorConfig, ResourceClient, ResourceError, TimedResource, Worker, WorkerContext,
 };
 pub use model::{
-    DEFAULT_SHUTDOWN_TIMEOUT, EXPIRY_BUFFER, RestartPolicy, RestartTracker, RestartType, RootError,
-    ServiceError, ShutdownPolicy, SupervisionStrategy, TaskResult,
-};
-pub use root_supervisor::{RootSupervisor, RootSupervisorHandle};
-pub use service_supervisor::{
-    ChildSpec, ServiceSupervisor, ServiceSupervisorBuilder, ServiceSupervisorHandle,
-    ShutdownSignalFn, UntypedActorFactory, UntypedSender,
+    DEFAULT_SHUTDOWN_TIMEOUT, EXPIRY_BUFFER, RestartPolicy, RestartTracker, RestartType,
+    ShutdownPolicy, SupervisionStrategy, SupervisorError, TaskResult,
 };
 pub use stateful_actor::{
-    ActorClient, ActorContext, ActorControl, ActorError, StatefulActor, StatefulActorBuilder,
-    StatefulActorConfig,
+    ActorClient, ActorContext, ActorControl, ActorError, CallMessage, StatefulActor,
+    StatefulActorBuilder, StatefulActorConfig,
+};
+pub use supervisor::{
+    ChildSpec, ShutdownSignalFn, SlotState, SpawnContext, Supervisor, SupervisorBuilder,
+    SupervisorHandle, UntypedActorFactory, UntypedSender,
 };

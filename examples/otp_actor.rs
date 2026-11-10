@@ -1,18 +1,18 @@
 //! # Hierarchical Supervision Tree Demo Application
 //!
 //! Demonstrates the OTP-modeled supervision architecture:
-//! - **Autonomous Service Self-Registration**: Services register with the RootSupervisor;
-//!   child actors are spawned and supervised via ChildSpecs under the ServiceSupervisor.
+//! - **Unified Recursive Supervision**: Supervisors register under parent Supervisors;
+//!   child actors are spawned and supervised via ChildSpecs under any Supervisor.
 //! - **Generic Worker Trait**: Pure decoupled actors powered by custom structs or async closures (Zero `Box::pin`!).
-//! - **Control Plane & Data Plane Decoupling**: Clients talk directly to actors (1-hop channel).
+//! - **Control Plane & Data Plane Decoupling**: Clients talk directly to actors (0-hop watch cache & 1-hop channel).
 //! - **Transparent Client Self-Healing**: Transparently recovers across worker crashes and supervisor restarts.
 
 use std::time::Duration;
 use tokio::time::Instant;
 
 use otp_actor::actor::{
-    GenericResourceActor, RestartPolicy, RootSupervisor, ServiceSupervisor, SupervisionStrategy,
-    TimedResource, Worker, WorkerContext,
+    ResourceActor, RestartPolicy, SupervisionStrategy, Supervisor, TimedResource, Worker,
+    WorkerContext,
 };
 
 // ============================================================================
@@ -115,31 +115,28 @@ async fn main() {
         .init();
 
     println!("========================================================");
-    println!("Supervision Tree with Autonomous Self-Registration");
-    println!("  RootSupervisor <- ServiceSupervisor <- Dynamic Actors");
+    println!("Supervision Tree with Recursive Supervisors");
+    println!("  Supervisor ('root') <- Supervisor ('gcp-auth-service') <- Actors");
     println!("========================================================\n");
 
     // ------------------------------------------------------------------
-    // Phase 1: Bootstrapping Root Supervisor & Service Self-Registration
+    // Phase 1: Bootstrapping Root Supervisor & Child Service Supervisor
     // ------------------------------------------------------------------
     println!("-------------------------------------------------------------------------");
-    println!("--- Phase 1: Root Supervisor & Service Self-Registration ---");
+    println!("--- Phase 1: Root Supervisor & Child Service Supervisor ---");
     println!("-------------------------------------------------------------------------");
 
-    let root_supervisor = RootSupervisor::new();
+    let root_supervisor = Supervisor::new("root");
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // The ServiceSupervisor starts itself and registers autonomously with the RootSupervisor!
-    println!(
-        "-> ServiceSupervisor 'gcp-auth-service' boots and registers ITSELF with RootSupervisor..."
-    );
-    let auth_service_supervisor =
-        ServiceSupervisor::spawn_and_register("gcp-auth-service", &root_supervisor)
-            .await
-            .expect("Failed to self-register service supervisor");
+    println!("-> Child Supervisor 'gcp-auth-service' boots under root Supervisor...");
+    let auth_service_supervisor = Supervisor::builder("gcp-auth-service")
+        .spawn(&root_supervisor)
+        .await
+        .expect("Failed to spawn service supervisor");
 
     tokio::time::sleep(Duration::from_millis(50)).await;
-    println!("-> ServiceSupervisor successfully connected to RootSupervisor.\n");
+    println!("-> Child Supervisor successfully connected to root Supervisor.\n");
 
     // ------------------------------------------------------------------
     // Phase 2: Autonomous Actor Registration with Injected Workers
@@ -155,21 +152,21 @@ async fn main() {
     let storage_worker = GcpTokenWorker {
         scope: "gcp-storage".to_string(),
     };
-    let storage_client = GenericResourceActor::builder("gcp-storage")
-        .worker(storage_worker) // <-- Worker Struct injected from the outside!
+    let storage_client = ResourceActor::builder("gcp-storage")
+        .worker(storage_worker)
         .eager_prewarm(true)
-        .spawn_and_register(&auth_service_supervisor, &root_supervisor)
+        .spawn(&auth_service_supervisor)
         .await
-        .expect("Failed to self-register gcp-storage actor");
+        .expect("Failed to register gcp-storage actor");
 
     // Actor 2: Injected Worker async function (Lazy / Cold Start)
     println!("-> Actor 'gcp-bigquery' boots with worker async function (Pre-Warm: DISABLED)...");
-    let bigquery_client = GenericResourceActor::builder("gcp-bigquery")
-        .worker(gcp_bigquery_worker) // <-- Zero-allocation standalone async function!
+    let bigquery_client = ResourceActor::builder("gcp-bigquery")
+        .worker(gcp_bigquery_worker)
         .eager_prewarm(false)
-        .spawn_and_register(&auth_service_supervisor, &root_supervisor)
+        .spawn(&auth_service_supervisor)
         .await
-        .expect("Failed to self-register gcp-bigquery actor");
+        .expect("Failed to register gcp-bigquery actor");
 
     // Actor 3: Completely custom generic worker closure (e.g. dynamic Database Secret rotator)
     println!("-> Actor 'billing-db' boots with custom DB rotator closure...");
@@ -184,13 +181,13 @@ async fn main() {
         ))
     };
 
-    let db_client = GenericResourceActor::builder("billing-db")
-        .worker(db_worker) // <-- Zero-allocation inline async closure!
+    let db_client = ResourceActor::builder("billing-db")
+        .worker(db_worker)
         .expiry_buffer(Duration::from_secs(2))
         .channel_capacity(128)
-        .spawn_and_register(&auth_service_supervisor, &root_supervisor)
+        .spawn(&auth_service_supervisor)
         .await
-        .expect("Failed to self-register billing-db actor");
+        .expect("Failed to register billing-db actor");
 
     // Allow 350ms so that the eager pre-warming background fetch for 'gcp-storage' completes!
     tokio::time::sleep(Duration::from_millis(350)).await;
@@ -231,7 +228,7 @@ async fn main() {
         mask_secret(&db_conn)
     );
 
-    // Subsequent direct query to BigQuery: Instant Cache Hit (bypasses supervisor completely)
+    // Subsequent direct query to BigQuery: Instant Cache Hit (bypasses supervisor & mailbox completely)
     let bq_cache_start = Instant::now();
     let cached_bq = bigquery_client.get().await.unwrap();
     println!(
@@ -251,7 +248,7 @@ async fn main() {
     println!("-------------------------------------------------------------------------");
     let _ = storage_client.simulate_crash().await;
 
-    // Allow 80ms for ServiceSupervisor to catch panic and respawn 'gcp-storage' #2
+    // Allow 80ms for Supervisor to catch panic and respawn 'gcp-storage' #2
     tokio::time::sleep(Duration::from_millis(80)).await;
 
     // Verify Sibling Resilience: 'gcp-bigquery' was NEVER interrupted!
@@ -275,24 +272,20 @@ async fn main() {
     );
 
     // ------------------------------------------------------------------
-    // Phase 5: Service-Supervisor Crash & Root-Supervisor Auto-Restart
+    // Phase 5: Child-Supervisor Crash & Parent-Supervisor Auto-Restart
     // ------------------------------------------------------------------
     println!("-------------------------------------------------------------------------");
-    println!("--- Phase 5: Service-Supervisor Crash & Hierarchical Subtree Restart ---");
-    println!("-> Injecting crash command into ServiceSupervisor 'gcp-auth-service' via Root...");
+    println!("--- Phase 5: Child-Supervisor Crash & Hierarchical Subtree Restart ---");
+    println!("-> Injecting crash command into child Supervisor 'gcp-auth-service' via Root...");
     println!("-------------------------------------------------------------------------");
 
     let _ = root_supervisor
-        .trigger_service_crash("gcp-auth-service")
+        .trigger_child_crash("gcp-auth-service")
         .await;
 
-    // Allow 80ms for RootSupervisor to intercept panic and spawn ServiceSupervisor #2
+    // Allow 80ms for root Supervisor to intercept panic and spawn child Supervisor #2
     tokio::time::sleep(Duration::from_millis(80)).await;
 
-    // Verify OTP Subtree Recovery & Transparent Client Rebinding:
-    // In OTP, dropping the supervisor terminates its child actors cleanly. ServiceSupervisor #2
-    // boots replacement child actors from ChildSpecs. Clients detect the closed channel,
-    // automatically rebind to the replacement actors, and complete queries transparently!
     println!(
         "\n-> Verifying Transparent Rebind: Clients query actors across supervisor restart..."
     );
@@ -334,21 +327,20 @@ async fn main() {
     // ------------------------------------------------------------------
     println!("-------------------------------------------------------------------------");
     println!("--- Phase 6: Restored Subtree Active & Self-Healing Operational ---");
-    println!("-> Verifying that ServiceSupervisor #2 supervises its replacement actors...");
+    println!("-> Verifying that child Supervisor #2 supervises its replacement actors...");
     println!("-------------------------------------------------------------------------");
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     println!(
-        "\n-> Verifying Restored Supervision: Injecting crash into 'gcp-storage' under ServiceSupervisor #2..."
+        "\n-> Verifying Restored Supervision: Injecting crash into 'gcp-storage' under child Supervisor #2..."
     );
     let _ = storage_client.simulate_crash().await;
 
-    // Allow 80ms for restored ServiceSupervisor #2 to detect the crash and restart 'gcp-storage' #3!
+    // Allow 80ms for restored child Supervisor #2 to detect the crash and restart 'gcp-storage' #3!
     tokio::time::sleep(Duration::from_millis(80)).await;
 
-    // Client requests token: transparent rebind to 'gcp-storage' #3 under ServiceSupervisor #2!
     println!(
-        "\n-> Verifying Self-Healing under restored ServiceSupervisor #2: Calling storage_client.get()..."
+        "\n-> Verifying Self-Healing under restored child Supervisor #2: Calling storage_client.get()..."
     );
     let storage_p6_start = Instant::now();
     let storage_p6_token = storage_client.get().await.unwrap();
@@ -385,18 +377,15 @@ async fn main() {
         ))
     };
 
-    let strict_policy = RestartPolicy {
-        max_restarts: 2,
-        time_window: Duration::from_secs(5),
-        initial_backoff: Duration::from_millis(50),
-        max_backoff: Duration::from_millis(500),
-        backoff_multiplier: 2.0,
-    };
+    let strict_policy = RestartPolicy::new(2, Duration::from_secs(5))
+        .initial_backoff(Duration::from_millis(50))
+        .max_backoff(Duration::from_millis(500))
+        .backoff_multiplier(2.0);
 
-    let unstable_client = GenericResourceActor::builder("unstable-worker")
+    let unstable_client = ResourceActor::builder("unstable-worker")
         .worker(unstable_worker)
         .restart_policy(strict_policy)
-        .spawn_and_register(&auth_service_supervisor, &root_supervisor)
+        .spawn(&auth_service_supervisor)
         .await
         .expect("Failed to spawn unstable-worker");
 
@@ -463,15 +452,13 @@ async fn main() {
     println!("--- Phase 8: Dependent Actors & One-for-All Supervision ---");
     println!("--------------------------------------------------------");
     println!(
-        "-> Booting a dedicated ServiceSupervisor 'order-pipeline' with SupervisionStrategy::OneForAll..."
+        "-> Booting a dedicated child Supervisor 'order-pipeline' with SupervisionStrategy::OneForAll..."
     );
-    let pipeline_supervisor = ServiceSupervisor::spawn_and_register_with_strategy(
-        "order-pipeline",
-        SupervisionStrategy::OneForAll,
-        &root_supervisor,
-    )
-    .await
-    .expect("Failed to register order-pipeline supervisor");
+    let pipeline_supervisor = Supervisor::builder("order-pipeline")
+        .strategy(SupervisionStrategy::OneForAll)
+        .spawn(&root_supervisor)
+        .await
+        .expect("Failed to register order-pipeline supervisor");
 
     println!("-> Registering 2 dependent actors under 'order-pipeline':");
     println!("   1. 'session-mgr' (manages stateful session)");
@@ -490,15 +477,15 @@ async fn main() {
         )))
     };
 
-    let session_client = GenericResourceActor::builder("session-mgr")
+    let session_client = ResourceActor::builder("session-mgr")
         .worker(session_worker)
-        .spawn_and_register(&pipeline_supervisor, &root_supervisor)
+        .spawn(&pipeline_supervisor)
         .await
         .expect("Failed to spawn session-mgr");
 
-    let cache_client = GenericResourceActor::builder("order-cache")
+    let cache_client = ResourceActor::builder("order-cache")
         .worker(cache_worker)
-        .spawn_and_register(&pipeline_supervisor, &root_supervisor)
+        .spawn(&pipeline_supervisor)
         .await
         .expect("Failed to spawn order-cache");
 

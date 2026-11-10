@@ -10,6 +10,26 @@ use crate::remote::proto::remote_error::Kind;
 
 type EndpointMap = HashMap<String, HashMap<String, Arc<dyn ByteEndpoint>>>;
 
+pub(crate) const MAX_LABEL_CHARS: usize = 128;
+
+/// Sanitizes untrusted service/actor labels before placing them in logs or error messages:
+/// replaces control characters (`\n`, `\r`, ANSI escapes) with `'?'` and truncates overly long strings.
+pub(crate) fn sanitize_label(input: &str) -> String {
+    let mut out = String::with_capacity(input.len().min(MAX_LABEL_CHARS));
+    let mut chars = input.chars();
+    for ch in chars.by_ref().take(MAX_LABEL_CHARS) {
+        if ch.is_control() {
+            out.push('?');
+        } else {
+            out.push(ch);
+        }
+    }
+    if chars.next().is_some() {
+        out.push('…');
+    }
+    out
+}
+
 /// Registry that routes incoming gRPC calls to local actors.
 #[derive(Clone, Default)]
 pub struct ActorNodeRegistry {
@@ -110,12 +130,16 @@ impl ActorNodeRegistry {
                 Some(ep) => Ok(ep.clone()),
                 None => Err(RemoteError {
                     kind: Kind::ActorNotFound as i32,
-                    message: format!("{service_name}/{actor_name}"),
+                    message: format!(
+                        "{}/{}",
+                        sanitize_label(service_name),
+                        sanitize_label(actor_name)
+                    ),
                 }),
             },
             None => Err(RemoteError {
                 kind: Kind::ServiceNotFound as i32,
-                message: service_name.to_string(),
+                message: sanitize_label(service_name),
             }),
         }
     }

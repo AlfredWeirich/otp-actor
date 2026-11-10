@@ -17,8 +17,11 @@ pub mod registry;
 pub mod server;
 
 pub use client::{AnyActorClient, RemoteActorClient};
-pub use endpoint::ByteEndpoint;
-pub use error::RemoteActorError;
+pub use endpoint::{ByteEndpoint, REMOTE_PROTOCOL_VERSION};
+pub use error::{RemoteActorError, RemoteNodeError};
 pub use proto::{ActorNodeClient, ActorNodeServer};
 pub use registry::ActorNodeRegistry;
-pub use server::{ActorNodeHandle, ActorNodeService, DEFAULT_DRAIN_TIMEOUT};
+pub use server::{
+    ActorNodeBuilder, ActorNodeHandle, ActorNodeService, Authorizer, DEFAULT_DRAIN_TIMEOUT,
+    DEFAULT_REMOTE_CALL_TIMEOUT, MAX_REMOTE_REQUEST_TIMEOUT,
+};

@@ -1,17 +1,19 @@
 //! # Domain Models and Supervision Tree Protocol Definitions
 //!
-//! Defines the core data structures, error types, commands, and restart policies
-//! utilized across the multi-level supervision hierarchy (Root -> Service -> Actors).
+//! Defines the core data structures, error types, and restart policies
+//! utilized across the recursive supervision hierarchy (`Supervisor` -> child `Supervisor`s / actors).
 
 use std::time::Duration;
 use thiserror::Error;
 use tokio::time::Instant;
 
-/// Safety margin threshold: Asynchronous refresh requests are triggered before actual expiration.
-/// Set to 2 seconds for this demonstration (typically 5 minutes / 300s in production environments).
+/// Default safety margin before resource expiration when proactive background refresh is triggered (2 seconds).
+///
+/// Override per actor via [`super::generic_actor::ResourceActorBuilder::expiry_buffer`] for
+/// longer-lived credentials (e.g., 60–300 seconds for OAuth2 tokens).
 pub const EXPIRY_BUFFER: Duration = Duration::from_secs(2);
 
-/// Default grace period granted to an actor or service during graceful shutdown (5 seconds).
+/// Default grace period granted to an actor or child supervisor during graceful shutdown (5 seconds).
 pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Result returned by supervised actor and supervisor tasks upon termination.
@@ -23,27 +25,29 @@ pub type TaskResult = Result<(), String>;
 // 1. Restart Policy, Restart Type, Shutdown Policy, Strategies & Crash Tracking
 // ============================================================================
 
-/// Defines when a supervised child actor should be restarted by its supervisor upon termination
+/// Defines when a supervised child (actor or supervisor) should be restarted upon termination
 /// (modeled after Erlang/OTP child specification restart rules).
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RestartType {
-    /// The child actor is restarted only if it terminates abnormally (`Err` or panic).
+    /// The child is restarted only if it terminates abnormally (`Err` or panic).
     /// If it terminates normally (`Ok(())`), it is not restarted.
     #[default]
     Transient,
 
-    /// The child actor is always restarted, regardless of whether it terminates normally (`Ok(())`)
+    /// The child is always restarted, regardless of whether it terminates normally (`Ok(())`)
     /// or abnormally (`Err` / panic), unless explicitly stopped via the supervisor.
-    /// Best for critical long-lived daemons and resource actors.
+    /// Best for critical long-lived daemons, sub-supervisors, and resource actors.
     Permanent,
 
-    /// The child actor is never restarted (neither on normal exit nor on crash/panic, nor when
+    /// The child is never restarted (neither on normal exit nor on crash/panic, nor when
     /// siblings restart under `OneForAll` / `RestForOne`). Best for one-shot tasks.
     Temporary,
 }
 
-/// Defines how a supervisor terminates a child actor or service during shutdown or stop operations
+/// Defines how a supervisor terminates a child actor or child supervisor during shutdown or stop operations
 /// (modeled after Erlang/OTP shutdown specifications).
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShutdownPolicy {
     /// Signals graceful shutdown and waits up to the specified timeout for the task to complete
@@ -63,38 +67,88 @@ impl Default for ShutdownPolicy {
     }
 }
 
-/// Supervision restart strategy governing how sibling actors are treated when one actor crashes.
+/// Supervision restart strategy governing how sibling children are treated when one child crashes.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SupervisionStrategy {
-    /// Only the crashed actor is restarted. Sibling actors remain completely unaffected.
-    /// Best for independent, shared-nothing actors.
+    /// Only the crashed child is restarted. Sibling children remain completely unaffected.
+    /// Best for independent, shared-nothing actors or sub-supervisors.
     #[default]
     OneForOne,
 
-    /// If any actor crashes, ALL actors supervised by this supervisor are terminated
-    /// and restarted in order of registration.
-    /// Best for tightly coupled actors sharing in-memory session or dependent state.
+    /// If any child crashes, ALL children supervised by this supervisor are terminated
+    /// in reverse registration order and restarted in order of registration.
+    /// Best for tightly coupled actors or services sharing dependent state.
     OneForAll,
 
-    /// If an actor crashes, that actor and all subsequent actors registered AFTER it
-    /// are terminated and restarted in order of registration. Earlier actors remain untouched.
-    /// Best for linear dependency pipelines (A -> B -> C).
+    /// If a child crashes, that child and all subsequent children registered AFTER it
+    /// are terminated in reverse order and restarted in order of registration. Earlier children remain untouched.
+    /// Best for linear dependency pipelines (`A -> B -> C`).
     RestForOne,
 }
 
-/// Configuration defining restart rate-limiting and backoff behavior for supervised actors.
+/// Configuration defining restart rate-limiting and exponential backoff behavior for supervised children.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RestartPolicy {
     /// Maximum number of restarts allowed within the time window.
     pub max_restarts: usize,
     /// Time window over which restart frequencies are tracked.
     pub time_window: Duration,
-    /// Base delay applied before spawning the replacement actor on first restart.
+    /// Base delay applied before spawning the replacement child on first restart.
     pub initial_backoff: Duration,
     /// Maximum backoff ceiling across consecutive failures.
     pub max_backoff: Duration,
     /// Factor by which backoff increases after each consecutive crash.
     pub backoff_multiplier: f64,
+}
+
+impl RestartPolicy {
+    /// Creates a new [`RestartPolicy`] with the given `max_restarts` and `time_window`,
+    /// using default backoff settings (`50ms` initial, `2s` max, `2.0x` multiplier).
+    #[must_use]
+    pub fn new(max_restarts: usize, time_window: Duration) -> Self {
+        Self {
+            max_restarts,
+            time_window,
+            ..Self::default()
+        }
+    }
+
+    /// Sets the maximum number of restarts allowed within `time_window`.
+    #[must_use]
+    pub fn max_restarts(mut self, max_restarts: usize) -> Self {
+        self.max_restarts = max_restarts;
+        self
+    }
+
+    /// Sets the sliding time window over which restarts are counted.
+    #[must_use]
+    pub fn time_window(mut self, time_window: Duration) -> Self {
+        self.time_window = time_window;
+        self
+    }
+
+    /// Sets the initial backoff delay before the first restart.
+    #[must_use]
+    pub fn initial_backoff(mut self, initial_backoff: Duration) -> Self {
+        self.initial_backoff = initial_backoff;
+        self
+    }
+
+    /// Sets the maximum backoff ceiling across consecutive restarts.
+    #[must_use]
+    pub fn max_backoff(mut self, max_backoff: Duration) -> Self {
+        self.max_backoff = max_backoff;
+        self
+    }
+
+    /// Sets the exponential backoff multiplier applied on each consecutive restart.
+    #[must_use]
+    pub fn backoff_multiplier(mut self, backoff_multiplier: f64) -> Self {
+        self.backoff_multiplier = backoff_multiplier;
+        self
+    }
 }
 
 impl Default for RestartPolicy {
@@ -112,18 +166,29 @@ impl Default for RestartPolicy {
 /// Helper tracking restart timestamps and computing exponential backoff.
 #[derive(Debug, Clone)]
 pub struct RestartTracker {
-    pub policy: RestartPolicy,
-    pub restarts: Vec<Instant>,
-    pub consecutive_failures: usize,
+    pub(crate) policy: RestartPolicy,
+    pub(crate) restarts: Vec<Instant>,
+    pub(crate) consecutive_failures: usize,
 }
 
 impl RestartTracker {
+    /// Creates a new [`RestartTracker`] governed by the given [`RestartPolicy`].
     pub fn new(policy: RestartPolicy) -> Self {
         Self {
             policy,
             restarts: Vec::new(),
             consecutive_failures: 0,
         }
+    }
+
+    /// Returns the configured [`RestartPolicy`].
+    pub fn policy(&self) -> &RestartPolicy {
+        &self.policy
+    }
+
+    /// Returns the number of consecutive failures within the active window.
+    pub fn consecutive_failures(&self) -> usize {
+        self.consecutive_failures
     }
 
     /// Records a crash.
@@ -175,37 +240,25 @@ impl RestartTracker {
 }
 
 // ============================================================================
-// 2. Supervisor Error Definitions
+// 2. Unified Supervisor Error Definition
 // ============================================================================
 
-/// Error conditions encountered at the service supervisor level.
-#[derive(Debug, Error, Clone)]
-pub enum ServiceError {
-    #[error("Actor '{0}' is already registered with this service supervisor")]
-    ActorAlreadyExists(String),
-    #[error("Actor '{0}' was not found")]
-    ActorNotFound(String),
-    #[error("Actor '{0}' channel type mismatch during downcast")]
-    ActorTypeMismatch(String),
-    #[error("Service supervisor is unavailable or terminated")]
-    ServiceUnavailable,
+/// Error conditions encountered at any level of the [`super::supervisor::Supervisor`] hierarchy.
+#[non_exhaustive]
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum SupervisorError {
+    #[error("Child '{0}' is already registered and running under this supervisor")]
+    ChildAlreadyExists(String),
+    #[error("Child '{0}' was not found under this supervisor")]
+    ChildNotFound(String),
+    #[error("Child '{0}' channel type mismatch during downcast")]
+    ChildTypeMismatch(String),
+    #[error("Supervisor is unavailable or has terminated")]
+    SupervisorUnavailable,
     #[error(
-        "Actor '{0}' exceeded maximum restart threshold ({1} restarts within {2:?}) and is permanently failed"
+        "Child '{0}' exceeded maximum restart threshold ({1} restarts within {2:?}) and is permanently failed"
     )]
     MaxRestartsExceeded(String, usize, Duration),
-}
-
-/// Error conditions encountered at the root supervisor level.
-#[derive(Debug, Error, Clone)]
-pub enum RootError {
-    #[error("Service '{0}' is already registered with root supervisor")]
-    ServiceAlreadyExists(String),
-    #[error("Service '{0}' was not found")]
-    ServiceNotFound(String),
-    #[error("Root supervisor is unavailable or terminated")]
-    RootUnavailable,
-    #[error(
-        "Service '{0}' exceeded maximum restart threshold ({1} restarts within {2:?}) and is permanently failed"
-    )]
-    MaxRestartsExceeded(String, usize, Duration),
+    #[error("Child '{0}' factory panicked during spawn: {1}")]
+    FactoryPanicked(String, String),
 }

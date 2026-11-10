@@ -4,7 +4,29 @@ use crate::remote::proto::RemoteError;
 use crate::remote::proto::remote_error::Kind;
 use std::fmt::{self, Debug, Display};
 
+/// Error encountered when starting or shutting down a remote [`crate::remote::ActorNodeHandle`].
+#[non_exhaustive]
+#[derive(Debug, thiserror::Error)]
+pub enum RemoteNodeError {
+    /// Failed to bind TCP listener socket.
+    #[error("Failed to bind TCP listener: {0}")]
+    Bind(#[from] std::io::Error),
+
+    /// Tonic gRPC server transport error.
+    #[error("gRPC server transport error: {0}")]
+    Transport(#[from] tonic::transport::Error),
+
+    /// Server background task panicked or was cancelled.
+    #[error("Server task failed to join: {0}")]
+    Join(#[from] tokio::task::JoinError),
+
+    /// Attached supervisor subtree failed to shut down cleanly.
+    #[error("Supervisor shutdown error: {0}")]
+    Supervisor(#[from] crate::actor::SupervisorError),
+}
+
 /// Error encountered when communicating with a remote actor over gRPC.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum RemoteActorError<E> {
     /// Domain-specific error returned by the remote actor's `handle` method.
@@ -25,6 +47,9 @@ pub enum RemoteActorError<E> {
     /// The remote actor is temporarily unavailable (e.g. recovering or restarting).
     ActorUnavailable,
 
+    /// The remote actor exceeded its restart intensity budget and was permanently terminated.
+    MaxRestartsExceeded(String),
+
     /// Operation timed out waiting for the remote node or actor.
     Timeout,
 
@@ -36,6 +61,12 @@ pub enum RemoteActorError<E> {
 
     /// The remote actor panicked or crashed while handling the message.
     ActorPanic(String),
+
+    /// The client and remote server speak incompatible wire protocol versions.
+    IncompatibleProtocol(String),
+
+    /// Unrecognized framework error code received from a newer or incompatible node.
+    Unknown { kind: i32, message: String },
 }
 
 impl<E: Display> Display for RemoteActorError<E> {
@@ -47,22 +78,40 @@ impl<E: Display> Display for RemoteActorError<E> {
             Self::ActorNotFound(act) => write!(f, "Actor '{act}' not found on remote node"),
             Self::MailboxFull => write!(f, "Remote actor mailbox is full"),
             Self::ActorUnavailable => write!(f, "Remote actor is temporarily unavailable"),
+            Self::MaxRestartsExceeded(msg) => {
+                write!(f, "Remote actor exceeded max restarts: {msg}")
+            }
             Self::Timeout => write!(f, "Remote actor operation timed out"),
             Self::Serialization(msg) => write!(f, "Serialization error: {msg}"),
             Self::Deserialization(msg) => write!(f, "Deserialization error: {msg}"),
             Self::ActorPanic(msg) => write!(f, "Remote actor panicked or crashed: {msg}"),
+            Self::IncompatibleProtocol(msg) => write!(f, "Incompatible remote protocol: {msg}"),
+            Self::Unknown { kind, message } => {
+                write!(f, "Unknown remote framework error (kind={kind}): {message}")
+            }
         }
     }
 }
 
 impl<E: Debug + Display> std::error::Error for RemoteActorError<E> {}
 
+fn status_is_timeout(status: &tonic::Status) -> bool {
+    if status.code() == tonic::Code::DeadlineExceeded {
+        return true;
+    }
+    let mut source = std::error::Error::source(status);
+    while let Some(err) = source {
+        if err.is::<tonic::TimeoutExpired>() {
+            return true;
+        }
+        source = err.source();
+    }
+    status.code() == tonic::Code::Cancelled && status.message() == "Timeout expired"
+}
+
 impl<E> From<tonic::Status> for RemoteActorError<E> {
     fn from(status: tonic::Status) -> Self {
-        if status.code() == tonic::Code::DeadlineExceeded
-            || (status.code() == tonic::Code::Cancelled
-                && status.message().contains("Timeout expired"))
-        {
+        if status_is_timeout(&status) {
             Self::Timeout
         } else {
             Self::Transport(status)
@@ -72,17 +121,22 @@ impl<E> From<tonic::Status> for RemoteActorError<E> {
 
 impl<E> From<RemoteError> for RemoteActorError<E> {
     fn from(err: RemoteError) -> Self {
-        let kind = Kind::try_from(err.kind).unwrap_or(Kind::Unspecified);
-        match kind {
-            Kind::ServiceNotFound => RemoteActorError::ServiceNotFound(err.message),
-            Kind::ActorNotFound => RemoteActorError::ActorNotFound(err.message),
-            Kind::MailboxFull => RemoteActorError::MailboxFull,
-            Kind::ActorUnavailable => RemoteActorError::ActorUnavailable,
-            Kind::Timeout => RemoteActorError::Timeout,
-            Kind::Serialization => RemoteActorError::Serialization(err.message),
-            Kind::Deserialization => RemoteActorError::Deserialization(err.message),
-            Kind::ActorPanic => RemoteActorError::ActorPanic(err.message),
-            Kind::Unspecified => RemoteActorError::ActorPanic(err.message),
+        match Kind::try_from(err.kind) {
+            Ok(Kind::ServiceNotFound) => RemoteActorError::ServiceNotFound(err.message),
+            Ok(Kind::ActorNotFound) => RemoteActorError::ActorNotFound(err.message),
+            Ok(Kind::MailboxFull) => RemoteActorError::MailboxFull,
+            Ok(Kind::ActorUnavailable) => RemoteActorError::ActorUnavailable,
+            Ok(Kind::MaxRestartsExceeded) => RemoteActorError::MaxRestartsExceeded(err.message),
+            Ok(Kind::Timeout) => RemoteActorError::Timeout,
+            Ok(Kind::Serialization) => RemoteActorError::Serialization(err.message),
+            Ok(Kind::Deserialization) => RemoteActorError::Deserialization(err.message),
+            Ok(Kind::ActorPanic) => RemoteActorError::ActorPanic(err.message),
+            Ok(Kind::IncompatibleProtocol) => RemoteActorError::IncompatibleProtocol(err.message),
+            Ok(Kind::Unspecified) => RemoteActorError::ActorPanic(err.message),
+            Err(_) => RemoteActorError::Unknown {
+                kind: err.kind,
+                message: err.message,
+            },
         }
     }
 }
@@ -94,15 +148,25 @@ impl<E: ToString> From<crate::actor::ActorError<E>> for RemoteError {
                 kind: Kind::ActorUnavailable as i32,
                 message: "Actor task terminated unexpectedly or is unavailable".into(),
             },
-            crate::actor::ActorError::Service(crate::actor::ServiceError::ActorNotFound(name)) => {
-                RemoteError {
-                    kind: Kind::ActorNotFound as i32,
-                    message: name,
-                }
-            }
-            crate::actor::ActorError::Service(other_svc_err) => RemoteError {
+            crate::actor::ActorError::MailboxFull => RemoteError {
+                kind: Kind::MailboxFull as i32,
+                message: "Actor mailbox is full".into(),
+            },
+            crate::actor::ActorError::Supervisor(
+                crate::actor::SupervisorError::ChildNotFound(name),
+            ) => RemoteError {
+                kind: Kind::ActorNotFound as i32,
+                message: name,
+            },
+            crate::actor::ActorError::Supervisor(
+                crate::actor::SupervisorError::MaxRestartsExceeded(name, max, window),
+            ) => RemoteError {
+                kind: Kind::MaxRestartsExceeded as i32,
+                message: format!("Child '{name}' exceeded max restarts ({max} in {window:?})"),
+            },
+            crate::actor::ActorError::Supervisor(other_sup_err) => RemoteError {
                 kind: Kind::ActorUnavailable as i32,
-                message: other_svc_err.to_string(),
+                message: other_sup_err.to_string(),
             },
             crate::actor::ActorError::Timeout(duration) => RemoteError {
                 kind: Kind::Timeout as i32,

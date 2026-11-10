@@ -1,12 +1,11 @@
-//! # Example: Dynamic Child Actor Spawning via Injected Supervisor Handle
+//! # Example: Dynamic Child Actor Spawning via `ctx.supervisor()`
 //!
-//! Demonstrates how a `Manager` actor receives a `ServiceSupervisorHandle`
-//! via dependency injection, allowing it to dynamically spawn and register new `Worker`
+//! Demonstrates how a `Manager` actor uses `ctx.supervisor()` from its [`ActorContext`]
+//! (or an injected [`SupervisorHandle`]) to dynamically spawn and register new `Worker`
 //! actors under the supervision tree at runtime.
 
 use otp_actor::actor::{
-    ActorClient, ActorContext, RestartType, RootSupervisor, ServiceSupervisor,
-    ServiceSupervisorHandle, StatefulActor, StatefulActorBuilder,
+    ActorClient, ActorContext, RestartType, StatefulActor, StatefulActorBuilder, Supervisor,
 };
 
 // ============================================================================
@@ -26,7 +25,7 @@ impl StatefulActor for Worker {
     async fn handle(
         &mut self,
         task: Self::Message,
-        ctx: &mut ActorContext,
+        ctx: &mut ActorContext<Self>,
     ) -> Result<Self::Response, Self::Error> {
         Ok(format!(
             "Worker #{} (instance #{}) finished task: '{task}'",
@@ -37,13 +36,11 @@ impl StatefulActor for Worker {
 }
 
 // ============================================================================
-// The Manager Actor (Holds ServiceSupervisorHandle via Dependency Injection)
+// The Manager Actor (Spawns siblings using ctx.supervisor())
 // ============================================================================
 
-#[derive(Clone)]
-struct Manager {
-    supervisor: ServiceSupervisorHandle,
-}
+#[derive(Clone, Default)]
+struct Manager;
 
 enum ManagerMsg {
     SpawnWorker(u32),
@@ -57,18 +54,18 @@ impl StatefulActor for Manager {
     async fn handle(
         &mut self,
         msg: Self::Message,
-        _ctx: &mut ActorContext,
+        ctx: &mut ActorContext<Self>,
     ) -> Result<Self::Response, Self::Error> {
         match msg {
             ManagerMsg::SpawnWorker(worker_id) => {
                 let worker_name = format!("worker-{worker_id}");
                 println!("  [Manager] Dynamically registering '{worker_name}' under supervisor...");
 
-                // The Manager uses its injected supervisor handle to spawn a Worker:
+                // The Manager uses ctx.supervisor() directly to spawn a sibling Worker:
                 let worker_client =
                     StatefulActorBuilder::from_instance(worker_name, Worker { id: worker_id })
                         .restart_type(RestartType::Transient)
-                        .spawn(&self.supervisor)
+                        .spawn(ctx.supervisor())
                         .await
                         .map_err(|e| e.to_string())?;
 
@@ -86,18 +83,15 @@ impl StatefulActor for Manager {
 async fn main() {
     println!("=== Dynamic Child Spawning with otp-actor ===\n");
 
-    // 1. Initialize the Supervision Tree (Root -> Service)
-    let root = RootSupervisor::new();
-    let service = ServiceSupervisor::spawn_and_register("worker-service", &root)
+    // 1. Initialize the Supervision Tree (root -> worker-service)
+    let root = Supervisor::new("root");
+    let service = Supervisor::builder("worker-service")
+        .spawn(&root)
         .await
         .expect("Failed to spawn service supervisor");
 
-    // 2. Start Manager, injecting the ServiceSupervisorHandle
-    let manager = Manager {
-        supervisor: service.clone(),
-    };
-
-    let manager_client = StatefulActorBuilder::from_instance("manager", manager)
+    // 2. Start Manager under worker-service
+    let manager_client = StatefulActorBuilder::from_default::<Manager>("manager")
         .spawn(&service)
         .await
         .expect("Failed to spawn Manager");
@@ -132,7 +126,7 @@ async fn main() {
     println!("  👉 Response from worker-2: \"{res2}\"\n");
 
     // 5. Query the supervisor directly to prove worker-1 is actively tracked
-    println!("--- 3. Query ServiceSupervisor directly for worker-1 ---");
+    println!("--- 3. Query Supervisor directly for worker-1 ---");
     let resolved_client = service
         .get_actor_client::<Worker>("worker-1")
         .await
