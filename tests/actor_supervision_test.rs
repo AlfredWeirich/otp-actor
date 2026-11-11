@@ -4135,3 +4135,326 @@ async fn test_factory_panic_during_auto_recovery_retries_and_escalates() {
 
     root.shutdown().await.unwrap();
 }
+
+// ============================================================================
+// ActorContext::send_interval & ActorContext::send_interval_with Tests
+// ============================================================================
+
+#[derive(Clone, Default)]
+struct IntervalActor {
+    ticks: usize,
+    tick_notify: Option<Arc<tokio::sync::Notify>>,
+    active_handle: Option<tokio::task::AbortHandle>,
+}
+
+#[derive(Clone)]
+struct TimerDropProbe(Arc<AtomicUsize>);
+
+impl Drop for TimerDropProbe {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[derive(Clone)]
+enum IntervalMsg {
+    StartCloneInterval(Duration),
+    StartWithDropProbe {
+        period: Duration,
+        dropped: Arc<AtomicUsize>,
+    },
+    CancelInterval,
+    Tick,
+    GetState,
+    TriggerPanic,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct IntervalStatus {
+    instance_id: usize,
+    ticks: usize,
+}
+
+impl StatefulActor for IntervalActor {
+    type Message = IntervalMsg;
+    type Response = IntervalStatus;
+    type Error = String;
+
+    async fn handle(
+        &mut self,
+        msg: Self::Message,
+        ctx: &mut ActorContext<Self>,
+    ) -> Result<Self::Response, Self::Error> {
+        match msg {
+            IntervalMsg::StartCloneInterval(period) => {
+                if let Some(prev) = self.active_handle.take() {
+                    prev.abort();
+                }
+                self.active_handle = Some(ctx.send_interval(period, IntervalMsg::Tick));
+            }
+            IntervalMsg::StartWithDropProbe { period, dropped } => {
+                if let Some(prev) = self.active_handle.take() {
+                    prev.abort();
+                }
+                let probe = TimerDropProbe(dropped);
+                self.active_handle = Some(ctx.send_interval_with(period, move || {
+                    let _keep = &probe;
+                    IntervalMsg::Tick
+                }));
+            }
+            IntervalMsg::CancelInterval => {
+                if let Some(handle) = self.active_handle.take() {
+                    handle.abort();
+                }
+            }
+            IntervalMsg::Tick => {
+                self.ticks += 1;
+                if let Some(notify) = &self.tick_notify {
+                    notify.notify_waiters();
+                }
+            }
+            IntervalMsg::GetState => {}
+            IntervalMsg::TriggerPanic => panic!("intentional panic for timer cancellation test"),
+        }
+
+        Ok(IntervalStatus {
+            instance_id: ctx.instance_id(),
+            ticks: self.ticks,
+        })
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_actor_context_send_interval_ticks_abort_and_lifecycle_cancel() {
+    let root = Supervisor::new("root");
+    let tick_notify = Arc::new(tokio::sync::Notify::new());
+    let notify_for_actor = tick_notify.clone();
+
+    let client = StatefulActorBuilder::new("interval-actor", move |_| IntervalActor {
+        ticks: 0,
+        tick_notify: Some(notify_for_actor.clone()),
+        active_handle: None,
+    })
+    .spawn(&root)
+    .await
+    .unwrap();
+
+    // 1. Start a 5s interval; must NOT fire immediately at t = 0
+    client
+        .call(IntervalMsg::StartCloneInterval(Duration::from_secs(5)))
+        .await
+        .unwrap();
+    tokio::task::yield_now().await;
+    assert_eq!(client.call(IntervalMsg::GetState).await.unwrap().ticks, 0);
+
+    // 2. Advance across 3 full periods and verify deterministic ticks
+    for expected in 1..=3 {
+        let notified = tick_notify.notified();
+        tokio::time::advance(Duration::from_secs(5)).await;
+        notified.await;
+        assert_eq!(
+            client.call(IntervalMsg::GetState).await.unwrap().ticks,
+            expected
+        );
+    }
+
+    // 3. Aborting the returned AbortHandle stops further ticks permanently
+    client.call(IntervalMsg::CancelInterval).await.unwrap();
+    tokio::time::advance(Duration::from_secs(20)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(client.call(IntervalMsg::GetState).await.unwrap().ticks, 3);
+
+    // 4. Starting a 1-hour interval and shutting down immediately drops the timer task
+    let dropped = Arc::new(AtomicUsize::new(0));
+    client
+        .call(IntervalMsg::StartWithDropProbe {
+            period: Duration::from_secs(3600),
+            dropped: dropped.clone(),
+        })
+        .await
+        .unwrap();
+    tokio::task::yield_now().await;
+    assert_eq!(dropped.load(Ordering::SeqCst), 0);
+
+    root.shutdown().await.unwrap();
+    for _ in 0..5 {
+        if dropped.load(Ordering::SeqCst) == 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        dropped.load(Ordering::SeqCst),
+        1,
+        "Sleeping 1h interval task must exit immediately upon actor shutdown"
+    );
+}
+
+#[derive(Default)]
+struct NonCloneIntervalActor {
+    received_seqs: Vec<u64>,
+    tick_notify: Option<Arc<tokio::sync::Notify>>,
+}
+
+struct NonCloneToken(u64);
+
+enum NonCloneIntervalMsg {
+    Start(Duration),
+    Hold(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    ),
+    Tick(NonCloneToken),
+    GetSeqs,
+}
+
+impl StatefulActor for NonCloneIntervalActor {
+    type Message = NonCloneIntervalMsg;
+    type Response = Vec<u64>;
+    type Error = String;
+
+    async fn handle(
+        &mut self,
+        msg: Self::Message,
+        ctx: &mut ActorContext<Self>,
+    ) -> Result<Self::Response, Self::Error> {
+        match msg {
+            NonCloneIntervalMsg::Start(period) => {
+                let mut seq = 0u64;
+                ctx.send_interval_with(period, move || {
+                    seq += 1;
+                    NonCloneIntervalMsg::Tick(NonCloneToken(seq))
+                });
+            }
+            NonCloneIntervalMsg::Hold(entered_tx, release_rx) => {
+                let _ = entered_tx.send(());
+                let _ = release_rx.await;
+            }
+            NonCloneIntervalMsg::Tick(token) => {
+                self.received_seqs.push(token.0);
+                if let Some(notify) = &self.tick_notify {
+                    notify.notify_waiters();
+                }
+            }
+            NonCloneIntervalMsg::GetSeqs => {}
+        }
+        Ok(self.received_seqs.clone())
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_actor_context_send_interval_with_non_clone_and_skips_missed_ticks_under_backpressure()
+{
+    let root = Supervisor::new("root");
+    let tick_notify = Arc::new(tokio::sync::Notify::new());
+    let notify_for_actor = tick_notify.clone();
+
+    let client = StatefulActorBuilder::new("non-clone-interval", move |_| NonCloneIntervalActor {
+        received_seqs: Vec::new(),
+        tick_notify: Some(notify_for_actor.clone()),
+    })
+    .channel_capacity(1)
+    .spawn(&root)
+    .await
+    .unwrap();
+
+    client
+        .call(NonCloneIntervalMsg::Start(Duration::from_secs(5)))
+        .await
+        .unwrap();
+
+    // Verify normal non-Clone generation for tick #1 at t = 5s
+    let first = tick_notify.notified();
+    tokio::time::advance(Duration::from_secs(5)).await;
+    first.await;
+    assert_eq!(
+        client.call(NonCloneIntervalMsg::GetSeqs).await.unwrap(),
+        vec![1]
+    );
+
+    // Block actor handler while advancing across 3 full intervals (t = 10s, 15s, 20s)
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    client
+        .cast(NonCloneIntervalMsg::Hold(entered_tx, release_rx))
+        .await
+        .unwrap();
+    entered_rx.await.unwrap();
+
+    // Advance 16s so t=10s fills the 1-slot mailbox (seq 2) and t=15s/20s are skipped cleanly
+    let second = tick_notify.notified();
+    tokio::time::advance(Duration::from_secs(16)).await;
+    tokio::task::yield_now().await;
+
+    // Release handler and let the single queued tick drain; MissedTickBehavior::Skip prevents burst catch-up
+    let _ = release_tx.send(());
+    second.await;
+    assert_eq!(
+        client.call(NonCloneIntervalMsg::GetSeqs).await.unwrap(),
+        vec![1, 2],
+        "Backpressure + MissedTickBehavior::Skip must not burst missed ticks"
+    );
+
+    // Next tick arrives cleanly on the original 5s grid at t = 25s
+    let third = tick_notify.notified();
+    tokio::time::advance(Duration::from_secs(4)).await;
+    third.await;
+    assert_eq!(
+        client.call(NonCloneIntervalMsg::GetSeqs).await.unwrap(),
+        vec![1, 2, 3]
+    );
+
+    root.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_actor_context_send_interval_cancels_on_panic_and_ignores_zero_or_max_duration() {
+    let root = Supervisor::new("root");
+    let client = StatefulActorBuilder::from_default::<IntervalActor>("panic-interval-actor")
+        .restart_type(RestartType::Permanent)
+        .restart_policy(RestartPolicy::default().initial_backoff(Duration::from_millis(10)))
+        .spawn(&root)
+        .await
+        .unwrap();
+
+    // 1. Zero and MAX durations must not panic
+    client
+        .call(IntervalMsg::StartCloneInterval(Duration::ZERO))
+        .await
+        .unwrap();
+    client
+        .call(IntervalMsg::StartCloneInterval(Duration::MAX))
+        .await
+        .unwrap();
+
+    // 2. Active 1h interval on instance #1 is dropped immediately when instance #1 panics
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let st = client
+        .call(IntervalMsg::StartWithDropProbe {
+            period: Duration::from_secs(3600),
+            dropped: dropped.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(st.instance_id, 1);
+
+    let crash = client.call(IntervalMsg::TriggerPanic).await;
+    assert!(matches!(crash, Err(ActorError::ActorUnavailable)));
+
+    let recovered = client.call_retry(IntervalMsg::GetState).await.unwrap();
+    assert_eq!(recovered.instance_id, 2);
+
+    for _ in 0..50 {
+        if dropped.load(Ordering::SeqCst) == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(
+        dropped.load(Ordering::SeqCst),
+        1,
+        "Sleeping interval task from crashed instance #1 must be cancelled on panic unwind"
+    );
+
+    root.shutdown().await.unwrap();
+}

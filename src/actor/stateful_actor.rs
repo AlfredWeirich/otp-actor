@@ -12,7 +12,7 @@
 //!   or its supervisor crashes and restarts.
 //! - **Request/Response, Typed Sub-Messages & Fire-and-Forget**: Supports [`ActorClient::call`], [`ActorClient::ask`]
 //!   (via [`CallMessage`]), [`ActorClient::cast`], [`ActorClient::try_cast`], and [`ActorClient::cast_timeout`].
-//! - **Rich Execution Context**: [`ActorContext<A>`] provides `client()`, `supervisor()`, and `send_after()` timers.
+//! - **Rich Execution Context**: [`ActorContext<A>`] provides `client()`, `supervisor()`, `send_after()`, and `send_interval()` timers.
 
 use std::future::Future;
 use std::marker::PhantomData;
@@ -23,6 +23,7 @@ use tokio::sync::{
     mpsc::{self, Receiver, Sender, WeakSender},
     oneshot, watch,
 };
+use tokio::time::{Instant, MissedTickBehavior, interval_at};
 
 use super::model::{RestartPolicy, RestartType, ShutdownPolicy, SupervisorError, TaskResult};
 use super::supervisor::{
@@ -46,6 +47,7 @@ pub struct ActorContext<A: StatefulActor> {
     instance_id: usize,
     control: ActorControl,
     weak_sender: WeakSender<ActorEnvelope<A>>,
+    cancel_rx: watch::Receiver<bool>,
     supervisor: SupervisorHandle,
 }
 
@@ -56,6 +58,7 @@ impl<A: StatefulActor> Clone for ActorContext<A> {
             instance_id: self.instance_id,
             control: self.control.clone(),
             weak_sender: self.weak_sender.clone(),
+            cancel_rx: self.cancel_rx.clone(),
             supervisor: self.supervisor.clone(),
         }
     }
@@ -72,11 +75,12 @@ impl<A: StatefulActor> std::fmt::Debug for ActorContext<A> {
 }
 
 impl<A: StatefulActor> ActorContext<A> {
-    /// Creates a new actor context for the given actor name, instance ID, weak self-sender, and parent supervisor handle.
+    /// Creates a new actor context for the given actor name, instance ID, weak self-sender, lifecycle signal, and parent supervisor handle.
     pub(crate) fn new(
         name: impl Into<String>,
         instance_id: usize,
         weak_sender: WeakSender<ActorEnvelope<A>>,
+        cancel_rx: watch::Receiver<bool>,
         supervisor: SupervisorHandle,
     ) -> Self {
         Self {
@@ -84,6 +88,7 @@ impl<A: StatefulActor> ActorContext<A> {
             instance_id,
             control: ActorControl::Continue,
             weak_sender,
+            cancel_rx,
             supervisor,
         }
     }
@@ -123,13 +128,105 @@ impl<A: StatefulActor> ActorContext<A> {
 
     /// Schedules `msg` to be delivered to this actor via `cast` after `delay`.
     ///
-    /// Returns a [`tokio::task::AbortHandle`] that can be used to cancel the scheduled timer.
+    /// The timer task aborts automatically if this actor instance stops or panics before `delay` elapses.
+    /// Returns a [`tokio::task::AbortHandle`] that can be used to cancel the scheduled timer early.
     pub fn send_after(&self, delay: Duration, msg: A::Message) -> tokio::task::AbortHandle {
         let weak_tx = self.weak_sender.clone();
+        let mut cancel_rx = self.cancel_rx.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(delay).await;
+            tokio::select! {
+                biased;
+                _ = cancel_rx.wait_for(|&cancelled| cancelled) => return,
+                _ = tokio::time::sleep(delay) => {}
+            }
             if let Some(tx) = weak_tx.upgrade() {
-                let _ = tx.send(ActorEnvelope::Cast { msg }).await;
+                tokio::select! {
+                    biased;
+                    _ = cancel_rx.wait_for(|&cancelled| cancelled) => {}
+                    _ = tx.send(ActorEnvelope::Cast { msg }) => {}
+                }
+            }
+        })
+        .abort_handle()
+    }
+
+    /// Periodically delivers clones of `msg` to this actor via `cast` every `period`.
+    ///
+    /// The first message is scheduled after one full `period` (not immediately at call time).
+    /// Missed ticks caused by slow handlers or full mailboxes are skipped rather than burst-queued
+    /// (`MissedTickBehavior::Skip`), and the background task terminates immediately when this actor
+    /// instance stops, crashes, or panics.
+    ///
+    /// If `period` is [`Duration::ZERO`], logs a warning and returns an already-completed
+    /// [`tokio::task::AbortHandle`] instead of panicking.
+    ///
+    /// For non-`Clone` messages or dynamically generated payloads, use [`Self::send_interval_with`].
+    pub fn send_interval(&self, period: Duration, msg: A::Message) -> tokio::task::AbortHandle
+    where
+        A::Message: Clone,
+    {
+        self.send_interval_with(period, move || msg.clone())
+    }
+
+    /// Periodically generates and delivers messages via `cast` every `period` using `make_msg`.
+    ///
+    /// Unlike [`Self::send_interval`], this works with non-`Clone` message types and lets each tick
+    /// compute fresh payloads. `make_msg` is invoked only after a bounded mailbox permit is reserved,
+    /// avoiding wasted allocations if the actor stops while backpressured.
+    ///
+    /// The first tick fires after `period`, missed ticks under backpressure are skipped
+    /// (`MissedTickBehavior::Skip`), and the timer task stops immediately when the current actor
+    /// instance exits or panics. If `period` is [`Duration::ZERO`], logs a warning and returns an
+    /// already-completed [`tokio::task::AbortHandle`].
+    pub fn send_interval_with<F>(
+        &self,
+        period: Duration,
+        mut make_msg: F,
+    ) -> tokio::task::AbortHandle
+    where
+        F: FnMut() -> A::Message + Send + 'static,
+    {
+        if period.is_zero() {
+            tracing::warn!(
+                actor = %self.name,
+                instance = self.instance_id,
+                "Ignoring send_interval_with called with zero duration."
+            );
+            return tokio::spawn(async {}).abort_handle();
+        }
+
+        let weak_tx = self.weak_sender.clone();
+        let mut cancel_rx = self.cancel_rx.clone();
+        tokio::spawn(async move {
+            let Some(start) = Instant::now().checked_add(period) else {
+                let _ = cancel_rx.wait_for(|&cancelled| cancelled).await;
+                return;
+            };
+
+            let mut ticker = interval_at(start, period);
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel_rx.wait_for(|&cancelled| cancelled) => break,
+                    _ = ticker.tick() => {}
+                }
+
+                let Some(tx) = weak_tx.upgrade() else {
+                    break;
+                };
+
+                let permit = tokio::select! {
+                    biased;
+                    _ = cancel_rx.wait_for(|&cancelled| cancelled) => break,
+                    res = tx.reserve() => match res {
+                        Ok(permit) => permit,
+                        Err(_) => break,
+                    }
+                };
+
+                permit.send(ActorEnvelope::Cast { msg: make_msg() });
             }
         })
         .abort_handle()
@@ -462,6 +559,15 @@ pub(crate) struct StatefulActorRunner<A: StatefulActor> {
     instance_id: usize,
 }
 
+/// Drop guard broadcasting `true` on the instance lifecycle channel whenever the actor task returns or unwinds.
+struct InstanceCancelGuard(watch::Sender<bool>);
+
+impl Drop for InstanceCancelGuard {
+    fn drop(&mut self) {
+        let _ = self.0.send(true);
+    }
+}
+
 impl<A: StatefulActor> StatefulActorRunner<A> {
     pub(crate) fn new(
         config: StatefulActorConfig,
@@ -588,10 +694,14 @@ impl<A: StatefulActor> StatefulActorRunner<A> {
 
     /// Runs the actor lifecycle (`on_start` -> message loop -> `on_stop`).
     pub(crate) async fn run(mut self) -> TaskResult {
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let _cancel_guard = InstanceCancelGuard(cancel_tx);
+
         let mut ctx = ActorContext::new(
             self.config.name.clone(),
             self.instance_id,
             self.weak_sender.clone(),
+            cancel_rx,
             self.supervisor.clone(),
         );
 

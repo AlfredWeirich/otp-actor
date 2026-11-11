@@ -31,7 +31,7 @@
 //!    - Modeled after Erlang/OTP `gen_server` for building robust state machines.
 //!    - Native `impl Future` methods (`handle`, `handle_cast`, `on_start`, `on_stop`) with zero heap allocations per message.
 //!    - Direct 1-hop data plane with typed request/response ([`ActorClient::call`], [`ActorClient::ask`] via [`CallMessage`]) and asynchronous notification ([`ActorClient::cast`], [`ActorClient::try_cast`], [`ActorClient::cast_timeout`]).
-//!    - Rich execution context ([`ActorContext`]) with `client()`, `supervisor()`, `send_after()`, and controlled failure escalation via [`ActorContext::fail`].
+//!    - Rich execution context ([`ActorContext`]) with `client()`, `supervisor()`, `send_after()`, `send_interval()`, `send_interval_with()`, and controlled failure escalation via [`ActorContext::fail`].
 //!    - Supervised alongside [`ResourceActor`] and child [`Supervisor`]s under the same supervision tree.
 //!
 //! 4. **Remote Actors over gRPC** (`--features remote`, see `otp_actor::remote`):
