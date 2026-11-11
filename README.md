@@ -1,18 +1,33 @@
-# otp-actor — Hierarchical Supervision Tree, Resource Actor, Stateful Actor & gRPC Remote Actors for Tokio
+# otp-actor — Fault-Tolerant OTP Actors, 0-ms Self-Healing & gRPC Remoting for Tokio
 
-A **fault-tolerant actor framework** for [Tokio](https://tokio.rs), inspired by Erlang/OTP supervision trees. It combines four core capabilities:
+**Stop writing brittle reconnect loops, guarding unbounded mailboxes against OOM, or wrapping actors in proc-macro boilerplate.**
+`otp-actor` brings Erlang/OTP supervision semantics to [Tokio](https://tokio.rs) with strictly decoupled control and data planes:
 
-1. **A unified, recursive supervision tree** (`Supervisor` → child `Supervisor`s / actors to arbitrary depth) that detects controlled error exits (`TaskResult::Err`) and task panics, applies restart strategies (`OneForOne`, `OneForAll`, `RestForOne`) at *every* level, honors OTP child restart rules (`RestartType::Permanent`, `Transient`, `Temporary`) and graceful shutdown policies (`ShutdownPolicy::Timeout`, `BrutalKill`, `Infinity`), and protects against crash loops with rate limiting and exponential backoff.
-2. **A generic, reusable "resource actor" (`ResourceActor`)** that fetches, caches and proactively refreshes *any* kind of expiring resource (OAuth tokens, database credentials, config snapshots, signed URLs, …) with **0-hop lock-free `watch` cache reads** (`ResourceClient::get()`) and delegates refreshes to a user-supplied `Worker` — a struct, an `async fn`, or a closure.
-3. **A zero-cost stateful actor (`StatefulActor`)** (modeled after Erlang's `gen_server`) for general-purpose state machines with typed `call` (request/response), `cast` / `try_cast` / `cast_timeout` (fire-and-forget), `CallMessage<A>` (`ask` per-request response types), `ActorContext<Self>` (`client()`, `supervisor()`, `send_after()`), `on_start` / `on_stop` lifecycle hooks, and a zero-polling `watch`-backed self-healing client architecture (`ActorClient`).
-4. **Remote actors over gRPC (`RemoteActorClient`, `ActorNodeHandle`, `AnyActorClient`)** (optional `--features remote`) providing complete location transparency, a universal Protobuf wire contract ([`proto/actor_node.proto`](proto/actor_node.proto)), bounded `postcard` payload serialization via Serde, network self-healing across actor crashes without connection drops, and coordinated 2-phase graceful shutdown.
+- **0-ms Reactive Client Rebinding (`watch<SlotState>`)**: When an actor crashes or panics, [`ActorClient`](src/actor/stateful_actor.rs) and [`ResourceClient`](src/actor/generic_actor.rs) never poll or sleep—they await the supervisor's `SlotState` watch channel and rebind immediately as soon as the replacement spawns.
+- **0-Hop Lock-Free Cache Reads (`ResourceActor`)**: Fresh expiring resources (OAuth2 tokens, DB credentials, config snapshots, signed URLs) are read directly from a `tokio::sync::watch` snapshot on the caller task without crossing the actor mailbox or allocating a `oneshot`.
+- **Zero-Cost Pure Traits (Native `impl Future`)**: [`StatefulActor`](src/actor/stateful_actor.rs) and [`Worker`](src/actor/generic_actor.rs) use native RPITIT `impl Future` (Rust `edition = "2024"`)—zero `#[async_trait]`, zero `Box::pin` per message, and zero heavy derive macros.
+- **Bounded Mailboxes & Explicit Backpressure**: Bounded `mpsc` channels (`try_cast()` → `ActorError::MailboxFull`) and bounded single-flight waiter queues (`ResourceError::Overloaded`) prevent runaway memory growth under load.
+- **N-Level OTP Supervision Trees**: Unified recursive [`Supervisor`](src/actor/supervisor.rs) supporting `OneForOne`, `OneForAll`, and `RestForOne` at every depth, sliding-window `RestartPolicy` budgets with exponential backoff, `RestartType`, `ShutdownPolicy`, and parent escalation (`escalate_on_failure`).
+- **Point-to-Point gRPC Remoting (`--features remote`)**: Location-transparent HTTP/2 gRPC ([`RemoteActorClient`](src/remote/client.rs), [`AnyActorClient`](src/remote/client.rs)) with a universal Protobuf envelope ([`proto/actor_node.proto`](proto/actor_node.proto)), bounded 4 MiB `postcard` serialization, and 2-phase `GOAWAY` shutdown—without running a Raft or Gossip cluster.
 
-In-process clients talk **directly** to actors over their own 1-hop Tokio channel (or 0-hop `watch` snapshot for fresh `ResourceActor` cache hits), while remote clients communicate over multiplexed HTTP/2 gRPC into server-side endpoints. In both modes, supervisors are strictly confined to lifecycle management (the *control plane*) and publish per-child `watch::Receiver<SlotState>` handles so clients re-bind with **zero polling and zero sleep loops** after a crash.
+---
+
+## Why `otp-actor`?
+
+| Feature | `otp-actor` | `ractor` | Raw Tokio (`spawn` + `mpsc`) |
+| --- | --- | --- | --- |
+| **Supervision Trees** | Built-in recursive `Supervisor` (`OneForOne`, `OneForAll`, `RestForOne`, budgets & backoff) | Basic links in core; full trees via `ractor_supervisor` | Manual (`JoinSet` + custom loops) |
+| **Client Rebinding on Crash** | Automatic **0-ms** reactive rebind via `watch<SlotState>` | Manual re-lookup / handle `ActorRef` exit | Manual channel replacement |
+| **Cached Reads** | **0-hop** `watch` snapshot (`ResourceClient::get`) | Custom implementation | Custom `watch` / `RwLock` |
+| **Mailbox & Backpressure** | Bounded `mpsc` (`try_cast` → `MailboxFull`) & bounded waiters | Unbounded by default (bounded options in factories) | Explicit (`mpsc::channel`) |
+| **Async Trait Overhead** | Pure traits with native `impl Future` (zero `Box::pin`) | `#[async_trait]` (boxed trait futures) | None (manual loops) |
+| **Remoting / Distribution** | Optional point-to-point gRPC (`--features remote`, no cluster daemon) | Full cluster layer (`ractor_cluster`) | Custom `tonic` / TCP |
 
 ---
 
 ## Table of Contents
 
+- [Why `otp-actor`?](#why-otp-actor)
 - [Highlights](#highlights)
 - [Architecture](#architecture)
   - [Control plane vs. data plane](#control-plane-vs-data-plane)
@@ -137,6 +152,9 @@ flowchart TD
 | `RemoteActorClient`, `AnyActorClient`, `ActorNodeHandle`, `ActorNodeService`, `ActorNodeRegistry`, `ByteEndpoint`, `RemoteActorError`, `RemoteNodeError` | [`src/remote/mod.rs`](src/remote/mod.rs) | gRPC remote actors (`--features remote`): bounded `postcard` endpoint bridge, typed remote client, location transparency, coordinated 2-phase shutdown. |
 | Protobuf Schema & Build Script | [`proto/actor_node.proto`](proto/actor_node.proto) & [`build.rs`](build.rs) | Compact universal gRPC actor wire contract (`Call`, `Cast`, `RemoteError`), compiled automatically via `tonic-prost-build`. |
 | `SupervisionStrategy`, `RestartPolicy`, `RestartTracker`, `RestartType`, `ShutdownPolicy`, `SupervisorError`, `TaskResult`, `EXPIRY_BUFFER`, `DEFAULT_SHUTDOWN_TIMEOUT` | [`src/actor/model.rs`](src/actor/model.rs) | Shared domain model: strategies, `#[non_exhaustive]` policies & errors, restart types, shutdown policies, backoff computation, task exit results. |
+| Quickstart (Crash & 0-ms Rebind) | [`examples/quickstart.rs`](examples/quickstart.rs) | 35-line copy-paste showcase: real actor panic isolation and automatic `watch<SlotState>` rebinding. |
+| Microservice Pipeline | [`examples/microservice_pipeline.rs`](examples/microservice_pipeline.rs) | Ingestion worker + 0-hop `ResourceActor` auth cache (`stale_while_error`) + bounded `try_cast` backpressure. |
+| `RestForOne` Pipeline | [`examples/rest_for_one_pipeline.rs`](examples/rest_for_one_pipeline.rs) | 3-stage pipeline isolating panics and restarting only downstream stages (supports `--interactive`). |
 | Demo | [`examples/otp_actor.rs`](examples/otp_actor.rs) | Eight-phase walkthrough with simulated GCP tokens and a database secret. |
 | Minimum | [`examples/minimum.rs`](examples/minimum.rs) | Output-free minimal example demonstrating both `ResourceActor` and `StatefulActor` under a root `Supervisor`. |
 | Simple / Educational | [`examples/simple.rs`](examples/simple.rs) | Minimal, step-by-step example highlighting core usages, 0-hop reads, self-healing, `StatefulActor`, and graceful shutdown. |
@@ -168,8 +186,17 @@ flowchart TD
 # Build the core library (zero gRPC overhead)
 cargo build
 
+# 30-second quickstart: panic isolation + 0-ms client rebinding
+cargo run --example quickstart
+
 # Run the output-free minimal example (both actor types)
 cargo run --example minimum
+
+# Run the microservice ingestion pipeline blueprint (0-hop auth + backpressure + stale-while-error)
+cargo run --example microservice_pipeline
+
+# Run the RestForOne pipeline demo (or add `-- --interactive` to inject panics manually)
+cargo run --example rest_for_one_pipeline
 
 # Run the simple educational example (core usages only)
 cargo run --example simple
@@ -192,7 +219,7 @@ cargo run --example remote_server --features remote
 # Terminal 2 (Rechner A / Client):
 cargo run --example remote_client --features remote
 
-# Run all 81 core & remote tests (+ 4 doc-tests = 85 total)
+# Run all 82 core & remote tests (+ 4 doc-tests = 86 total)
 cargo test --all-features
 
 # Optimized build
@@ -222,7 +249,57 @@ use otp_actor::{ResourceActor, Supervisor, TimedResource, WorkerContext};
 
 ## Quick Start
 
-A complete example: a supervised actor that "fetches" a token which is valid for 60 seconds. It is refreshed in the background shortly before it expires, and served in 0 hops from the `watch` cache whenever fresh.
+### 1. Panic Recovery & 0-ms Client Rebinding (`StatefulActor`)
+
+Run this directly via `cargo run --example quickstart` ([`examples/quickstart.rs`](examples/quickstart.rs)):
+
+```rust
+use otp_actor::{ActorContext, ActorError, StatefulActor, StatefulActorBuilder, Supervisor};
+
+#[derive(Default)]
+struct Counter(i64);
+
+enum Msg { Add(i64), Get, PanicNow }
+
+impl StatefulActor for Counter {
+    type Message = Msg;
+    type Response = i64;
+    type Error = String;
+
+    async fn handle(&mut self, msg: Msg, ctx: &mut ActorContext<Self>) -> Result<i64, String> {
+        match msg {
+            Msg::Add(n) => { self.0 += n; Ok(self.0) }
+            Msg::Get => Ok(self.0),
+            Msg::PanicNow => panic!("boom inside instance #{}!", ctx.instance_id()),
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let root = Supervisor::new_root();
+    let client = StatefulActorBuilder::from_default::<Counter>("counter")
+        .spawn(&root)
+        .await?;
+
+    assert_eq!(client.call(Msg::Add(42)).await?, 42);
+
+    // Real panic inside the actor task — isolated by the Supervisor.
+    let crash = client.call(Msg::PanicNow).await;
+    assert!(matches!(crash, Err(ActorError::ActorUnavailable)));
+
+    // Same `ActorClient` immediately rebinds via `watch<SlotState>` (zero polling/sleeps)
+    // and delivers the non-Clone `Msg::Get` to the fresh replacement instance:
+    assert_eq!(client.call(Msg::Get).await?, 0);
+
+    root.shutdown().await?;
+    Ok(())
+}
+```
+
+### 2. Zero-Hop Resource Caching (`ResourceActor`)
+
+A supervised actor that "fetches" a token valid for 60 seconds, refreshes it in the background shortly before expiry, and serves fresh reads in **0 hops** directly from the `watch` snapshot:
 
 ```rust
 use std::time::Duration;
@@ -1222,6 +1299,9 @@ The integration suite in [`tests/actor_supervision_test.rs`](tests/actor_supervi
 │       ├── registry.rs                 # ActorNodeRegistry
 │       └── server.rs                   # ActorNodeService + ActorNodeHandle (2-phase shutdown)
 ├── examples
+│   ├── quickstart.rs                   # 35-line panic isolation & 0-ms watch<SlotState> rebind showcase
+│   ├── microservice_pipeline.rs        # ingestion worker + 0-hop auth cache + bounded try_cast backpressure
+│   ├── rest_for_one_pipeline.rs        # 3-stage RestForOne panic recovery (automated & --interactive)
 │   ├── minimum.rs                      # output-free minimal example for both actor types
 │   ├── otp_actor.rs                    # full 8-phase demo walkthrough
 │   ├── simple.rs                       # minimal step-by-step educational example
