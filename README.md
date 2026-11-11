@@ -138,6 +138,7 @@ flowchart TD
 | Protobuf Schema & Build Script | [`proto/actor_node.proto`](proto/actor_node.proto) & [`build.rs`](build.rs) | Compact universal gRPC actor wire contract (`Call`, `Cast`, `RemoteError`), compiled automatically via `tonic-prost-build`. |
 | `SupervisionStrategy`, `RestartPolicy`, `RestartTracker`, `RestartType`, `ShutdownPolicy`, `SupervisorError`, `TaskResult`, `EXPIRY_BUFFER`, `DEFAULT_SHUTDOWN_TIMEOUT` | [`src/actor/model.rs`](src/actor/model.rs) | Shared domain model: strategies, `#[non_exhaustive]` policies & errors, restart types, shutdown policies, backoff computation, task exit results. |
 | Demo | [`examples/otp_actor.rs`](examples/otp_actor.rs) | Eight-phase walkthrough with simulated GCP tokens and a database secret. |
+| Minimum | [`examples/minimum.rs`](examples/minimum.rs) | Output-free minimal example demonstrating both `ResourceActor` and `StatefulActor` under a root `Supervisor`. |
 | Simple / Educational | [`examples/simple.rs`](examples/simple.rs) | Minimal, step-by-step example highlighting core usages, 0-hop reads, self-healing, `StatefulActor`, and graceful shutdown. |
 | Dynamic Child | [`examples/dynamic_child.rs`](examples/dynamic_child.rs) | Dynamically spawning sibling child actors at runtime via `ctx.supervisor()`. |
 | Dynamic Supervisor | [`examples/dynamic_supervisor.rs`](examples/dynamic_supervisor.rs) | Dynamically provisioning isolated `OneForAll` child `Supervisor` subtrees at runtime. |
@@ -166,6 +167,9 @@ flowchart TD
 ```bash
 # Build the core library (zero gRPC overhead)
 cargo build
+
+# Run the output-free minimal example (both actor types)
+cargo run --example minimum
 
 # Run the simple educational example (core usages only)
 cargo run --example simple
@@ -1218,6 +1222,7 @@ The integration suite in [`tests/actor_supervision_test.rs`](tests/actor_supervi
 │       ├── registry.rs                 # ActorNodeRegistry
 │       └── server.rs                   # ActorNodeService + ActorNodeHandle (2-phase shutdown)
 ├── examples
+│   ├── minimum.rs                      # output-free minimal example for both actor types
 │   ├── otp_actor.rs                    # full 8-phase demo walkthrough
 │   ├── simple.rs                       # minimal step-by-step educational example
 │   ├── dynamic_child.rs                # dynamic child spawning via ctx.supervisor()
