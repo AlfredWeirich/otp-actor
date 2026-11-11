@@ -4,7 +4,7 @@
 
 > 📦 **Implementation Reference (`otp-actor`):**  
 > The architectural models, supervision hierarchies, and self-healing resilience strategies analyzed in this guide are implemented and battle-tested in the open-source Rust framework [**`otp-actor`**](https://github.com/AlfredWeirich/otp-actor) (available on [crates.io](https://crates.io/crates/otp-actor)).  
-> Inspired directly by Erlang/OTP, `otp-actor` brings unified recursive supervision trees (`Supervisor` → child `Supervisor`s / actors to arbitrary depth $N$), OTP restart strategies (`OneForOne`, `OneForAll`, `RestForOne`) at every level, generic proactive resource caching (`ResourceActor` with 0-hop `watch` cache reads), stateful actors (`gen_server`-style with `handle` / `handle_cast` / `ask`, instance-scoped timers & stream forwarding via `send_interval`, `forward_receiver`, and `spawn_scoped` / `ActorScope`), and bounded runtime introspection (`snapshot`, `watch_child_status`, `queue_stats`) with zero-polling reactive client re-binding to the [Tokio](https://tokio.rs) ecosystem.  
+> Inspired directly by Erlang/OTP, `otp-actor` brings unified recursive supervision trees (`Supervisor` → child `Supervisor`s / actors to arbitrary depth $N$), OTP restart strategies (`OneForOne`, `OneForAll`, `RestForOne`) at every level, generic proactive resource caching (`ResourceActor` with 0-hop `watch` cache reads), stateful actors (`gen_server`-style with `handle` / `handle_cast` / `ask`, instance-scoped timers & stream forwarding via `send_interval`, `forward_receiver`, and `spawn_scoped` / `ActorScope`), and bounded runtime introspection (`snapshot`, `snapshot_tree`, `watch_child_status`, `queue_stats`, `cache_state`) with zero-polling reactive client re-binding to the [Tokio](https://tokio.rs) ecosystem.  
 > It also supports distributed **remote actors** over gRPC with location transparency via the optional `remote` feature (see [Section 5.4](#54-distributed-actors-remote-communication-over-grpc-in-otp-actor) and the [GitHub repository](https://github.com/AlfredWeirich/otp-actor) for architecture details and multi-process examples).
 
 ---
@@ -1006,7 +1006,7 @@ To solve this without polling loops or supervisor bottlenecks, modern frameworks
 
 ## 4.6 Runtime Introspection & Non-Intrusive Health Observation
 
-Production supervision trees need visibility for Kubernetes readiness probes (`/readyz`), flapping detection, and queue-depth telemetry—without introducing overhead or race conditions on the data-plane hot path. Designing introspection inside an OTP supervisor involves four critical trade-offs:
+Production supervision trees need visibility for Kubernetes readiness probes (`/readyz`), flapping detection, queue-depth telemetry, and cache health—without introducing overhead or race conditions on the data-plane hot path. Designing introspection inside an OTP supervisor involves six critical trade-offs:
 
 ### 1. Single-Source-of-Truth Watching (`watch_child_status`) vs. Parallel Channels
 A tempting anti-pattern is adding a second `watch::Sender<ChildStatus>` per child dedicated to observers. Maintaining two parallel state channels across restarts, strategy waves (`OneForAll` / `RestForOne`), stops, and deletions creates a persistent risk of **state-desynchronization bugs**.
@@ -1027,6 +1027,20 @@ What makes a supervision tree "healthy" depends entirely on deployment semantics
 Operators frequently monitor bounded mailbox saturation via client telemetry (`ActorClient::queue_stats()` → `QueueStats { max_capacity, available, queued, is_closed, is_full() }`).
 * Reading `max_capacity()` and `capacity()` from the client's locally cached `mpsc::Sender` incurs zero supervisor round-trips and never holds locks across `.await`.
 * **Operational Caveat:** Because the cached sender updates reactively on rebind, `queue_stats()` returns approximate point-in-time counts—and immediately after an actor crashes (before that client issues its next `call` or `cast` to rebind onto the replacement instance), it reflects the exited instance's closed mailbox (`is_closed == true`).
+
+### 5. Whole-Hierarchy Snapshots Without Blocking a Supervisor (`snapshot_tree`)
+A flat `snapshot()` only describes one level. Real deployments nest supervisors (`root → pipeline → worker pool`), and a readiness probe usually wants the whole picture in one call. Two naive designs are traps:
+* **The Parent-Waits-for-Child Deadlock:** Letting each supervisor *recursively ask its child supervisors for snapshots from inside its own event loop* ties up the parent while it waits. A child that concurrently needs its parent (for example to rebind via the parent's command mailbox) can then deadlock the pair. A supervisor must never block on its own subtree.
+* **The Per-Level Timeout Trap:** Giving every level its own timeout makes the worst case grow with tree depth, and a single stuck subtree can consume the whole budget before its siblings are even asked.
+* **Solution:** `SupervisorHandle::snapshot_tree_timeout(d)` runs the recursion **on the caller side**. It fetches the flat per-level snapshot, then descends into each child that is a supervisor (`ChildSnapshot::is_supervisor`, recorded from the child spec so it stays correct even for `Stopped` or `Failed` supervisor children). All child supervisors are queried **concurrently under one shared deadline**, so a stuck subtree cannot starve its siblings and total latency stays bounded by `d` regardless of depth.
+* **Failure Semantics (Resilient, Not Fail-Fast):** A health probe is most valuable exactly when something is wrong, so a failing subtree must not discard the rest of the picture. Only an unreachable *root* fails the call. Every child supervisor that is restarting (`SupervisorUnavailable`), stopped (`ChildNotFound`), permanently failed (its failure reason), or too slow (`Timeout`) is recorded as an `Err` in its `SubtreeSnapshot::result` while the remaining subtrees are returned in full. Helpers such as `find(&["mid", "deep"])`, `all_running_deep()`, `any_failed_deep()`, `any_restarting_deep()`, and `unavailable_count()` stay raw facts; readiness *policy* remains yours (see 3).
+* **Operational Caveat:** The tree is collected level by level from independent supervisors, so it is **not an atomic cut** across levels: a child may restart between the moment its parent and the child itself are queried.
+
+### 6. Cache Health Without a Mailbox Hop (`ResourceClient::cache_state`)
+Whether an expiring resource (OAuth token, DB credential) is currently servable is a common readiness signal, but asking the `ResourceActor` for it would queue the probe behind in-flight workers and mailbox traffic, which is the opposite of what a probe should do.
+* **Solution:** `ResourceClient::cache_state()` is **synchronous** and classifies the same 0-hop `watch` snapshot that `get()` reads first: `Empty`, `Fresh`, `RefreshDue` (valid but inside the pre-expiration buffer, so the next `get()` takes the 1-hop refresh path), `StaleUsable` (expired but inside the `stale_while_error` window), `Expired`, or `Invalidated`. Timing metadata (`expires_in`, `expired_for`) is included. The configured `stale_while_error` window travels with the endpoint so expired entries can be told apart as `StaleUsable` vs. `Expired`.
+* **No Secret Leakage:** The state carries metadata only and never the cached value, so it is safe to log or export as a metric. This complements the redacting `Debug` of `TimedResource`.
+* **Operational Caveat:** Like `queue_stats()`, it reads the client's locally cached endpoint. After an actor crash and *before* the client's next call rebinds it, it reports `Invalidated`.
 
 ---
 
@@ -1063,7 +1077,7 @@ Review this checklist when designing actor-based systems:
   - `OneForAll` for tightly coupled in-memory state.
   - `RestForOne` for sequential data pipelines.
 - [ ] **Configure Crash-Loop Protection:** Pair a maximum restart threshold (e.g., 3 restarts in 5 seconds) with exponential backoff.
-- [ ] **Bound Health Checks & Monitor Flapping:** Query supervisor snapshots with an explicit deadline (`snapshot_timeout`), distinguish active failures (`any_failed()`) from transient backoff (`any_restarting()`), track sliding-window restarts (`restarts_in_window`), and subscribe non-invasively via `watch_child_status()` instead of polling.
+- [ ] **Bound Health Checks & Monitor Flapping:** Query supervisor snapshots with an explicit deadline (`snapshot_timeout`, or `snapshot_tree_timeout` for nested hierarchies), distinguish active failures (`any_failed()` / `any_failed_deep()`) from transient backoff (`any_restarting()`), track sliding-window restarts (`restarts_in_window`), treat unreachable subtrees (`unavailable_count()`) as their own signal, and subscribe non-invasively via `watch_child_status()` instead of polling. Use `ResourceClient::cache_state()` to expose credential/cache freshness without a mailbox hop.
 - [ ] **Incorporate Graceful Shutdown:** Grant stateful actors an adequate timeout window (`ShutdownPolicy::Timeout`) to drain mailboxes and commit state before teardown.
 
 ---

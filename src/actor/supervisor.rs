@@ -10,7 +10,7 @@
 //! - [`ShutdownPolicy::Timeout`], [`ShutdownPolicy::BrutalKill`], and [`ShutdownPolicy::Infinity`]
 //! - Rate-limited exponential backoff ([`RestartPolicy`], [`RestartTracker`]) and optional failure escalation (`escalate_on_failure`)
 //! - Lock-free, zero-polling data-plane rebinding via per-child [`tokio::sync::watch`] channels ([`SlotState`])
-//! - Runtime introspection snapshots with built-in timeouts ([`SupervisorHandle::snapshot`], [`SupervisorHandle::snapshot_timeout`]) and read-only status observation ([`SupervisorHandle::watch_child_status`]).
+//! - Runtime introspection snapshots with built-in timeouts ([`SupervisorHandle::snapshot`], [`SupervisorHandle::snapshot_timeout`]), whole-hierarchy snapshots under one shared deadline ([`SupervisorHandle::snapshot_tree`], [`SupervisorHandle::snapshot_tree_timeout`]), and read-only status observation ([`SupervisorHandle::watch_child_status`]).
 
 use std::any::Any;
 use std::collections::HashMap;

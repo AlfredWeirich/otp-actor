@@ -17,11 +17,12 @@
 //!    - Honors OTP-grade child restart specifications ([`RestartType::Transient`], [`RestartType::Permanent`], [`RestartType::Temporary`]).
 //!    - Enforces bounded graceful shutdown policies ([`ShutdownPolicy::Timeout`], [`ShutdownPolicy::BrutalKill`], [`ShutdownPolicy::Infinity`]).
 //!    - Defends against crash loops using sliding-window rate limiting and exponential backoff ([`RestartPolicy`], [`RestartTracker`]).
-//!    - Exposes bounded runtime introspection snapshots ([`SupervisorHandle::snapshot`], [`SupervisorHandle::snapshot_timeout`]) and read-only status observation ([`SupervisorHandle::watch_child_status`]).
+//!    - Exposes bounded runtime introspection snapshots ([`SupervisorHandle::snapshot`], [`SupervisorHandle::snapshot_timeout`]), whole-hierarchy views with per-subtree failure isolation ([`SupervisorHandle::snapshot_tree`], [`SupervisorHandle::snapshot_tree_timeout`]), and read-only status observation ([`SupervisorHandle::watch_child_status`]).
 //!
 //! 2. **Resource Actor** ([`ResourceActor`]):
 //!    - Proactively fetches, caches, and refreshes expiring resources (OAuth2 tokens, dynamic secrets, database credentials, configuration snapshots).
 //!    - Zero-hop cache reads via [`tokio::sync::watch`] in [`ResourceClient::get`].
+//!    - Non-intrusive cache health classification without a mailbox hop ([`ResourceClient::cache_state`] → [`CacheState`]).
 //!    - Zero-cost worker execution via the [`Worker`] trait: accepts custom structs, standalone `async fn`s, or closures returning native `impl Future` without `Box::pin` heap allocations.
 //!    - Single-flight request coalescing (multiple concurrent callers await a single backend fetch).
 //!    - Proactive background timer refresh before hard TTL expiration with entropy-hashed jitter.

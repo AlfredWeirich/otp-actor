@@ -7,6 +7,9 @@
 //! - **Zero-Hop Cache Reads**: Fresh cached resources are published to a [`tokio::sync::watch`] channel
 //!   and served in 0 hops by [`ResourceClient::get`] without allocating a `oneshot` channel or traversing
 //!   the actor mailbox.
+//! - **Non-Intrusive Cache Health**: [`ResourceClient::cache_state`] classifies the same 0-hop cache
+//!   ([`CacheState`]: `Fresh`, `RefreshDue`, `StaleUsable`, `Expired`, ...) without a mailbox hop and
+//!   without ever exposing the cached value.
 //! - **Zero-Cost Worker Futures**: Accepts custom structs, standalone `async fn`s, or closures returning
 //!   native `impl Future` without `Box::pin` heap allocations.
 //! - **Single-Flight Coalescing & Backpressure**: Concurrent cache-miss callers coalesce onto a single
