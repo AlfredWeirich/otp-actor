@@ -1,5 +1,7 @@
 # otp-actor — Fault-Tolerant OTP Actors, 0-ms Self-Healing & gRPC Remoting for Tokio
 
+> **Note:** This crate is based on code developed in a large production system since 2024 and is now being extracted step by step into a standalone crate.
+
 **Stop writing brittle reconnect loops, guarding unbounded mailboxes against OOM, or wrapping actors in proc-macro boilerplate.**
 `otp-actor` brings Erlang/OTP supervision semantics to [Tokio](https://tokio.rs) with strictly decoupled control and data planes:
 
