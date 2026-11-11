@@ -114,6 +114,6 @@ pub use stateful_actor::{
 };
 pub use supervisor::{
     ChildSnapshot, ChildSpec, ChildStatus, ChildStatusWatcher, ShutdownSignalFn, SlotState,
-    SpawnContext, Supervisor, SupervisorBuilder, SupervisorHandle, SupervisorSnapshot,
-    UntypedActorFactory, UntypedSender,
+    SpawnContext, SubtreeSnapshot, Supervisor, SupervisorBuilder, SupervisorHandle,
+    SupervisorSnapshot, SupervisorTreeSnapshot, UntypedActorFactory, UntypedSender,
 };
