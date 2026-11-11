@@ -224,7 +224,7 @@ cargo run --example remote_server --features remote
 # Terminal 2 (Rechner A / Client):
 cargo run --example remote_client --features remote
 
-# Run all 92 core & remote tests (+ 4 doc-tests = 96 total)
+# Run all 96 core & remote tests (+ 4 doc-tests = 100 total)
 cargo test --all-features
 
 # Optimized build
