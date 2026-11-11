@@ -2388,19 +2388,36 @@ impl SupervisorHandle {
         }
     }
 
-    /// Starts and supervises a new child (leaf actor or nested [`SupervisorBuilder`]) from a [`ChildSpec`].
-    pub async fn start_child(&self, spec: impl Into<ChildSpec>) -> Result<(), SupervisorError> {
-        let (tx, rx) = oneshot::channel();
+    /// Sends a typed [`SupervisorCommand`] created by `make_cmd` and awaits its `oneshot` response.
+    async fn send_request<T>(
+        &self,
+        make_cmd: impl FnOnce(oneshot::Sender<T>) -> SupervisorCommand,
+    ) -> Result<T, SupervisorError> {
         let cmd_sender = self.get_sender().await?;
+        let (tx, rx) = oneshot::channel();
         cmd_sender
-            .send(SupervisorCommand::StartChild {
-                spec: spec.into(),
-                respond_to: tx,
-            })
+            .send(make_cmd(tx))
             .await
             .map_err(|_| SupervisorError::SupervisorUnavailable)?;
 
-        rx.await.map_err(|_| SupervisorError::SupervisorUnavailable)?
+        rx.await.map_err(|_| SupervisorError::SupervisorUnavailable)
+    }
+
+    /// Sends a fallible [`SupervisorCommand`] and flattens the reply's [`SupervisorError`] into the result.
+    async fn send_result<T>(
+        &self,
+        make_cmd: impl FnOnce(oneshot::Sender<Result<T, SupervisorError>>) -> SupervisorCommand,
+    ) -> Result<T, SupervisorError> {
+        self.send_request(make_cmd).await?
+    }
+
+    /// Starts and supervises a new child (leaf actor or nested [`SupervisorBuilder`]) from a [`ChildSpec`].
+    pub async fn start_child(&self, spec: impl Into<ChildSpec>) -> Result<(), SupervisorError> {
+        self.send_result(|respond_to| SupervisorCommand::StartChild {
+            spec: spec.into(),
+            respond_to,
+        })
+        .await
     }
 
     /// Manually restarts or recovers a child, resetting its failed status and backoff counters.
@@ -2409,17 +2426,11 @@ impl SupervisorHandle {
         &self,
         child_name: impl Into<String>,
     ) -> Result<(), SupervisorError> {
-        let (tx, rx) = oneshot::channel();
-        let cmd_sender = self.get_sender().await?;
-        cmd_sender
-            .send(SupervisorCommand::RestartChild {
-                child_name: child_name.into(),
-                respond_to: tx,
-            })
-            .await
-            .map_err(|_| SupervisorError::SupervisorUnavailable)?;
-
-        rx.await.map_err(|_| SupervisorError::SupervisorUnavailable)?
+        self.send_result(|respond_to| SupervisorCommand::RestartChild {
+            child_name: child_name.into(),
+            respond_to,
+        })
+        .await
     }
 
     /// Gracefully stops a specific supervised child according to its [`ShutdownPolicy`].
@@ -2431,17 +2442,11 @@ impl SupervisorHandle {
     /// the supervisor waits for the child to finish its current handler before acknowledging
     /// `stop_child`, which will deadlock until its [`ShutdownPolicy`] timeout expires.
     pub async fn stop_child(&self, child_name: impl Into<String>) -> Result<(), SupervisorError> {
-        let (tx, rx) = oneshot::channel();
-        let cmd_sender = self.get_sender().await?;
-        cmd_sender
-            .send(SupervisorCommand::StopChild {
-                child_name: child_name.into(),
-                respond_to: tx,
-            })
-            .await
-            .map_err(|_| SupervisorError::SupervisorUnavailable)?;
-
-        rx.await.map_err(|_| SupervisorError::SupervisorUnavailable)?
+        self.send_result(|respond_to| SupervisorCommand::StopChild {
+            child_name: child_name.into(),
+            respond_to,
+        })
+        .await
     }
 
     /// Gracefully stops (if running) and completely removes a child's specification and state from this supervisor.
@@ -2452,17 +2457,11 @@ impl SupervisorHandle {
     /// the supervisor waits for the child to finish its current handler before acknowledging
     /// `delete_child`, which will deadlock until its [`ShutdownPolicy`] timeout expires.
     pub async fn delete_child(&self, child_name: impl Into<String>) -> Result<(), SupervisorError> {
-        let (tx, rx) = oneshot::channel();
-        let cmd_sender = self.get_sender().await?;
-        cmd_sender
-            .send(SupervisorCommand::DeleteChild {
-                child_name: child_name.into(),
-                respond_to: tx,
-            })
-            .await
-            .map_err(|_| SupervisorError::SupervisorUnavailable)?;
-
-        rx.await.map_err(|_| SupervisorError::SupervisorUnavailable)?
+        self.send_result(|respond_to| SupervisorCommand::DeleteChild {
+            child_name: child_name.into(),
+            respond_to,
+        })
+        .await
     }
 
     fn current_command_sender(&self) -> Option<Sender<SupervisorCommand>> {
@@ -2536,17 +2535,11 @@ impl SupervisorHandle {
         &self,
         child_name: &str,
     ) -> Result<watch::Receiver<SlotState>, SupervisorError> {
-        let (tx, rx) = oneshot::channel();
-        let cmd_sender = self.get_sender().await?;
-        cmd_sender
-            .send(SupervisorCommand::ResolveChildSlot {
-                child_name: child_name.to_string(),
-                respond_to: tx,
-            })
-            .await
-            .map_err(|_| SupervisorError::SupervisorUnavailable)?;
-
-        rx.await.map_err(|_| SupervisorError::SupervisorUnavailable)?
+        self.send_result(|respond_to| SupervisorCommand::ResolveChildSlot {
+            child_name: child_name.to_string(),
+            respond_to,
+        })
+        .await
     }
 
     /// Captures a point-in-time [`SupervisorSnapshot`] with the default [`DEFAULT_SNAPSHOT_TIMEOUT`].
@@ -2574,14 +2567,8 @@ impl SupervisorHandle {
 
     /// Requests a [`SupervisorSnapshot`] from this supervisor without any deadline of its own.
     async fn snapshot_untimed(&self) -> Result<SupervisorSnapshot, SupervisorError> {
-        let cmd_sender = self.get_sender().await?;
-        let (tx, rx) = oneshot::channel();
-        cmd_sender
-            .send(SupervisorCommand::Snapshot { respond_to: tx })
+        self.send_request(|respond_to| SupervisorCommand::Snapshot { respond_to })
             .await
-            .map_err(|_| SupervisorError::SupervisorUnavailable)?;
-
-        rx.await.map_err(|_| SupervisorError::SupervisorUnavailable)
     }
 
     /// Captures a point-in-time [`SupervisorTreeSnapshot`] of this supervisor and all nested child
@@ -2712,23 +2699,41 @@ impl SupervisorHandle {
         child_name: impl Into<String>,
     ) -> Result<ChildStatusWatcher, SupervisorError> {
         let child_name = child_name.into();
-        let (tx, rx) = oneshot::channel();
-        let cmd_sender = self.get_sender().await?;
-        cmd_sender
-            .send(SupervisorCommand::ObserveChildSlot {
+        let rx = self
+            .send_result(|respond_to| SupervisorCommand::ObserveChildSlot {
                 child_name: child_name.clone(),
-                respond_to: tx,
+                respond_to,
             })
+            .await?;
+        Ok(ChildStatusWatcher { child_name, rx })
+    }
+
+    /// Waits for a supervised child slot to settle out of [`SlotState::Restarting`]
+    /// and downcasts its active endpoint to `E`.
+    async fn resolve_running_endpoint<E: Clone + Send + Sync + 'static>(
+        &self,
+        child_name: String,
+    ) -> Result<(String, E, watch::Receiver<SlotState>), SupervisorError> {
+        let mut slot_rx = self.resolve_child_slot(&child_name).await?;
+        let state = slot_rx
+            .wait_for(|s| !matches!(s, SlotState::Restarting { .. }))
             .await
             .map_err(|_| SupervisorError::SupervisorUnavailable)?;
+        let endpoint = match &*state {
+            SlotState::Running { endpoint, .. } => {
+                if let Some(ep) = endpoint.downcast_ref::<E>() {
+                    ep.clone()
+                } else {
+                    return Err(SupervisorError::ChildTypeMismatch(child_name));
+                }
+            }
+            SlotState::Failed(err) => return Err(err.clone()),
+            SlotState::Stopped => return Err(SupervisorError::ChildNotFound(child_name)),
+            SlotState::Restarting { .. } => unreachable!(),
+        };
+        drop(state);
 
-        let slot_rx = rx
-            .await
-            .map_err(|_| SupervisorError::SupervisorUnavailable)??;
-        Ok(ChildStatusWatcher {
-            child_name,
-            rx: slot_rx,
-        })
+        Ok((child_name, endpoint, slot_rx))
     }
 
     /// Retrieves a direct [`ResourceClient`] data-plane handle for a supervised [`super::generic_actor::ResourceActor`].
@@ -2739,26 +2744,9 @@ impl SupervisorHandle {
         &self,
         child_name: impl Into<String>,
     ) -> Result<ResourceClient<T, E>, SupervisorError> {
-        let name = child_name.into();
-        let mut slot_rx = self.resolve_child_slot(&name).await?;
-        let state = slot_rx
-            .wait_for(|s| !matches!(s, SlotState::Restarting { .. }))
-            .await
-            .map_err(|_| SupervisorError::SupervisorUnavailable)?;
-        let endpoint = match &*state {
-            SlotState::Running { endpoint, .. } => {
-                if let Some(ep) = endpoint.downcast_ref::<ResourceEndpoint<T, E>>() {
-                    ep.clone()
-                } else {
-                    return Err(SupervisorError::ChildTypeMismatch(name));
-                }
-            }
-            SlotState::Failed(err) => return Err(err.clone()),
-            SlotState::Stopped => return Err(SupervisorError::ChildNotFound(name)),
-            SlotState::Restarting { .. } => unreachable!(),
-        };
-        drop(state);
-
+        let (name, endpoint, slot_rx) = self
+            .resolve_running_endpoint::<ResourceEndpoint<T, E>>(child_name.into())
+            .await?;
         Ok(ResourceClient::new(name, endpoint, slot_rx, self.clone()))
     }
 
@@ -2767,26 +2755,9 @@ impl SupervisorHandle {
         &self,
         child_name: impl Into<String>,
     ) -> Result<ActorClient<A>, SupervisorError> {
-        let name = child_name.into();
-        let mut slot_rx = self.resolve_child_slot(&name).await?;
-        let state = slot_rx
-            .wait_for(|s| !matches!(s, SlotState::Restarting { .. }))
-            .await
-            .map_err(|_| SupervisorError::SupervisorUnavailable)?;
-        let sender = match &*state {
-            SlotState::Running { endpoint, .. } => {
-                if let Some(tx) = endpoint.downcast_ref::<Sender<ActorEnvelope<A>>>() {
-                    tx.clone()
-                } else {
-                    return Err(SupervisorError::ChildTypeMismatch(name));
-                }
-            }
-            SlotState::Failed(err) => return Err(err.clone()),
-            SlotState::Stopped => return Err(SupervisorError::ChildNotFound(name)),
-            SlotState::Restarting { .. } => unreachable!(),
-        };
-        drop(state);
-
+        let (name, sender, slot_rx) = self
+            .resolve_running_endpoint::<Sender<ActorEnvelope<A>>>(child_name.into())
+            .await?;
         Ok(ActorClient::new(name, sender, slot_rx, self.clone()))
     }
 
@@ -2795,26 +2766,9 @@ impl SupervisorHandle {
         &self,
         child_name: impl Into<String>,
     ) -> Result<SupervisorHandle, SupervisorError> {
-        let name = child_name.into();
-        let mut slot_rx = self.resolve_child_slot(&name).await?;
-        let state = slot_rx
-            .wait_for(|s| !matches!(s, SlotState::Restarting { .. }))
-            .await
-            .map_err(|_| SupervisorError::SupervisorUnavailable)?;
-        let sender = match &*state {
-            SlotState::Running { endpoint, .. } => {
-                if let Some(tx) = endpoint.downcast_ref::<Sender<SupervisorCommand>>() {
-                    tx.clone()
-                } else {
-                    return Err(SupervisorError::ChildTypeMismatch(name));
-                }
-            }
-            SlotState::Failed(err) => return Err(err.clone()),
-            SlotState::Stopped => return Err(SupervisorError::ChildNotFound(name)),
-            SlotState::Restarting { .. } => unreachable!(),
-        };
-        drop(state);
-
+        let (name, sender, slot_rx) = self
+            .resolve_running_endpoint::<Sender<SupervisorCommand>>(child_name.into())
+            .await?;
         Ok(SupervisorHandle::new_child_handle(
             name,
             sender,
@@ -2828,17 +2782,11 @@ impl SupervisorHandle {
         &self,
         child_name: &str,
     ) -> Result<UntypedSender, SupervisorError> {
-        let (tx, rx) = oneshot::channel();
-        let cmd_sender = self.get_sender().await?;
-        cmd_sender
-            .send(SupervisorCommand::ResolveChildChannel {
-                child_name: child_name.to_string(),
-                respond_to: tx,
-            })
-            .await
-            .map_err(|_| SupervisorError::SupervisorUnavailable)?;
-
-        rx.await.map_err(|_| SupervisorError::SupervisorUnavailable)?
+        self.send_result(|respond_to| SupervisorCommand::ResolveChildChannel {
+            child_name: child_name.to_string(),
+            respond_to,
+        })
+        .await
     }
 
     /// Queries the supervisor's registry and downcasts the endpoint to the expected type `S`.
@@ -2857,17 +2805,11 @@ impl SupervisorHandle {
     /// Injects an intentional crash into a specific child managed by this supervisor.
     #[cfg(any(test, feature = "chaos_test"))]
     pub async fn trigger_child_crash(&self, child_name: &str) -> Result<(), SupervisorError> {
-        let (tx, rx) = oneshot::channel();
-        let cmd_sender = self.get_sender().await?;
-        cmd_sender
-            .send(SupervisorCommand::TriggerChildCrash {
-                child_name: child_name.to_string(),
-                respond_to: tx,
-            })
-            .await
-            .map_err(|_| SupervisorError::SupervisorUnavailable)?;
-
-        rx.await.map_err(|_| SupervisorError::SupervisorUnavailable)?
+        self.send_result(|respond_to| SupervisorCommand::TriggerChildCrash {
+            child_name: child_name.to_string(),
+            respond_to,
+        })
+        .await
     }
 
     /// Injects an intentional crash into this supervisor itself.
