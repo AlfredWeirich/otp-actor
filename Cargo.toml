@@ -10,6 +10,9 @@ repository = "https://github.com/AlfredWeirich/otp-actor"
 keywords = ["actor", "supervision", "tokio", "cache", "resilience"]
 categories = ["asynchronous", "concurrency"]
 
+[package.metadata.docs.rs]
+all-features = true
+
 [features]
 default = []
 chaos_test = []
