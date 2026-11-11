@@ -17,6 +17,7 @@
 //!    - Honors OTP-grade child restart specifications ([`RestartType::Transient`], [`RestartType::Permanent`], [`RestartType::Temporary`]).
 //!    - Enforces bounded graceful shutdown policies ([`ShutdownPolicy::Timeout`], [`ShutdownPolicy::BrutalKill`], [`ShutdownPolicy::Infinity`]).
 //!    - Defends against crash loops using sliding-window rate limiting and exponential backoff ([`RestartPolicy`], [`RestartTracker`]).
+//!    - Exposes bounded runtime introspection snapshots ([`SupervisorHandle::snapshot`], [`SupervisorHandle::snapshot_timeout`]) and read-only status observation ([`SupervisorHandle::watch_child_status`]).
 //!
 //! 2. **Resource Actor** ([`ResourceActor`]):
 //!    - Proactively fetches, caches, and refreshes expiring resources (OAuth2 tokens, dynamic secrets, database credentials, configuration snapshots).
@@ -30,7 +31,7 @@
 //! 3. **General-Purpose Stateful Actor** ([`StatefulActor`]):
 //!    - Modeled after Erlang/OTP `gen_server` for building robust state machines.
 //!    - Native `impl Future` methods (`handle`, `handle_cast`, `on_start`, `on_stop`) with zero heap allocations per message.
-//!    - Direct 1-hop data plane with typed request/response ([`ActorClient::call`], [`ActorClient::ask`] via [`CallMessage`]) and asynchronous notification ([`ActorClient::cast`], [`ActorClient::try_cast`], [`ActorClient::cast_timeout`]).
+//!    - Direct 1-hop data plane with typed request/response ([`ActorClient::call`], [`ActorClient::ask`] via [`CallMessage`]), asynchronous notification ([`ActorClient::cast`], [`ActorClient::try_cast`], [`ActorClient::cast_timeout`]), and approximate mailbox depth inspection ([`ActorClient::queue_stats`]).
 //!    - Rich execution context ([`ActorContext`]) with `client()`, `supervisor()`, `send_after()`, `send_interval()`, `send_interval_with()`, `spawn_scoped()`, `forward_receiver()`, and controlled failure escalation via [`ActorContext::fail`].
 //!    - Supervised alongside [`ResourceActor`] and child [`Supervisor`]s under the same supervision tree.
 //!

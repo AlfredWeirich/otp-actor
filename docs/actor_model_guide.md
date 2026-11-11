@@ -4,7 +4,7 @@
 
 > 📦 **Implementation Reference (`otp-actor`):**  
 > The architectural models, supervision hierarchies, and self-healing resilience strategies analyzed in this guide are implemented and battle-tested in the open-source Rust framework [**`otp-actor`**](https://github.com/AlfredWeirich/otp-actor) (available on [crates.io](https://crates.io/crates/otp-actor)).  
-> Inspired directly by Erlang/OTP, `otp-actor` brings unified recursive supervision trees (`Supervisor` → child `Supervisor`s / actors to arbitrary depth $N$), OTP restart strategies (`OneForOne`, `OneForAll`, `RestForOne`) at every level, generic proactive resource caching (`ResourceActor` with 0-hop `watch` cache reads), and stateful actors (`gen_server`-style with `handle` / `handle_cast` / `ask` / `send_after`) with zero-polling reactive client re-binding to the [Tokio](https://tokio.rs) ecosystem.  
+> Inspired directly by Erlang/OTP, `otp-actor` brings unified recursive supervision trees (`Supervisor` → child `Supervisor`s / actors to arbitrary depth $N$), OTP restart strategies (`OneForOne`, `OneForAll`, `RestForOne`) at every level, generic proactive resource caching (`ResourceActor` with 0-hop `watch` cache reads), stateful actors (`gen_server`-style with `handle` / `handle_cast` / `ask`, instance-scoped timers & stream forwarding via `send_interval`, `forward_receiver`, and `spawn_scoped` / `ActorScope`), and bounded runtime introspection (`snapshot`, `watch_child_status`, `queue_stats`) with zero-polling reactive client re-binding to the [Tokio](https://tokio.rs) ecosystem.  
 > It also supports distributed **remote actors** over gRPC with location transparency via the optional `remote` feature (see [Section 5.4](#54-distributed-actors-remote-communication-over-grpc-in-otp-actor) and the [GitHub repository](https://github.com/AlfredWeirich/otp-actor) for architecture details and multi-process examples).
 
 ---
@@ -31,12 +31,14 @@
    - [3.4 The Typed Client (`ActorClient`)](#34-the-typed-client-actorclient)
    - [3.5 Complete Implementation: The Circuit Breaker Actor](#35-complete-implementation-the-circuit-breaker-actor)
    - [3.6 Mailbox Management and Backpressure](#36-mailbox-management-and-backpressure)
+   - [3.7 Lifecycle-Scoped Background Tasks, Timers, and Stream Forwarding](#37-lifecycle-scoped-background-tasks-timers-and-stream-forwarding)
 4. [Part 4: Supervisors & Fault Tolerance in Action](#part-4-supervisors--fault-tolerance-in-action)
    - [4.1 The Role of the Supervisor: Control Plane vs. Data Plane](#41-the-role-of-the-supervisor-control-plane-vs-data-plane)
    - [4.2 The Three Classic OTP Restart Strategies](#42-the-three-classic-otp-restart-strategies)
    - [4.3 Lifecycle Specifications: RestartType and ShutdownPolicy](#43-lifecycle-specifications-restarttype-and-shutdownpolicy)
    - [4.4 Guarding Against Crash Loops: Rate Limiting & Exponential Backoff](#44-guarding-against-crash-loops-rate-limiting--exponential-backoff)
    - [4.5 Self-Healing in Rust with Tokio: Panics and Transparent Re-Bindings](#45-self-healing-in-rust-with-tokio-panics-and-transparent-re-bindings)
+   - [4.6 Runtime Introspection & Non-Intrusive Health Observation](#46-runtime-introspection--non-intrusive-health-observation)
 5. [Part 5: Conclusion, Outlook, and Production Checklist](#part-5-conclusion-outlook-and-production-checklist)
    - [5.1 Summary & Industry Perspective](#51-summary--industry-perspective)
    - [5.2 Production Best-Practice Checklist](#52-production-best-practice-checklist)
@@ -776,6 +778,65 @@ impl CircuitBreakerClient {
 
 ---
 
+## 3.7 Lifecycle-Scoped Background Tasks, Timers, and Stream Forwarding
+
+In real systems, actors rarely react to incoming RPCs alone. They maintain periodic heartbeats, consume external WebSocket/gRPC/Kafka feeds, or run asynchronous helper loops spawned from inside `on_start` or `handle`. Naively calling raw `tokio::spawn` with a self-healing client introduces **three subtle architectural hazards**:
+
+### 1. The Cross-Instance Leak Hazard
+Suppose an actor spawns a background reader loop holding a self-healing `ActorClient`:
+1. Actor instance `#1` panics because its internal protocol state became corrupt.
+2. The `Supervisor` spins up a clean replacement instance `#2` (with empty in-memory state).
+3. Meanwhile, the orphaned reader task from instance `#1` is still alive: its next `client.cast(stale_event)` **transparently rebinds to instance `#2`** and injects stale events or corrupted cursor offsets into the fresh actor!
+
+In Erlang/OTP, auxiliary processes are linked to the owning worker's lifetime so they terminate alongside it. In Rust/Tokio, the same invariant is achieved by **instance-pinned scoping (`ActorScope` / `ctx.spawn_scoped`)**:
+* A scoped task receives an `ActorScope<A>` pinned strictly to the owning `instance_id` backed by a per-instance cancellation signal (`watch::Receiver<bool>`).
+* On clean shutdown, cancellation triggers once the mailbox drains (just before `on_stop`); on error or panic unwind, a Drop guard fires cancellation immediately.
+* Unlike `ActorClient`, `ActorScope` intentionally **never rebinds**: once instance `#1` exits, `scope.cancelled()` completes and `scope.cast(...)` / `scope.try_cast(...)` immediately return `Err(ActorError::ActorUnavailable)`.
+
+### 2. Idle Permit Starvation in Stream Forwarders
+Suppose an actor forwards messages from an external `mpsc::Receiver<T>` into its own bounded mailbox (`channel_capacity(1)` or `channel_capacity(4)`). A common mistake looks like this:
+
+```rust
+// ANTI-PATTERN: Holding a bounded mailbox permit while waiting on external I/O!
+while let Ok(permit) = self_tx.reserve().await {
+    match external_rx.recv().await {
+        Some(item) => permit.send(ActorEnvelope::Cast { msg: map(item) }),
+        None => break,
+    }
+}
+```
+
+**Why this breaks:** While `external_rx` is idle, the forwarder holds the only available slot in the mailbox. External `call()` / `cast()` callers wait forever on a "full" queue even though the actor has zero messages to process—creating a classic **permit-starvation deadlock**.
+
+**The Architectural Fix (`recv-before-reserve`):**
+Always await the *external event* (raced against instance cancellation) first, and **only after an item arrives** reserve a bounded mailbox slot (`tx.reserve().await`), again raced against cancellation:
+
+```text
+  [External Stream / Interval]          [Actor Mailbox]
+              │                                │
+  1. Wait for item or tick                     │
+     (biased select! with cancel_rx)           │
+              │                                │
+              ├──(no permit held while idle!)  │
+              ▼                                │
+  2. Now call tx.reserve().await ─────────────►│ (Acquire permit under backpressure)
+     (biased select! with cancel_rx)           │
+              │                                │
+              ▼                                │
+  3. permit.send(map_msg(item)) ──────────────►│ (Zero wasted work if cancelled)
+```
+
+In `otp-actor`, `ActorContext::forward_receiver(rx, map_msg)` implements this exact two-stage protocol.
+
+### 3. Backpressured Periodic Timers Without Catch-Up Bursts
+A naive interval loop (`tokio::time::interval`) defaults to `MissedTickBehavior::Burst`: if an actor handler stalls for 10 seconds under heavy load, releasing the stall unleashes a flood of queued timer ticks all at once, amplifying overload.
+* Binding timers to `ActorContext::send_interval` / `send_interval_with` solves three problems together:
+  1. Uses `MissedTickBehavior::Skip` so stalled intervals drop missed beats cleanly and resume on schedule.
+  2. In `send_interval_with`, constructs payloads lazily **only after** reserving a mailbox permit (`make_msg()`), avoiding heap allocations when backpressured and supporting **non-`Clone` message enums** (such as message enums carrying owned `mpsc::Receiver` or `oneshot::Sender` handles).
+  3. Cancels automatically on instance exit/panic and guards against `Duration::ZERO` (logging a warning instead of panicking inside `tokio::time::interval`).
+
+---
+
 # Part 4: Supervisors & Fault Tolerance in Action
 
 ## 4.1 The Role of the Supervisor: Control Plane vs. Data Plane
@@ -914,25 +975,24 @@ When an actor crashes and is re-spawned, channel-based architectures encounter a
 3. Subsequent calls to `.send()` immediately fail with `SendError("channel closed")`.
 4. *Without re-binding,* every client in the application would have to be torn down and manually recreated, defeating the purpose of autonomous self-healing.
 
-#### The 1-Hop Re-Binding Architecture
-To solve this, modern frameworks (such as `otp-actor`) equip clients with **transparent re-binding**. Clients hold a synchronized channel reference (`Arc<std::sync::RwLock<mpsc::Sender<Msg>>>`) alongside a handle to their managing supervisor:
+#### Reactive Slot-Watch Re-Binding Architecture
+To solve this without polling loops or supervisor bottlenecks, modern frameworks (such as `otp-actor`) pair a cached sender (`Arc<std::sync::RwLock<mpsc::Sender<Msg>>>`) with a per-child `tokio::sync::watch::Receiver<SlotState>`:
 
 ```
 [ Client ]                   [ Supervisor ]             [ Actor Task ]
     │                              │                           │
     ├─ 1. send(Msg) via Sender A ──┼──────────────────────────►│ (CRASH / PANIC!)
-    │                              │                           X Mailbox A destroyed!
+    │                              │                           X Mailbox A dropped!
     │◄─ Err(SendError) ────────────┼───────────────────────────┘
     │                              │
-    │ (Client detects drop)        ├─ 2. Spawns replacement task & Mailbox B
-    │                              ├─ 3. Registers Sender B in registry
-    │                              │
-    ├─ 4. Queries new mailbox ────►│
-    │◄─ Receives Sender B ─────────┤
-    │                              │
-    ├─ 5. Auto-retries via Sender B┼──────────────────────────►[ New Actor Task ]
-    │◄─ Ok(Response) ──────────────┼───────────────────────────┤ (Processes message)
-    ▼                              ▼                           ▼
+    │ (Client awaits SlotState     ├─ 2. Publishes SlotState::Restarting
+    │  via cached watch::Receiver) ├─ 3. Spawns replacement task & Mailbox B
+    │◄─ SlotState::Running(B) ─────┴─ 4. Broadcasts Running { Sender B }
+    │
+    ├─ 5. Rebinds Sender B locally (0 ms, zero polling)
+    ├─ 6. Auto-retries via Sender B───────────────────────────►[ New Actor Task ]
+    │◄─ Ok(Response) ──────────────────────────────────────────┤ (Processes message)
+    ▼                                                          ▼
 ```
 
 #### Detailed Re-Binding Lifecycle:
@@ -941,6 +1001,32 @@ To solve this, modern frameworks (such as `otp-actor`) equip clients with **tran
 3. **Zero-Polling Backoff Waiting:** While the supervisor executes a backoff delay or restart wave (`SlotState::Restarting`), the client suspends asynchronously on `slot_rx.wait_for(...)` until `SlotState::Running`, `SlotState::Stopped`, or `SlotState::Failed`—consuming zero CPU and avoiding per-caller polling or spin loops.
 4. **Transparent Retry:** Once the replacement actor spawns and transitions the slot to `SlotState::Running`, the client updates its internal sender (and 0-hop cache receiver for `ResourceClient`) and retries the original message transparently.
 5. **System Impact:** For upstream callers (e.g., REST API handlers or gRPC controllers), the failure was invisible—manifesting as a momentary millisecond latency bump rather than a dropped connection.
+
+---
+
+## 4.6 Runtime Introspection & Non-Intrusive Health Observation
+
+Production supervision trees need visibility for Kubernetes readiness probes (`/readyz`), flapping detection, and queue-depth telemetry—without introducing overhead or race conditions on the data-plane hot path. Designing introspection inside an OTP supervisor involves four critical trade-offs:
+
+### 1. Single-Source-of-Truth Watching (`watch_child_status`) vs. Parallel Channels
+A tempting anti-pattern is adding a second `watch::Sender<ChildStatus>` per child dedicated to observers. Maintaining two parallel state channels across restarts, strategy waves (`OneForAll` / `RestForOne`), stops, and deletions creates a persistent risk of **state-desynchronization bugs**.
+* **Architectural Solution:** Wrap the supervisor's *existing* `watch::Receiver<SlotState>` inside a read-only facade (`ChildStatusWatcher`) that maps `SlotState` on read (`current()`, `changed()`, `wait_for(...)`) without ever exposing internal channel endpoints (`UntypedSender`). Furthermore, observation queries (`watch_child_status`) intentionally accept children in `Stopped` or `Failed` states—even though data-plane lookups reject them—so monitors can watch recovery triggered by `restart_child`.
+
+### 2. Bounded Control-Plane Pull Snapshots (`snapshot_timeout`)
+Unlike steady-state message traffic, asking a supervisor for a coherent point-in-time overview of its children (`SupervisorSnapshot`: ordered `children`, active `instance_id`, `RestartType`, and `restarts_in_window`) goes through the supervisor's command mailbox.
+* **The Hanging Health-Check Hazard:** If a supervisor is currently stalled inside a cascading `ShutdownPolicy` window or restarting a sub-supervisor, an unbounded `snapshot()` call blocks the HTTP health probe alongside it. A readiness check that hangs is worse than one that fails fast.
+* **Solution:** Always bound supervisor introspection with an explicit deadline (`DEFAULT_SNAPSHOT_TIMEOUT` or `snapshot_timeout(d)` → `SupervisorError::Timeout(d)`). Pulling on demand preserves zero hot-path overhead even when supervising thousands of dynamic per-tenant actors (avoiding $O(N)$ snapshot allocations on every child transition).
+
+### 3. Separating Raw Facts from Readiness Policy (Why No `is_healthy()`)
+What makes a supervision tree "healthy" depends entirely on deployment semantics:
+* An actor briefly pausing in exponential backoff (`ChildStatus::Restarting`) is actively recovering—failing `/readyz` with HTTP `503` on every momentary restart can unnecessarily eject healthy pods from a load balancer.
+* Conversely, a sub-second transient retry inside a tight loop shows up cleanly via **flapping metrics** (`RestartTracker::restarts_in_window()`), which evaluates sliding-window timestamps dynamically so expired restarts age out even before the next crash occurs.
+* Therefore, `SupervisorSnapshot` deliberately omits a one-size-fits-all `is_healthy()` method (and leaves out `serde` derives on in-process snapshot types containing `SupervisorError` and `Instant`-backed trackers), instead providing composable raw predicates (`all_running()`, `any_failed()`, `any_restarting()`, `running_count()`, `restarting_count()`, `stopped_count()`, `failed_count()`).
+
+### 4. Lock-Free Client Queue Telemetry & Its Rebind Caveat (`queue_stats`)
+Operators frequently monitor bounded mailbox saturation via client telemetry (`ActorClient::queue_stats()` → `QueueStats { max_capacity, available, queued, is_closed, is_full() }`).
+* Reading `max_capacity()` and `capacity()` from the client's locally cached `mpsc::Sender` incurs zero supervisor round-trips and never holds locks across `.await`.
+* **Operational Caveat:** Because the cached sender updates reactively on rebind, `queue_stats()` returns approximate point-in-time counts—and immediately after an actor crashes (before that client issues its next `call` or `cast` to rebind onto the replacement instance), it reflects the exited instance's closed mailbox (`is_closed == true`).
 
 ---
 
@@ -967,6 +1053,7 @@ Review this checklist when designing actor-based systems:
 
 ### 2. Messaging & Mailbox Management
 - [ ] **Default to Bounded Channels:** Always configure bounded mailboxes in production to prevent out-of-memory crashes via natural backpressure.
+- [ ] **Scope Timers & Stream Forwarders to Instance Lifetimes:** Use instance-bound primitives (`spawn_scoped` / `ActorScope`, `send_interval`, `forward_receiver`) instead of detached `tokio::spawn` + auto-rebinding clients so crashes never leak background tasks across restarts and idle forwarders never starve mailbox permits.
 - [ ] **Enforce Mandatory Timeouts on `call`s:** Every request–response `call` must be bounded by a timeout (e.g., `call_timeout`) to prevent cascading hangs.
 - [ ] **Prevent Circular Invocations:** Eliminate circular `call` cycles between actors; use fire-and-forget `cast` notifications for cross-actor eventing.
 
@@ -976,6 +1063,7 @@ Review this checklist when designing actor-based systems:
   - `OneForAll` for tightly coupled in-memory state.
   - `RestForOne` for sequential data pipelines.
 - [ ] **Configure Crash-Loop Protection:** Pair a maximum restart threshold (e.g., 3 restarts in 5 seconds) with exponential backoff.
+- [ ] **Bound Health Checks & Monitor Flapping:** Query supervisor snapshots with an explicit deadline (`snapshot_timeout`), distinguish active failures (`any_failed()`) from transient backoff (`any_restarting()`), track sliding-window restarts (`restarts_in_window`), and subscribe non-invasively via `watch_child_status()` instead of polling.
 - [ ] **Incorporate Graceful Shutdown:** Grant stateful actors an adequate timeout window (`ShutdownPolicy::Timeout`) to drain mailboxes and commit state before teardown.
 
 ---
@@ -997,7 +1085,7 @@ While the core of the Actor Model thrives on intra-process message passing via l
 
 In the Rust ecosystem, crossing process and network boundaries poses a unique architectural challenge: Rust's type system relies on compile-time static types and zero-cost in-memory moves. Passing a message over a network requires serialization, network transport negotiation, error mapping, connection pooling, and DoS mitigation—all while preserving the developer-friendly semantics of `call`, `cast`, and supervisory self-healing.
 
-Starting with version `0.2.0` (and expanded in `0.3.0`), the [`otp-actor`](https://crates.io/crates/otp-actor) crate bridges this divide through an optional, high-performance distributed subsystem activated via `--features remote`. Built on top of **HTTP/2 gRPC** (`tonic` and `prost`), it extends OTP principles seamlessly across the network.
+Starting with version `0.2.0` (and expanded across `0.3.x`), the [`otp-actor`](https://crates.io/crates/otp-actor) crate bridges this divide through an optional, high-performance distributed subsystem activated via `--features remote`. Built on top of **HTTP/2 gRPC** (`tonic` and `prost`), it extends OTP principles seamlessly across the network.
 
 ---
 

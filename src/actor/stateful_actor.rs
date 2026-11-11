@@ -1028,6 +1028,36 @@ impl<A: StatefulActor> StatefulActorRunner<A> {
 // Direct Data-Plane Client for StatefulActor
 // ============================================================================
 
+/// Approximate point-in-time queue statistics for an [`ActorClient`]'s bounded mailbox channel.
+///
+/// Returned synchronously by [`ActorClient::queue_stats`] based on the currently cached channel
+/// sender (`current_sender()`). Because values are read lock-free without contacting the supervisor
+/// or triggering channel rebinding:
+///
+/// - `queued` and `available` are approximate point-in-time snapshots under concurrent sends/receives.
+/// - Immediately after an actor crash or restart (and *before* the next `call` / `cast` rebinds the
+///   client), `queue_stats()` still inspects the previous instance's dead mailbox, reporting
+///   `is_closed == true`.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueueStats {
+    /// Total bounded capacity configured for this mailbox (`StatefulActorBuilder::channel_capacity`).
+    pub max_capacity: usize,
+    /// Approximate remaining free slots currently available before backpressure.
+    pub available: usize,
+    /// Approximate number of queued messages or reserved permits (`max_capacity.saturating_sub(available)`).
+    pub queued: usize,
+    /// `true` if the currently cached mailbox channel is closed.
+    pub is_closed: bool,
+}
+
+impl QueueStats {
+    /// Returns `true` if no free slots are currently available in the cached mailbox (`available == 0`).
+    pub fn is_full(&self) -> bool {
+        self.available == 0
+    }
+}
+
 /// High-performance, self-healing 1-hop Data Plane client for a [`StatefulActor`].
 pub struct ActorClient<A: StatefulActor> {
     name: String,
@@ -1098,6 +1128,24 @@ impl<A: StatefulActor> ActorClient<A> {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    /// Returns an approximate point-in-time snapshot of this client's bounded mailbox queue.
+    ///
+    /// Reads only the locally cached sender (`current_sender()`) without contacting the supervisor
+    /// or waiting on locks/channels. As a result, concurrent senders/receivers may shift counts
+    /// immediately after return, and after an actor crash (before the next `call`/`cast` triggers
+    /// rebinding) this reflects the closed mailbox of the exited instance (`is_closed == true`).
+    pub fn queue_stats(&self) -> QueueStats {
+        let tx = self.current_sender();
+        let max_capacity = tx.max_capacity();
+        let available = tx.capacity().min(max_capacity);
+        QueueStats {
+            max_capacity,
+            available,
+            queued: max_capacity.saturating_sub(available),
+            is_closed: tx.is_closed(),
+        }
     }
 
     /// Reactively waits on the [`SlotState`] watch channel until a replacement actor instance is running,

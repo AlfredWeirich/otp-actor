@@ -9,7 +9,8 @@
 //! - [`RestartType::Transient`], [`RestartType::Permanent`], and [`RestartType::Temporary`]
 //! - [`ShutdownPolicy::Timeout`], [`ShutdownPolicy::BrutalKill`], and [`ShutdownPolicy::Infinity`]
 //! - Rate-limited exponential backoff ([`RestartPolicy`], [`RestartTracker`]) and optional failure escalation (`escalate_on_failure`)
-//! - Lock-free, zero-polling data-plane rebinding via per-child [`tokio::sync::watch`] channels ([`SlotState`]).
+//! - Lock-free, zero-polling data-plane rebinding via per-child [`tokio::sync::watch`] channels ([`SlotState`])
+//! - Runtime introspection snapshots with built-in timeouts ([`SupervisorHandle::snapshot`], [`SupervisorHandle::snapshot_timeout`]) and read-only status observation ([`SupervisorHandle::watch_child_status`]).
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -23,8 +24,8 @@ use tokio::task::{JoinError, JoinHandle, JoinSet};
 
 use super::generic_actor::{ResourceClient, ResourceEndpoint};
 use super::model::{
-    RestartPolicy, RestartTracker, RestartType, ShutdownPolicy, SupervisionStrategy,
-    SupervisorError, TaskResult,
+    DEFAULT_SNAPSHOT_TIMEOUT, RestartPolicy, RestartTracker, RestartType, ShutdownPolicy,
+    SupervisionStrategy, SupervisorError, TaskResult,
 };
 use super::stateful_actor::{ActorClient, ActorEnvelope, StatefulActor};
 
@@ -66,6 +67,221 @@ pub enum SlotState {
     Stopped,
     /// The child exceeded its [`RestartPolicy`] limits and is permanently failed.
     Failed(SupervisorError),
+}
+
+/// Public lifecycle status of a supervised child at the time of inspection.
+///
+/// Mirrors [`SlotState`] without exposing internal communication endpoints (`UntypedSender`).
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChildStatus {
+    /// The child is currently running under `instance_id`.
+    Running { instance_id: usize },
+    /// The child is shutting down for restart or waiting in backoff before spawning the replacement for `instance_id`.
+    Restarting { instance_id: usize },
+    /// The child stopped cleanly and is not scheduled to restart.
+    Stopped,
+    /// The child failed permanently and requires manual intervention (`restart_child`) or parent recovery.
+    Failed(SupervisorError),
+}
+
+impl ChildStatus {
+    /// Returns `true` if the child is currently running (`ChildStatus::Running`).
+    pub fn is_running(&self) -> bool {
+        matches!(self, Self::Running { .. })
+    }
+
+    /// Returns `true` if the child is restarting or waiting in backoff (`ChildStatus::Restarting`).
+    pub fn is_restarting(&self) -> bool {
+        matches!(self, Self::Restarting { .. })
+    }
+
+    /// Returns `true` if the child is stopped (`ChildStatus::Stopped`).
+    pub fn is_stopped(&self) -> bool {
+        matches!(self, Self::Stopped)
+    }
+
+    /// Returns `true` if the child is permanently failed (`ChildStatus::Failed`).
+    pub fn is_failed(&self) -> bool {
+        matches!(self, Self::Failed(_))
+    }
+
+    /// Returns the active or restarting `instance_id`, or `None` if `Stopped` / `Failed`.
+    pub fn instance_id(&self) -> Option<usize> {
+        match self {
+            Self::Running { instance_id } | Self::Restarting { instance_id } => Some(*instance_id),
+            Self::Stopped | Self::Failed(_) => None,
+        }
+    }
+}
+
+impl From<&SlotState> for ChildStatus {
+    fn from(slot: &SlotState) -> Self {
+        match slot {
+            SlotState::Running { instance_id, .. } => Self::Running {
+                instance_id: *instance_id,
+            },
+            SlotState::Restarting { instance_id } => Self::Restarting {
+                instance_id: *instance_id,
+            },
+            SlotState::Stopped => Self::Stopped,
+            SlotState::Failed(err) => Self::Failed(err.clone()),
+        }
+    }
+}
+
+impl From<SlotState> for ChildStatus {
+    fn from(slot: SlotState) -> Self {
+        Self::from(&slot)
+    }
+}
+
+/// Point-in-time snapshot of a single supervised child within a [`SupervisorSnapshot`].
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildSnapshot {
+    /// Registered name of the child inside its parent [`Supervisor`].
+    pub name: String,
+    /// Current lifecycle status of the child.
+    pub status: ChildStatus,
+    /// Current or most recently spawned instance ID (`1`, `2`, ...).
+    pub instance_id: usize,
+    /// Configured OTP restart type (`Transient`, `Permanent`, or `Temporary`).
+    pub restart_type: RestartType,
+    /// Number of recent restarts currently inside the child's [`RestartPolicy::time_window`].
+    pub restarts_in_window: usize,
+}
+
+/// Point-in-time introspection snapshot of a [`Supervisor`] and its registered children.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SupervisorSnapshot {
+    /// Registered name of this supervisor.
+    pub name: String,
+    /// Current instance ID of this supervisor (`1` initially; increments on restart).
+    pub instance_id: usize,
+    /// Supervision restart strategy applied by this supervisor.
+    pub strategy: SupervisionStrategy,
+    /// Supervised children in startup / registration order.
+    pub children: Vec<ChildSnapshot>,
+}
+
+impl SupervisorSnapshot {
+    /// Looks up a child snapshot by registered name.
+    pub fn child(&self, name: &str) -> Option<&ChildSnapshot> {
+        self.children.iter().find(|c| c.name == name)
+    }
+
+    /// Returns `true` if every child in [`Self::children`] is [`ChildStatus::Running`].
+    ///
+    /// Note that this returns `true` when `children` is empty; check
+    /// `!snapshot.children.is_empty()` as well if at least one active child is required.
+    pub fn all_running(&self) -> bool {
+        self.children.iter().all(|c| c.status.is_running())
+    }
+
+    /// Returns `true` if at least one child is in [`ChildStatus::Failed`].
+    pub fn any_failed(&self) -> bool {
+        self.children.iter().any(|c| c.status.is_failed())
+    }
+
+    /// Returns `true` if at least one child is in [`ChildStatus::Restarting`].
+    pub fn any_restarting(&self) -> bool {
+        self.children.iter().any(|c| c.status.is_restarting())
+    }
+
+    /// Returns the number of children in [`ChildStatus::Running`].
+    pub fn running_count(&self) -> usize {
+        self.children
+            .iter()
+            .filter(|c| c.status.is_running())
+            .count()
+    }
+
+    /// Returns the number of children in [`ChildStatus::Restarting`].
+    pub fn restarting_count(&self) -> usize {
+        self.children
+            .iter()
+            .filter(|c| c.status.is_restarting())
+            .count()
+    }
+
+    /// Returns the number of children in [`ChildStatus::Stopped`].
+    pub fn stopped_count(&self) -> usize {
+        self.children
+            .iter()
+            .filter(|c| c.status.is_stopped())
+            .count()
+    }
+
+    /// Returns the number of children in [`ChildStatus::Failed`].
+    pub fn failed_count(&self) -> usize {
+        self.children
+            .iter()
+            .filter(|c| c.status.is_failed())
+            .count()
+    }
+}
+
+/// Read-only reactive observer for a supervised child's [`ChildStatus`].
+///
+/// Wraps the supervisor's existing per-child `watch` channel without exposing internal endpoints.
+/// If the child is deleted (`delete_child` or completed `Temporary` child) or the owning
+/// supervisor terminates/restarts, [`Self::changed`] and [`Self::wait_for`] return
+/// [`SupervisorError::SupervisorUnavailable`].
+#[derive(Clone)]
+pub struct ChildStatusWatcher {
+    child_name: String,
+    rx: watch::Receiver<SlotState>,
+}
+
+impl std::fmt::Debug for ChildStatusWatcher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChildStatusWatcher")
+            .field("child_name", &self.child_name)
+            .field("status", &self.current())
+            .finish()
+    }
+}
+
+impl ChildStatusWatcher {
+    /// Returns the registered name of the observed child.
+    pub fn child_name(&self) -> &str {
+        &self.child_name
+    }
+
+    /// Returns the child's latest observed [`ChildStatus`] without blocking.
+    pub fn current(&self) -> ChildStatus {
+        ChildStatus::from(&*self.rx.borrow())
+    }
+
+    /// Waits for the next status transition on the observed child slot.
+    ///
+    /// Returns [`SupervisorError::SupervisorUnavailable`] once the slot sender is closed (for
+    /// instance after [`SupervisorHandle::delete_child`] or supervisor termination/restart).
+    pub async fn changed(&mut self) -> Result<(), SupervisorError> {
+        self.rx
+            .changed()
+            .await
+            .map_err(|_| SupervisorError::SupervisorUnavailable)
+    }
+
+    /// Waits until [`ChildStatus`] satisfies `predicate` (checking the current status first)
+    /// and returns a clone of the matching status.
+    pub async fn wait_for<F>(&mut self, mut predicate: F) -> Result<ChildStatus, SupervisorError>
+    where
+        F: FnMut(&ChildStatus) -> bool,
+    {
+        let status_ref = self
+            .rx
+            .wait_for(|slot| {
+                let status = ChildStatus::from(slot);
+                predicate(&status)
+            })
+            .await
+            .map_err(|_| SupervisorError::SupervisorUnavailable)?;
+        Ok(ChildStatus::from(&*status_ref))
+    }
 }
 
 /// Specification defining a child (leaf actor or child [`Supervisor`]) to be supervised by a [`Supervisor`].
@@ -349,6 +565,16 @@ pub(crate) enum SupervisorCommand {
     ResolveChildSlot {
         child_name: String,
         respond_to: oneshot::Sender<Result<watch::Receiver<SlotState>, SupervisorError>>,
+    },
+    /// Subscribes to the reactive [`SlotState`] watch channel for status observation,
+    /// including children that are currently `Stopped` or `Failed`.
+    ObserveChildSlot {
+        child_name: String,
+        respond_to: oneshot::Sender<Result<watch::Receiver<SlotState>, SupervisorError>>,
+    },
+    /// Captures a point-in-time [`SupervisorSnapshot`] of this supervisor and its children.
+    Snapshot {
+        respond_to: oneshot::Sender<SupervisorSnapshot>,
     },
     /// Manually restarts or recovers a child (and any strategy-coupled siblings), resetting backoff limits.
     RestartChild {
@@ -1017,6 +1243,30 @@ impl Supervisor {
         }
     }
 
+    /// Builds a point-in-time [`SupervisorSnapshot`] ordered according to `self.child_order`.
+    fn build_snapshot(&self) -> SupervisorSnapshot {
+        let children = self
+            .child_order
+            .iter()
+            .filter_map(|name| {
+                self.children.get(name).map(|child| ChildSnapshot {
+                    name: name.clone(),
+                    status: ChildStatus::from(&*child.slot_tx.borrow()),
+                    instance_id: child.instance_id,
+                    restart_type: child.restart_type,
+                    restarts_in_window: child.restart_tracker.restarts_in_window(),
+                })
+            })
+            .collect();
+
+        SupervisorSnapshot {
+            name: self.name.clone(),
+            instance_id: self.instance_id,
+            strategy: self.strategy,
+            children,
+        }
+    }
+
     /// Processes a single incoming [`SupervisorCommand`], returning `Some(TaskResult)` when
     /// the supervisor event loop should terminate (e.g. `Shutdown`, `SimulateCrash`, or escalation).
     async fn handle_command(
@@ -1106,6 +1356,21 @@ impl Supervisor {
                 } else {
                     let _ = respond_to.send(Err(SupervisorError::ChildNotFound(child_name)));
                 }
+            }
+
+            SupervisorCommand::ObserveChildSlot {
+                child_name,
+                respond_to,
+            } => {
+                if let Some(child) = self.children.get(&child_name) {
+                    let _ = respond_to.send(Ok(child.slot_tx.subscribe()));
+                } else {
+                    let _ = respond_to.send(Err(SupervisorError::ChildNotFound(child_name)));
+                }
+            }
+
+            SupervisorCommand::Snapshot { respond_to } => {
+                let _ = respond_to.send(self.build_snapshot());
             }
 
             SupervisorCommand::RestartChild {
@@ -2168,6 +2433,70 @@ impl SupervisorHandle {
             .map_err(|_| SupervisorError::SupervisorUnavailable)?;
 
         rx.await.map_err(|_| SupervisorError::SupervisorUnavailable)?
+    }
+
+    /// Captures a point-in-time [`SupervisorSnapshot`] with the default [`DEFAULT_SNAPSHOT_TIMEOUT`].
+    ///
+    /// Returns [`SupervisorError::Timeout`] if the supervisor is busy (for example during a heavy
+    /// shutdown or restart wave) and does not answer within the built-in deadline. To specify a
+    /// custom timeout, use [`Self::snapshot_timeout`].
+    pub async fn snapshot(&self) -> Result<SupervisorSnapshot, SupervisorError> {
+        self.snapshot_timeout(DEFAULT_SNAPSHOT_TIMEOUT).await
+    }
+
+    /// Captures a point-in-time [`SupervisorSnapshot`] bounded by an explicit `timeout`.
+    ///
+    /// Wraps handle rebinding, command dispatch, and snapshot collection in `timeout`, returning
+    /// [`SupervisorError::Timeout`] rather than blocking a health probe if the supervisor is stalled
+    /// inside shutdown or cascading restarts.
+    pub async fn snapshot_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<SupervisorSnapshot, SupervisorError> {
+        let fut = async {
+            let cmd_sender = self.get_sender().await?;
+            let (tx, rx) = oneshot::channel();
+            cmd_sender
+                .send(SupervisorCommand::Snapshot { respond_to: tx })
+                .await
+                .map_err(|_| SupervisorError::SupervisorUnavailable)?;
+
+            rx.await.map_err(|_| SupervisorError::SupervisorUnavailable)
+        };
+
+        tokio::time::timeout(timeout, fut)
+            .await
+            .map_err(|_| SupervisorError::Timeout(timeout))?
+    }
+
+    /// Returns a read-only [`ChildStatusWatcher`] for `child_name` backed by the supervisor's
+    /// existing per-child `watch` channel.
+    ///
+    /// Unlike internal data-plane channel resolution, `watch_child_status` succeeds even when the
+    /// child is currently [`ChildStatus::Stopped`] or [`ChildStatus::Failed`], returning
+    /// [`SupervisorError::ChildNotFound`] only if no slot with `child_name` is registered.
+    pub async fn watch_child_status(
+        &self,
+        child_name: impl Into<String>,
+    ) -> Result<ChildStatusWatcher, SupervisorError> {
+        let child_name = child_name.into();
+        let (tx, rx) = oneshot::channel();
+        let cmd_sender = self.get_sender().await?;
+        cmd_sender
+            .send(SupervisorCommand::ObserveChildSlot {
+                child_name: child_name.clone(),
+                respond_to: tx,
+            })
+            .await
+            .map_err(|_| SupervisorError::SupervisorUnavailable)?;
+
+        let slot_rx = rx
+            .await
+            .map_err(|_| SupervisorError::SupervisorUnavailable)??;
+        Ok(ChildStatusWatcher {
+            child_name,
+            rx: slot_rx,
+        })
     }
 
     /// Retrieves a direct [`ResourceClient`] data-plane handle for a supervised [`super::generic_actor::ResourceActor`].
