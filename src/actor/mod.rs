@@ -101,8 +101,9 @@ pub mod supervisor;
 
 // Re-export primary types for a convenient public API
 pub use generic_actor::{
-    DEFAULT_FAILURE_COOLDOWN, DEFAULT_WORKER_TIMEOUT, ResourceActor, ResourceActorBuilder,
-    ResourceActorConfig, ResourceClient, ResourceError, TimedResource, Worker, WorkerContext,
+    CacheState, DEFAULT_FAILURE_COOLDOWN, DEFAULT_WORKER_TIMEOUT, ResourceActor,
+    ResourceActorBuilder, ResourceActorConfig, ResourceClient, ResourceError, TimedResource,
+    Worker, WorkerContext,
 };
 pub use model::{
     DEFAULT_SHUTDOWN_TIMEOUT, DEFAULT_SNAPSHOT_TIMEOUT, EXPIRY_BUFFER, RestartPolicy,

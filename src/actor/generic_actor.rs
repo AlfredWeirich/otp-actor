@@ -150,6 +150,8 @@ pub(crate) struct ResourceEndpoint<T, E> {
     pub(crate) sender: Sender<ResourceCommand<T, E>>,
     pub(crate) cache_rx: watch::Receiver<Option<ResourceSnapshot<T>>>,
     pub(crate) invalidated: Arc<AtomicBool>,
+    /// Configured stale-while-error grace window, used to classify expired cache entries.
+    pub(crate) stale_while_error: Duration,
 }
 
 impl<T, E> Clone for ResourceEndpoint<T, E> {
@@ -158,7 +160,105 @@ impl<T, E> Clone for ResourceEndpoint<T, E> {
             sender: self.sender.clone(),
             cache_rx: self.cache_rx.clone(),
             invalidated: self.invalidated.clone(),
+            stale_while_error: self.stale_while_error,
         }
+    }
+}
+
+impl<T, E> ResourceEndpoint<T, E> {
+    /// Classifies the locally visible cache without any channel round-trip (see [`CacheState`]).
+    pub(crate) fn cache_state(&self) -> CacheState {
+        if self.invalidated.load(Ordering::Acquire) || self.sender.is_closed() {
+            return CacheState::Invalidated;
+        }
+
+        let cached = self.cache_rx.borrow();
+        let Some(snapshot) = cached.as_ref() else {
+            return CacheState::Empty;
+        };
+
+        let now = Instant::now();
+        let resource = &snapshot.resource;
+
+        if resource.is_still_usable() {
+            let expires_in = resource
+                .expires_at
+                .map(|exp| exp.saturating_duration_since(now));
+            let refresh_due = snapshot.refresh_threshold.is_some_and(|t| now >= t);
+            return if refresh_due {
+                CacheState::RefreshDue { expires_in }
+            } else {
+                CacheState::Fresh { expires_in }
+            };
+        }
+
+        let expired_for = resource
+            .expires_at
+            .map_or(Duration::ZERO, |exp| now.saturating_duration_since(exp));
+        if self.stale_while_error > Duration::ZERO
+            && resource.is_usable_stale(self.stale_while_error)
+        {
+            CacheState::StaleUsable { expired_for }
+        } else {
+            CacheState::Expired { expired_for }
+        }
+    }
+}
+
+/// Point-in-time classification of a [`ResourceClient`]'s locally cached resource.
+///
+/// Returned synchronously by [`ResourceClient::cache_state`], which reads the same 0-hop `watch`
+/// cache as [`ResourceClient::get`] without crossing the actor mailbox, contacting the supervisor,
+/// or triggering a refresh. The cached value itself is never exposed, only its metadata, so the
+/// state is always safe to log or export as a health metric.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheState {
+    /// No resource has been cached yet (cold start, before the first successful worker run).
+    Empty,
+    /// A fresh resource is cached outside the pre-expiration buffer and is served in 0 hops.
+    Fresh {
+        /// Remaining validity, or `None` for a perpetual resource ([`TimedResource::perpetual`]).
+        expires_in: Option<Duration>,
+    },
+    /// The resource is still valid but inside the pre-expiration buffer: the next
+    /// [`ResourceClient::get`] is served by the actor (1 hop) and triggers a background refresh.
+    RefreshDue {
+        /// Remaining validity, or `None` for a perpetual resource.
+        expires_in: Option<Duration>,
+    },
+    /// The resource has expired but is still inside the configured stale-while-error window,
+    /// so [`ResourceClient::get`] serves it (via the actor) while a background refresh recovers.
+    StaleUsable {
+        /// Time elapsed since the resource expired.
+        expired_for: Duration,
+    },
+    /// The resource has expired beyond any stale-while-error allowance: the next
+    /// [`ResourceClient::get`] must wait for a fresh worker result.
+    Expired {
+        /// Time elapsed since the resource expired.
+        expired_for: Duration,
+    },
+    /// The cached endpoint is invalidated or its actor has exited (shutdown, crash, or restart
+    /// pending). The next [`ResourceClient::get`] transparently rebinds to the replacement
+    /// instance. As with `ActorClient::queue_stats`, this also reports the old instance after a
+    /// crash until the client's next call rebinds it.
+    Invalidated,
+}
+
+impl CacheState {
+    /// Returns `true` if [`ResourceClient::get`] is currently served from the cache in 0 hops.
+    pub fn is_fresh(&self) -> bool {
+        matches!(self, Self::Fresh { .. })
+    }
+
+    /// Returns `true` if a cached value could currently be returned to callers
+    /// (`Fresh`, `RefreshDue`, or `StaleUsable`).
+    pub fn has_usable_value(&self) -> bool {
+        matches!(
+            self,
+            Self::Fresh { .. } | Self::RefreshDue { .. } | Self::StaleUsable { .. }
+        )
     }
 }
 
@@ -424,6 +524,7 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
         let restart_policy = config.restart_policy;
         let restart_type = config.restart_type;
         let shutdown_policy = config.shutdown_policy;
+        let stale_while_error = config.stale_while_error;
         let name = config.name.clone();
 
         let factory: UntypedActorFactory = Arc::new(move |spawn_ctx: SpawnContext| {
@@ -434,6 +535,7 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
                 sender: tx,
                 cache_rx,
                 invalidated: invalidated.clone(),
+                stale_while_error,
             });
             let w = worker.clone();
             let cfg = config.clone();
@@ -1555,6 +1657,23 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static> Resourc
         tokio::time::timeout(timeout, self.get())
             .await
             .map_err(|_| ResourceError::Timeout(timeout))?
+    }
+
+    /// Returns a point-in-time [`CacheState`] classification of this client's cached resource.
+    ///
+    /// Synchronous and lock-free with respect to the actor: it reads the same 0-hop `watch` cache
+    /// as [`Self::get`] and never sends a command, contacts the supervisor, waits for a worker, or
+    /// triggers a refresh, so it is safe to call from health probes and metrics collectors at any
+    /// rate. The cached value itself is never exposed.
+    ///
+    /// The result is an instantaneous observation and may change immediately after it returns.
+    /// After an actor crash and *before* the client's next `get`/control call rebinds it, this
+    /// still inspects the previous instance and reports [`CacheState::Invalidated`].
+    pub fn cache_state(&self) -> CacheState {
+        self.endpoint
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .cache_state()
     }
 
     /// Proactively forces a background refresh, superseding any currently in-flight refresh.

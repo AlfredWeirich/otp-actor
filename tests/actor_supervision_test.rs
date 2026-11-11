@@ -4,10 +4,11 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use otp_actor::actor::{
-    ActorContext, ActorError, ActorScope, CallMessage, ChildSpec, ChildStatus, QueueStats,
-    ResourceActor, ResourceError, RestartPolicy, RestartTracker, RestartType, ShutdownPolicy,
-    StatefulActor, StatefulActorBuilder, SupervisionStrategy, Supervisor, SupervisorError,
-    SupervisorSnapshot, SupervisorTreeSnapshot, TimedResource, Worker, WorkerContext,
+    ActorContext, ActorError, ActorScope, CacheState, CallMessage, ChildSpec, ChildStatus,
+    QueueStats, ResourceActor, ResourceError, RestartPolicy, RestartTracker, RestartType,
+    ShutdownPolicy, StatefulActor, StatefulActorBuilder, SupervisionStrategy, Supervisor,
+    SupervisorError, SupervisorSnapshot, SupervisorTreeSnapshot, TimedResource, Worker,
+    WorkerContext,
 };
 
 #[tokio::test]
@@ -5343,5 +5344,167 @@ async fn test_supervisor_snapshot_tree_timeout_isolates_stuck_subtree_and_report
 
     let _ = release_tx.send(());
     shutdown_task.await.unwrap().unwrap();
+    root.shutdown().await.unwrap();
+}
+
+// ============================================================================
+// Phase-2 Introspection: ResourceClient::cache_state()
+// ============================================================================
+
+/// Asserts that `actual` is within 100ms of `expected` (the paused test clock is exact, but this
+/// keeps the assertions robust against scheduler-induced drift).
+fn assert_near(actual: Duration, expected: Duration) {
+    let diff = actual.abs_diff(expected);
+    assert!(
+        diff <= Duration::from_millis(100),
+        "expected ~{expected:?}, got {actual:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_resource_client_cache_state_lifecycle_fresh_refresh_due_stale_and_expired() {
+    let root = Supervisor::new("cache-state-root");
+
+    let fetches = Arc::new(AtomicUsize::new(0));
+    let fetches_for_worker = fetches.clone();
+    let worker = move |_ctx: WorkerContext| {
+        let fetches = fetches_for_worker.clone();
+        async move {
+            fetches.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, String>(TimedResource::with_ttl(
+                "secret-token".to_string(),
+                Duration::from_secs(10),
+            ))
+        }
+    };
+
+    let client = ResourceActor::builder("token")
+        .worker(worker)
+        .expiry_buffer(Duration::from_secs(2))
+        .stale_while_error(Duration::from_secs(5))
+        .proactive_refresh(false)
+        .spawn(&root)
+        .await
+        .unwrap();
+
+    // 1. Cold start: nothing cached yet, and observing the state must not trigger the worker
+    assert_eq!(client.cache_state(), CacheState::Empty);
+    assert!(!client.cache_state().has_usable_value());
+    assert_eq!(fetches.load(Ordering::SeqCst), 0);
+
+    // 2. First get() populates the cache: Fresh with the full TTL remaining
+    assert_eq!(client.get().await.unwrap(), "secret-token");
+    let CacheState::Fresh {
+        expires_in: Some(remaining),
+    } = client.cache_state()
+    else {
+        panic!("expected Fresh, got {:?}", client.cache_state());
+    };
+    assert_near(remaining, Duration::from_secs(10));
+    assert!(client.cache_state().is_fresh());
+    assert!(client.cache_state().has_usable_value());
+
+    // 3. Still outside the 2s pre-expiration buffer (3s left)
+    tokio::time::advance(Duration::from_secs(7)).await;
+    let CacheState::Fresh {
+        expires_in: Some(remaining),
+    } = client.cache_state()
+    else {
+        panic!("expected Fresh, got {:?}", client.cache_state());
+    };
+    assert_near(remaining, Duration::from_secs(3));
+
+    // 4. Inside the buffer (1.5s left): valid, but the next get() is a 1-hop refresh
+    tokio::time::advance(Duration::from_millis(1500)).await;
+    let CacheState::RefreshDue {
+        expires_in: Some(remaining),
+    } = client.cache_state()
+    else {
+        panic!("expected RefreshDue, got {:?}", client.cache_state());
+    };
+    assert_near(remaining, Duration::from_millis(1500));
+    assert!(!client.cache_state().is_fresh());
+    assert!(client.cache_state().has_usable_value());
+
+    // 5. Expired by 0.5s, but inside the 5s stale-while-error window
+    tokio::time::advance(Duration::from_secs(2)).await;
+    let CacheState::StaleUsable { expired_for } = client.cache_state() else {
+        panic!("expected StaleUsable, got {:?}", client.cache_state());
+    };
+    assert_near(expired_for, Duration::from_millis(500));
+    assert!(client.cache_state().has_usable_value());
+
+    // 6. Expired beyond the stale-while-error window (5.5s)
+    tokio::time::advance(Duration::from_secs(5)).await;
+    let CacheState::Expired { expired_for } = client.cache_state() else {
+        panic!("expected Expired, got {:?}", client.cache_state());
+    };
+    assert_near(expired_for, Duration::from_millis(5500));
+    assert!(!client.cache_state().has_usable_value());
+
+    // Observing the cache never touched the worker; only the single explicit get() did
+    assert_eq!(fetches.load(Ordering::SeqCst), 1);
+
+    // The state is metadata only and never leaks the cached value
+    assert!(!format!("{:?}", client.cache_state()).contains("secret-token"));
+
+    root.shutdown().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_resource_client_cache_state_perpetual_no_stale_window_and_invalidation() {
+    let root = Supervisor::new("cache-state-edge-root");
+
+    // 1. Perpetual resources never expire and report no remaining TTL
+    let perpetual = ResourceActor::builder("perpetual")
+        .worker(|_| async { Ok::<_, String>(TimedResource::perpetual("forever".to_string())) })
+        .spawn(&root)
+        .await
+        .unwrap();
+    assert_eq!(perpetual.cache_state(), CacheState::Empty);
+    assert_eq!(perpetual.get().await.unwrap(), "forever");
+    assert_eq!(
+        perpetual.cache_state(),
+        CacheState::Fresh { expires_in: None }
+    );
+    tokio::time::advance(Duration::from_secs(3600)).await;
+    assert_eq!(
+        perpetual.cache_state(),
+        CacheState::Fresh { expires_in: None }
+    );
+
+    // 2. Without a stale-while-error window an expired entry is Expired, never StaleUsable
+    let short = ResourceActor::builder("short")
+        .worker(|_| async {
+            Ok::<_, String>(TimedResource::with_ttl(
+                "short-lived".to_string(),
+                Duration::from_secs(1),
+            ))
+        })
+        .proactive_refresh(false)
+        .spawn(&root)
+        .await
+        .unwrap();
+    assert_eq!(short.get().await.unwrap(), "short-lived");
+    tokio::time::advance(Duration::from_secs(2)).await;
+    let CacheState::Expired { expired_for } = short.cache_state() else {
+        panic!("expected Expired, got {:?}", short.cache_state());
+    };
+    assert_near(expired_for, Duration::from_secs(1));
+
+    // 3. Crash: the cached endpoint reports Invalidated until the next call rebinds the client
+    perpetual.simulate_crash().await.unwrap();
+    assert_eq!(perpetual.cache_state(), CacheState::Invalidated);
+    assert!(!perpetual.cache_state().has_usable_value());
+    assert_eq!(perpetual.get().await.unwrap(), "forever");
+    assert_eq!(
+        perpetual.cache_state(),
+        CacheState::Fresh { expires_in: None }
+    );
+
+    // 4. Explicit shutdown invalidates the cache as well
+    short.shutdown().await.unwrap();
+    assert_eq!(short.cache_state(), CacheState::Invalidated);
+
     root.shutdown().await.unwrap();
 }
