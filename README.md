@@ -158,7 +158,7 @@ flowchart TD
 | Protobuf Schema & Build Script | [`proto/actor_node.proto`](proto/actor_node.proto) & [`build.rs`](build.rs) | Compact universal gRPC actor wire contract (`Call`, `Cast`, `RemoteError`), compiled automatically via `tonic-prost-build`. |
 | `SupervisionStrategy`, `RestartPolicy`, `RestartTracker`, `RestartType`, `ShutdownPolicy`, `SupervisorError`, `TaskResult`, `EXPIRY_BUFFER`, `DEFAULT_SHUTDOWN_TIMEOUT`, `DEFAULT_SNAPSHOT_TIMEOUT` | [`src/actor/model.rs`](src/actor/model.rs) | Shared domain model: strategies, `#[non_exhaustive]` policies & errors, restart types, shutdown policies, sliding-window crash tracking (`restarts_in_window`) & backoff, task exit results. |
 | Quickstart (Crash & 0-ms Rebind) | [`examples/quickstart.rs`](examples/quickstart.rs) | 35-line copy-paste showcase: real actor panic isolation and automatic `watch<SlotState>` rebinding. |
-| Microservice Pipeline | [`examples/microservice_pipeline.rs`](examples/microservice_pipeline.rs) | Ingestion worker (`ctx.forward_receiver`, `ctx.send_interval_with`) + 0-hop `ResourceActor` auth cache (`stale_while_error`) + bounded `try_cast`/`queue_stats()` + `ChildStatusWatcher`/`SupervisorSnapshot`/`snapshot_tree()` + `ResourceClient::cache_state()`. |
+| Microservice Pipeline | [`examples/microservice_pipeline.rs`](examples/microservice_pipeline.rs) | Ingestion worker (`ctx.forward_receiver`, `ctx.send_interval_with`, `ctx.spawn_scoped` / `ActorScope`) + 0-hop `ResourceActor` auth cache (`stale_while_error`, `cache_state()`) + bounded `try_cast`/`queue_stats()` + `ChildStatusWatcher`/`SupervisorSnapshot`/`snapshot_tree()`. |
 | `RestForOne` Pipeline | [`examples/rest_for_one_pipeline.rs`](examples/rest_for_one_pipeline.rs) | 3-stage pipeline isolating panics and restarting only downstream stages (supports `--interactive`). |
 | Demo | [`examples/otp_actor.rs`](examples/otp_actor.rs) | Eight-phase walkthrough with simulated GCP tokens and a database secret. |
 | Minimum | [`examples/minimum.rs`](examples/minimum.rs) | Output-free minimal example demonstrating both `ResourceActor` and `StatefulActor` under a root `Supervisor`. |
@@ -197,7 +197,7 @@ cargo run --example quickstart
 # Run the output-free minimal example (both actor types)
 cargo run --example minimum
 
-# Run the microservice ingestion pipeline blueprint (forward_receiver + interval + queue_stats + cache_state + snapshot_tree)
+# Run the microservice ingestion pipeline blueprint (forward_receiver + interval + spawn_scoped + queue_stats + cache_state + snapshot_tree)
 cargo run --example microservice_pipeline
 
 # Run the RestForOne pipeline demo (or add `-- --interactive` to inject panics manually)
@@ -238,10 +238,10 @@ To use the crate from another project in the same workspace or from crates.io, a
 
 ```toml
 [dependencies]
-otp-actor = "0.3.1"
+otp-actor = "0.3.2"
 # Optional features:
-# otp-actor = { version = "0.3.1", features = ["remote"] }
-# otp-actor = { version = "0.3.1", features = ["chaos_test"] }
+# otp-actor = { version = "0.3.2", features = ["remote"] }
+# otp-actor = { version = "0.3.2", features = ["chaos_test"] }
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -665,6 +665,8 @@ Key design guarantees:
 - **No idle permit starvation:** `send_interval_with` and `forward_receiver` wait for input *first* and only then reserve a bounded mailbox slot (`tx.reserve()`), so even `channel_capacity(1)` actors never deadlock waiting on an idle timer/stream.
 - **No cross-instance leaks:** Unlike `ActorClient`, `ActorScope<A>` is pinned to a single `instance_id` and intentionally **never** rebinds after a crash—returning `Err(ActorError::ActorUnavailable)` once that instance exits.
 
+For a complete, runnable blueprint combining `send_interval_with`, `forward_receiver`, and `spawn_scoped` (including verified `ActorScope` cancellation across crash recovery and shutdown), run [`examples/microservice_pipeline.rs`](examples/microservice_pipeline.rs) (`cargo run --example microservice_pipeline`).
+
 ### State Lifecycle on Restart & Persistence Patterns
 
 #### Does an actor lose its in-memory state when restarted?
@@ -728,7 +730,7 @@ When built with `--features remote`, the crate enables distributed actor communi
 
 ```toml
 [dependencies]
-otp-actor = { version = "0.3.1", features = ["remote"] }
+otp-actor = { version = "0.3.2", features = ["remote"] }
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 ```
@@ -1403,7 +1405,7 @@ The integration suite in [`tests/actor_supervision_test.rs`](tests/actor_supervi
 │       └── server.rs                   # ActorNodeService + ActorNodeHandle (2-phase shutdown)
 ├── examples
 │   ├── quickstart.rs                   # 35-line panic isolation & 0-ms watch<SlotState> rebind showcase
-│   ├── microservice_pipeline.rs        # ingestion worker (forward_receiver, send_interval_with) + auth cache (cache_state) + queue_stats + snapshot/snapshot_tree/watcher
+│   ├── microservice_pipeline.rs        # ingestion worker (forward_receiver, send_interval_with, spawn_scoped) + auth cache (cache_state) + queue_stats + snapshot/snapshot_tree/watcher
 │   ├── rest_for_one_pipeline.rs        # 3-stage RestForOne panic recovery (automated & --interactive)
 │   ├── minimum.rs                      # output-free minimal example for both actor types
 │   ├── otp_actor.rs                    # full 8-phase demo walkthrough

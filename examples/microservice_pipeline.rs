@@ -9,7 +9,9 @@
 //!   [`QueueStats`] observation (`sink_client.queue_stats()`).
 //! - **Ingestion Worker (`ingestion-worker`)**: `StatefulActor` using `ctx.forward_receiver(...)`
 //!   for external channel ingestion, `ctx.send_interval_with(...)` for lifecycle-bound heartbeats
-//!   on a non-`Clone` message enum, and automatic 0-ms `watch<SlotState>` rebinding after a crash.
+//!   on a non-`Clone` message enum, `ctx.spawn_scoped(...)` ([`ActorScope`]) for an instance-pinned
+//!   background loop that cancels cleanly on crash/shutdown, and automatic 0-ms `watch<SlotState>`
+//!   rebinding after a crash.
 //! - **Runtime Introspection (`pipeline`)**: Non-invasive [`ChildStatusWatcher`] observation
 //!   (`watch_child_status`), bounded supervisor health snapshots (`pipeline.snapshot()`), and a
 //!   whole-hierarchy view (`root.snapshot_tree()`), including flapping detection
@@ -29,7 +31,7 @@ use otp_actor::{
     ResourceClient, RestartPolicy, RestartType, StatefulActor, StatefulActorBuilder,
     SupervisionStrategy, Supervisor, TimedResource, WorkerContext,
 };
-use tokio::sync::{Notify, mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 
 // ============================================================================
 // Stage 2: Bounded Storage Sink (`StatefulActor`)
@@ -98,6 +100,7 @@ enum IngestionMsg {
     Ingest(IngestionEvent),
     AttachFeed(mpsc::Receiver<IngestionEvent>),
     Heartbeat,
+    ScopedProbe { from_instance: usize },
     Status,
     SimulateBug,
 }
@@ -106,10 +109,12 @@ struct IngestionWorker {
     auth_client: ResourceClient<String, String>,
     sink_client: ActorClient<StorageSink>,
     processed_notify: Arc<Notify>,
+    scoped_exits_tx: Arc<watch::Sender<usize>>,
     accepted: u64,
     rejected: u64,
     shed: u64,
     heartbeats: u64,
+    scoped_probes: u64,
 }
 
 impl IngestionWorker {
@@ -117,15 +122,18 @@ impl IngestionWorker {
         auth_client: ResourceClient<String, String>,
         sink_client: ActorClient<StorageSink>,
         processed_notify: Arc<Notify>,
+        scoped_exits_tx: Arc<watch::Sender<usize>>,
     ) -> Self {
         Self {
             auth_client,
             sink_client,
             processed_notify,
+            scoped_exits_tx,
             accepted: 0,
             rejected: 0,
             shed: 0,
             heartbeats: 0,
+            scoped_probes: 0,
         }
     }
 }
@@ -138,6 +146,7 @@ struct IngestionStats {
     rejected: u64,
     shed: u64,
     heartbeats: u64,
+    scoped_probes: u64,
 }
 
 enum IngestionReply {
@@ -157,6 +166,43 @@ impl StatefulActor for IngestionWorker {
         // Instance-bound periodic heartbeat (`send_interval_with` works without `Clone` on `IngestionMsg`).
         // Cancels automatically if this actor instance crashes or stops.
         ctx.send_interval_with(Duration::from_millis(80), || IngestionMsg::Heartbeat);
+
+        // Instance-bound background task (`ActorScope`): pinned strictly to `ctx.instance_id()`.
+        // Unlike detached `tokio::spawn` with an `ActorClient`, this loop stops immediately on crash
+        // or shutdown and never delivers messages onto a restarted replacement instance.
+        let scoped_exits_tx = self.scoped_exits_tx.clone();
+        ctx.spawn_scoped(move |mut scope| async move {
+            let instance_id = scope.instance_id();
+            let mut interval = tokio::time::interval(Duration::from_millis(75));
+            interval.tick().await;
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = scope.cancelled() => {
+                        println!(
+                            "  [spawn_scoped] background task for '{}' instance #{} cancelled cleanly",
+                            scope.name(),
+                            instance_id
+                        );
+                        scoped_exits_tx.send_modify(|n| *n += 1);
+                        break;
+                    }
+                    _ = interval.tick() => {
+                        if scope
+                            .cast(IngestionMsg::ScopedProbe {
+                                from_instance: instance_id,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            scoped_exits_tx.send_modify(|n| *n += 1);
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
         Ok(())
     }
 
@@ -207,12 +253,22 @@ impl StatefulActor for IngestionWorker {
                 self.heartbeats += 1;
                 Ok(IngestionReply::Ack)
             }
+            IngestionMsg::ScopedProbe { from_instance } => {
+                assert_eq!(
+                    from_instance,
+                    ctx.instance_id(),
+                    "ActorScope must never leak probes across actor restarts"
+                );
+                self.scoped_probes += 1;
+                Ok(IngestionReply::Ack)
+            }
             IngestionMsg::Status => Ok(IngestionReply::Stats(IngestionStats {
                 instance_id: ctx.instance_id(),
                 accepted: self.accepted,
                 rejected: self.rejected,
                 shed: self.shed,
                 heartbeats: self.heartbeats,
+                scoped_probes: self.scoped_probes,
             })),
             IngestionMsg::SimulateBug => {
                 ctx.fail("simulated parser invariant violation");
@@ -223,12 +279,13 @@ impl StatefulActor for IngestionWorker {
 
     async fn on_stop(&mut self, ctx: &mut ActorContext<Self>) {
         println!(
-            "  [ingestion-worker #{}] on_stop: accepted={}, rejected={}, shed={}, heartbeats={}",
+            "  [ingestion-worker #{}] on_stop: accepted={}, rejected={}, shed={}, heartbeats={}, scoped_probes={}",
             ctx.instance_id(),
             self.accepted,
             self.rejected,
             self.shed,
-            self.heartbeats
+            self.heartbeats,
+            self.scoped_probes
         );
     }
 }
@@ -282,6 +339,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sink_for_worker = sink_client.clone();
     let processed_notify = Arc::new(Notify::new());
     let notify_for_worker = processed_notify.clone();
+    let (scoped_exits_tx, mut scoped_exits_rx) = watch::channel(0usize);
+    let scoped_exits_tx = Arc::new(scoped_exits_tx);
+    let scoped_tx_for_worker = scoped_exits_tx.clone();
     let fast_restart =
         RestartPolicy::new(5, Duration::from_secs(10)).initial_backoff(Duration::from_millis(20));
 
@@ -290,6 +350,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             auth_for_worker.clone(),
             sink_for_worker.clone(),
             notify_for_worker.clone(),
+            scoped_tx_for_worker.clone(),
         )
     })
     .restart_type(RestartType::Permanent)
@@ -467,6 +528,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     println!("  ChildStatusWatcher observed recovery: {new_status:?}");
 
+    // Confirm instance #1's `spawn_scoped` task stopped immediately when #1 failed:
+    scoped_exits_rx.wait_for(|&exits| exits >= 1).await?;
+    assert_eq!(*scoped_exits_rx.borrow(), 1);
+
     // Immediately reuse `ingestion_client` with zero reconnect logic:
     match ingestion_client.call(IngestionMsg::Status).await? {
         IngestionReply::Stats(stats) => {
@@ -531,6 +596,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ------------------------------------------------------------------------
     println!("--- Phase 5: Graceful Shutdown ---");
     root.shutdown().await?;
-    println!("Pipeline shutdown complete.");
+    scoped_exits_rx.wait_for(|&exits| exits >= 2).await?;
+    assert_eq!(*scoped_exits_rx.borrow(), 2);
+    println!("Pipeline shutdown complete (both instance scopes cancelled cleanly).");
     Ok(())
 }
