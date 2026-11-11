@@ -4,9 +4,10 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use otp_actor::actor::{
-    ActorContext, ActorError, CallMessage, ChildSpec, ResourceActor, ResourceError, RestartPolicy,
-    RestartTracker, RestartType, ShutdownPolicy, StatefulActor, StatefulActorBuilder,
-    SupervisionStrategy, Supervisor, SupervisorError, TimedResource, Worker, WorkerContext,
+    ActorContext, ActorError, ActorScope, CallMessage, ChildSpec, ResourceActor, ResourceError,
+    RestartPolicy, RestartTracker, RestartType, ShutdownPolicy, StatefulActor,
+    StatefulActorBuilder, SupervisionStrategy, Supervisor, SupervisorError, TimedResource, Worker,
+    WorkerContext,
 };
 
 #[tokio::test]
@@ -4456,5 +4457,291 @@ async fn test_actor_context_send_interval_cancels_on_panic_and_ignores_zero_or_m
         "Sleeping interval task from crashed instance #1 must be cancelled on panic unwind"
     );
 
+    root.shutdown().await.unwrap();
+}
+
+// ============================================================================
+// ActorContext::forward_receiver & ActorContext::spawn_scoped (ActorScope)
+// ============================================================================
+
+#[derive(Clone, Default)]
+struct StreamActor {
+    items: Vec<u64>,
+    item_notify: Option<Arc<tokio::sync::Notify>>,
+}
+
+struct NonCloneItem(u64);
+
+enum StreamMsg {
+    AttachReceiver {
+        rx: tokio::sync::mpsc::Receiver<u64>,
+        dropped: Arc<AtomicUsize>,
+    },
+    SpawnScopedWorker {
+        rx: tokio::sync::mpsc::Receiver<u64>,
+        dropped: Arc<AtomicUsize>,
+        exited: Arc<AtomicBool>,
+        scope_out: tokio::sync::oneshot::Sender<ActorScope<StreamActor>>,
+    },
+    Hold(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    ),
+    Item(NonCloneItem),
+    GetState,
+    PanicNow,
+}
+
+impl StatefulActor for StreamActor {
+    type Message = StreamMsg;
+    type Response = (usize, Vec<u64>);
+    type Error = String;
+
+    async fn handle(
+        &mut self,
+        msg: Self::Message,
+        ctx: &mut ActorContext<Self>,
+    ) -> Result<Self::Response, Self::Error> {
+        match msg {
+            StreamMsg::AttachReceiver { rx, dropped } => {
+                let probe = TimerDropProbe(dropped);
+                ctx.forward_receiver(rx, move |n| {
+                    let _keep = &probe;
+                    StreamMsg::Item(NonCloneItem(n))
+                });
+            }
+            StreamMsg::SpawnScopedWorker {
+                mut rx,
+                dropped,
+                exited,
+                scope_out,
+            } => {
+                ctx.spawn_scoped(move |mut scope| async move {
+                    let _probe = TimerDropProbe(dropped);
+                    let _ = scope_out.send(scope.clone());
+
+                    loop {
+                        tokio::select! {
+                            biased;
+                            _ = scope.cancelled() => {
+                                exited.store(true, Ordering::SeqCst);
+                                break;
+                            }
+                            maybe_item = rx.recv() => match maybe_item {
+                                Some(v) => {
+                                    if scope.cast(StreamMsg::Item(NonCloneItem(v))).await.is_err() {
+                                        exited.store(true, Ordering::SeqCst);
+                                        break;
+                                    }
+                                }
+                                None => break,
+                            }
+                        }
+                    }
+                });
+            }
+            StreamMsg::Hold(entered_tx, release_rx) => {
+                let _ = entered_tx.send(());
+                let _ = release_rx.await;
+            }
+            StreamMsg::Item(item) => {
+                self.items.push(item.0);
+                if let Some(notify) = &self.item_notify {
+                    notify.notify_waiters();
+                }
+            }
+            StreamMsg::GetState => {}
+            StreamMsg::PanicNow => panic!("intentional stream actor panic"),
+        }
+        Ok((ctx.instance_id(), self.items.clone()))
+    }
+}
+
+#[tokio::test]
+async fn test_actor_context_forward_receiver_no_permit_starvation_backpressure_and_cleanup() {
+    let root = Supervisor::new("root");
+    let item_notify = Arc::new(tokio::sync::Notify::new());
+    let notify_for_actor = item_notify.clone();
+
+    let client = StatefulActorBuilder::new("stream-forwarder", move |_| StreamActor {
+        items: Vec::new(),
+        item_notify: Some(notify_for_actor.clone()),
+    })
+    .channel_capacity(1)
+    .spawn(&root)
+    .await
+    .unwrap();
+
+    // 1. Attach receiver with channel_capacity(1); idle forwarder must not hold a mailbox permit
+    let (ext_tx, ext_rx) = tokio::sync::mpsc::channel(4);
+    let dropped = Arc::new(AtomicUsize::new(0));
+    client
+        .call(StreamMsg::AttachReceiver {
+            rx: ext_rx,
+            dropped: dropped.clone(),
+        })
+        .await
+        .unwrap();
+
+    // Call succeeds immediately even while receiver is idle and capacity is 1
+    assert_eq!(client.call(StreamMsg::GetState).await.unwrap(), (1, vec![]));
+
+    // 2. Forward items cleanly and exit when external sender drops
+    let n1 = item_notify.notified();
+    ext_tx.send(10).await.unwrap();
+    n1.await;
+
+    let n2 = item_notify.notified();
+    ext_tx.send(20).await.unwrap();
+    n2.await;
+    drop(ext_tx);
+
+    for _ in 0..50 {
+        if dropped.load(Ordering::SeqCst) == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(
+        dropped.load(Ordering::SeqCst),
+        1,
+        "Forwarder must terminate cleanly when external sender drops"
+    );
+
+    // 3. Backpressure preservation under full mailbox + cleanup when actor stops with open sender
+    let (ext_tx2, ext_rx2) = tokio::sync::mpsc::channel(1);
+    let dropped2 = Arc::new(AtomicUsize::new(0));
+    client
+        .call(StreamMsg::AttachReceiver {
+            rx: ext_rx2,
+            dropped: dropped2.clone(),
+        })
+        .await
+        .unwrap();
+
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    client
+        .cast(StreamMsg::Hold(entered_tx, release_rx))
+        .await
+        .unwrap();
+    entered_rx.await.unwrap();
+
+    // Send items while actor is blocked inside Hold
+    ext_tx2.send(30).await.unwrap();
+    let n3 = item_notify.notified();
+    let _ = release_tx.send(());
+    n3.await;
+
+    assert_eq!(
+        client.call(StreamMsg::GetState).await.unwrap().1,
+        vec![10, 20, 30]
+    );
+
+    // Keep ext_tx2 intentionally alive and shut down supervisor; forwarder must cancel immediately
+    root.shutdown().await.unwrap();
+    for _ in 0..50 {
+        if dropped2.load(Ordering::SeqCst) == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(
+        dropped2.load(Ordering::SeqCst),
+        1,
+        "Idle forwarder must cancel cleanly on actor shutdown even if external sender remains open"
+    );
+    drop(ext_tx2);
+}
+
+#[tokio::test]
+async fn test_actor_context_spawn_scoped_panic_isolation_and_no_cross_instance_leak() {
+    let root = Supervisor::new("root");
+    let item_notify = Arc::new(tokio::sync::Notify::new());
+    let notify_for_actor = item_notify.clone();
+
+    let client = StatefulActorBuilder::new("scoped-actor", move |_| StreamActor {
+        items: Vec::new(),
+        item_notify: Some(notify_for_actor.clone()),
+    })
+    .channel_capacity(1)
+    .restart_type(RestartType::Permanent)
+    .restart_policy(RestartPolicy::default().initial_backoff(Duration::from_millis(10)))
+    .spawn(&root)
+    .await
+    .unwrap();
+
+    let (ext_tx, ext_rx) = tokio::sync::mpsc::channel(4);
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let exited = Arc::new(AtomicBool::new(false));
+    let (scope_tx, scope_rx) = tokio::sync::oneshot::channel();
+
+    client
+        .call(StreamMsg::SpawnScopedWorker {
+            rx: ext_rx,
+            dropped: dropped.clone(),
+            exited: exited.clone(),
+            scope_out: scope_tx,
+        })
+        .await
+        .unwrap();
+
+    let scope = scope_rx.await.unwrap();
+    assert_eq!(scope.name(), "scoped-actor");
+    assert_eq!(scope.instance_id(), 1);
+    assert!(!scope.is_cancelled());
+
+    // 1. Forward via ActorScope into instance #1
+    let n1 = item_notify.notified();
+    ext_tx.send(7).await.unwrap();
+    n1.await;
+    assert_eq!(client.call(StreamMsg::GetState).await.unwrap(), (1, vec![7]));
+
+    // 2. Check scope.try_cast MailboxFull under capacity = 1 backpressure
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    client
+        .cast(StreamMsg::Hold(entered_tx, release_rx))
+        .await
+        .unwrap();
+    entered_rx.await.unwrap();
+
+    assert!(scope.try_cast(StreamMsg::Item(NonCloneItem(8))).is_ok());
+    assert!(matches!(
+        scope.try_cast(StreamMsg::Item(NonCloneItem(9))),
+        Err(ActorError::MailboxFull)
+    ));
+    let _ = release_tx.send(());
+
+    // 3. Panic instance #1: scoped task exits immediately and old scope MUST NOT leak to instance #2
+    let crash = client.call(StreamMsg::PanicNow).await;
+    assert!(matches!(crash, Err(ActorError::ActorUnavailable)));
+
+    let (inst, items_after_restart) = client.call(StreamMsg::GetState).await.unwrap();
+    assert_eq!(inst, 2);
+    assert!(items_after_restart.is_empty());
+
+    for _ in 0..50 {
+        if dropped.load(Ordering::SeqCst) == 1 && exited.load(Ordering::SeqCst) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert!(exited.load(Ordering::SeqCst));
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    assert!(scope.is_cancelled());
+
+    // Old scope rejects new casts instead of silently rebinding to instance #2
+    assert!(matches!(
+        scope.cast(StreamMsg::Item(NonCloneItem(999))).await,
+        Err(ActorError::ActorUnavailable)
+    ));
+    assert!(matches!(
+        scope.try_cast(StreamMsg::Item(NonCloneItem(999))),
+        Err(ActorError::ActorUnavailable)
+    ));
+    assert_eq!(client.call(StreamMsg::GetState).await.unwrap(), (2, vec![]));
+
+    drop(ext_tx);
     root.shutdown().await.unwrap();
 }

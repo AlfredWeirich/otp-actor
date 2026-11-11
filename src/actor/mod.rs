@@ -109,7 +109,7 @@ pub use model::{
     ShutdownPolicy, SupervisionStrategy, SupervisorError, TaskResult,
 };
 pub use stateful_actor::{
-    ActorClient, ActorContext, ActorControl, ActorError, CallMessage, StatefulActor,
+    ActorClient, ActorContext, ActorControl, ActorError, ActorScope, CallMessage, StatefulActor,
     StatefulActorBuilder, StatefulActorConfig,
 };
 pub use supervisor::{
