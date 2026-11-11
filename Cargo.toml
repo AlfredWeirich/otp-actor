@@ -14,8 +14,12 @@ categories = ["asynchronous", "concurrency"]
 all-features = true
 
 [features]
+# Minimal core actor & supervision framework only (no networking or test hooks).
 default = []
+# Exposes crash-injection helpers (`simulate_crash()`, `trigger_child_crash()`) for resilience testing.
+# Enabled automatically in `[dev-dependencies]` for integration tests and examples.
 chaos_test = []
+# Enables network-transparent remote actors over HTTP/2 gRPC (`otp_actor::remote`).
 remote = [
     "dep:tonic",
     "dep:tonic-prost",

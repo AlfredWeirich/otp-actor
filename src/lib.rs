@@ -147,6 +147,21 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! ## Feature Flags
+//!
+//! All optional features are disabled by default (`default = []`), keeping the core framework
+//! free of networking or test-only dependencies:
+//!
+//! - **`remote`**: Enables network-transparent remote actors over HTTP/2 gRPC via the
+//!   `otp_actor::remote` module (`RemoteActorClient`, `AnyActorClient`, `ActorNodeBuilder`,
+//!   `ActorNodeHandle`, `ByteEndpoint`, and `ActorNodeRegistry`). Pulls in `tonic`,
+//!   `tonic-prost`, `prost`, `serde`, `postcard`, `tokio-stream`, `tonic-prost-build`, and
+//!   `tokio/net`.
+//! - **`chaos_test`**: Exposes intentional crash-injection helpers (`SupervisorHandle::trigger_child_crash`,
+//!   `SupervisorHandle::simulate_crash`, `ActorClient::simulate_crash`, and
+//!   `ResourceClient::simulate_crash`) for testing supervision recovery and crash-loop policies.
+//!   Enabled automatically in `[dev-dependencies]` for integration tests and examples.
 
 pub mod actor;
 pub use actor::*;
