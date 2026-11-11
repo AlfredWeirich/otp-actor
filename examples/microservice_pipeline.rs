@@ -3,11 +3,15 @@
 //! Combines `otp-actor`'s core production building blocks in a realistic service topology:
 //! - **`ResourceActor` (`db-auth-token`)**: 0-hop `watch` cache reads, proactive background refresh,
 //!   and `stale_while_error` resilience during simulated upstream auth-provider outages.
-//! - **Bounded Mailbox Backpressure (`storage-sink`)**: `StatefulActor` with explicit `channel_capacity`
-//!   demonstrating deterministic load shedding (`ActorError::MailboxFull` via `try_cast`).
-//! - **Ingestion Worker (`ingestion-worker`)**: `StatefulActor` with `handle_cast` and `handle`,
-//!   reading auth tokens in 0 hops and forwarding valid events downstream, plus automatic
-//!   0-ms `watch<SlotState>` rebinding after a worker crash.
+//! - **Bounded Mailbox Backpressure & Queue Metrics (`storage-sink`)**: `StatefulActor` with explicit
+//!   `channel_capacity`, deterministic load shedding (`ActorError::MailboxFull` via `try_cast`), and
+//!   [`QueueStats`] observation (`sink_client.queue_stats()`).
+//! - **Ingestion Worker (`ingestion-worker`)**: `StatefulActor` using `ctx.forward_receiver(...)`
+//!   for external channel ingestion, `ctx.send_interval_with(...)` for lifecycle-bound heartbeats
+//!   on a non-`Clone` message enum, and automatic 0-ms `watch<SlotState>` rebinding after a crash.
+//! - **Runtime Introspection (`pipeline`)**: Non-invasive [`ChildStatusWatcher`] observation
+//!   (`watch_child_status`) and bounded supervisor health snapshots (`pipeline.snapshot()`),
+//!   including flapping detection (`restarts_in_window`).
 //!
 //! Run with:
 //! ```bash
@@ -19,11 +23,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use otp_actor::{
-    ActorClient, ActorContext, ActorError, ResourceActor, ResourceClient, RestartPolicy,
-    RestartType, StatefulActor, StatefulActorBuilder, SupervisionStrategy, Supervisor,
-    TimedResource, WorkerContext,
+    ActorClient, ActorContext, ActorError, ChildStatus, QueueStats, ResourceActor, ResourceClient,
+    RestartPolicy, RestartType, StatefulActor, StatefulActorBuilder, SupervisionStrategy,
+    Supervisor, TimedResource, WorkerContext,
 };
-use tokio::sync::oneshot;
+use tokio::sync::{Notify, mpsc, oneshot};
 
 // ============================================================================
 // Stage 2: Bounded Storage Sink (`StatefulActor`)
@@ -35,7 +39,10 @@ struct StorageSink {
 }
 
 enum SinkMsg {
-    Write { record: String, auth_token: String },
+    Write {
+        record: String,
+        auth_token: String,
+    },
     /// Deterministic test/demo gate to pause the sink handler and exercise mailbox backpressure.
     PauseUntil(oneshot::Sender<()>, oneshot::Receiver<()>),
     Stats,
@@ -46,7 +53,11 @@ impl StatefulActor for StorageSink {
     type Response = (usize, usize); // (persisted_count, instance_id)
     type Error = String;
 
-    async fn handle(&mut self, msg: SinkMsg, ctx: &mut ActorContext<Self>) -> Result<Self::Response, String> {
+    async fn handle(
+        &mut self,
+        msg: SinkMsg,
+        ctx: &mut ActorContext<Self>,
+    ) -> Result<Self::Response, String> {
         match msg {
             SinkMsg::Write { record, auth_token } => {
                 self.persisted.push(format!("{record} [auth={auth_token}]"));
@@ -83,6 +94,8 @@ struct IngestionEvent {
 
 enum IngestionMsg {
     Ingest(IngestionEvent),
+    AttachFeed(mpsc::Receiver<IngestionEvent>),
+    Heartbeat,
     Status,
     SimulateBug,
 }
@@ -90,35 +103,46 @@ enum IngestionMsg {
 struct IngestionWorker {
     auth_client: ResourceClient<String, String>,
     sink_client: ActorClient<StorageSink>,
+    processed_notify: Arc<Notify>,
     accepted: u64,
     rejected: u64,
     shed: u64,
+    heartbeats: u64,
 }
 
 impl IngestionWorker {
-    fn new(auth_client: ResourceClient<String, String>, sink_client: ActorClient<StorageSink>) -> Self {
+    fn new(
+        auth_client: ResourceClient<String, String>,
+        sink_client: ActorClient<StorageSink>,
+        processed_notify: Arc<Notify>,
+    ) -> Self {
         Self {
             auth_client,
             sink_client,
+            processed_notify,
             accepted: 0,
             rejected: 0,
             shed: 0,
+            heartbeats: 0,
         }
     }
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 struct IngestionStats {
     instance_id: usize,
     accepted: u64,
     rejected: u64,
     shed: u64,
+    heartbeats: u64,
 }
 
 enum IngestionReply {
     Forwarded,
     DroppedInvalid,
     BackpressureShed,
+    Ack,
     Stats(IngestionStats),
 }
 
@@ -126,6 +150,13 @@ impl StatefulActor for IngestionWorker {
     type Message = IngestionMsg;
     type Response = IngestionReply;
     type Error = String;
+
+    async fn on_start(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), String> {
+        // Instance-bound periodic heartbeat (`send_interval_with` works without `Clone` on `IngestionMsg`).
+        // Cancels automatically if this actor instance crashes or stops.
+        ctx.send_interval_with(Duration::from_millis(80), || IngestionMsg::Heartbeat);
+        Ok(())
+    }
 
     async fn handle(
         &mut self,
@@ -136,6 +167,7 @@ impl StatefulActor for IngestionWorker {
             IngestionMsg::Ingest(ev) => {
                 if !ev.valid {
                     self.rejected += 1;
+                    self.processed_notify.notify_waiters();
                     return Ok(IngestionReply::DroppedInvalid);
                 }
 
@@ -153,20 +185,32 @@ impl StatefulActor for IngestionWorker {
                 }) {
                     Ok(()) => {
                         self.accepted += 1;
+                        self.processed_notify.notify_waiters();
                         Ok(IngestionReply::Forwarded)
                     }
                     Err(ActorError::MailboxFull) => {
                         self.shed += 1;
+                        self.processed_notify.notify_waiters();
                         Ok(IngestionReply::BackpressureShed)
                     }
                     Err(e) => Err(format!("sink error: {e}")),
                 }
+            }
+            IngestionMsg::AttachFeed(rx) => {
+                // Pulls items from external mpsc receiver before reserving mailbox permits (no starvation).
+                ctx.forward_receiver(rx, IngestionMsg::Ingest);
+                Ok(IngestionReply::Ack)
+            }
+            IngestionMsg::Heartbeat => {
+                self.heartbeats += 1;
+                Ok(IngestionReply::Ack)
             }
             IngestionMsg::Status => Ok(IngestionReply::Stats(IngestionStats {
                 instance_id: ctx.instance_id(),
                 accepted: self.accepted,
                 rejected: self.rejected,
                 shed: self.shed,
+                heartbeats: self.heartbeats,
             })),
             IngestionMsg::SimulateBug => {
                 ctx.fail("simulated parser invariant violation");
@@ -177,11 +221,12 @@ impl StatefulActor for IngestionWorker {
 
     async fn on_stop(&mut self, ctx: &mut ActorContext<Self>) {
         println!(
-            "  [ingestion-worker #{}] on_stop: accepted={}, rejected={}, shed={}",
+            "  [ingestion-worker #{}] on_stop: accepted={}, rejected={}, shed={}, heartbeats={}",
             ctx.instance_id(),
             self.accepted,
             self.rejected,
-            self.shed
+            self.shed,
+            self.heartbeats
         );
     }
 }
@@ -233,11 +278,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 3. IngestionWorker wired with both ResourceClient and ActorClient<StorageSink>
     let auth_for_worker = auth_client.clone();
     let sink_for_worker = sink_client.clone();
-    let fast_restart = RestartPolicy::new(5, Duration::from_secs(10))
-        .initial_backoff(Duration::from_millis(20));
+    let processed_notify = Arc::new(Notify::new());
+    let notify_for_worker = processed_notify.clone();
+    let fast_restart =
+        RestartPolicy::new(5, Duration::from_secs(10)).initial_backoff(Duration::from_millis(20));
 
     let ingestion_client = StatefulActorBuilder::new("ingestion-worker", move |_| {
-        IngestionWorker::new(auth_for_worker.clone(), sink_for_worker.clone())
+        IngestionWorker::new(
+            auth_for_worker.clone(),
+            sink_for_worker.clone(),
+            notify_for_worker.clone(),
+        )
     })
     .restart_type(RestartType::Permanent)
     .restart_policy(fast_restart)
@@ -245,9 +296,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
 
     // ------------------------------------------------------------------------
-    // Phase 1: Normal ingestion with 0-hop auth token reads
+    // Phase 1: Normal ingestion, 0-hop auth reads & forward_receiver stream feed
     // ------------------------------------------------------------------------
-    println!("--- Phase 1: Filtering & 0-hop Auth Token Reads ---");
+    println!("--- Phase 1: Filtering, External Stream Forwarding & 0-hop Auth Token Reads ---");
     for (id, valid) in [(1, true), (2, false), (3, true)] {
         let reply = ingestion_client
             .call(IngestionMsg::Ingest(IngestionEvent {
@@ -259,17 +310,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match reply {
             IngestionReply::Forwarded => println!("  Event #{id}: forwarded to sink"),
             IngestionReply::DroppedInvalid => println!("  Event #{id}: filtered out (invalid)"),
-            IngestionReply::BackpressureShed | IngestionReply::Stats(_) => {}
+            IngestionReply::BackpressureShed | IngestionReply::Ack | IngestionReply::Stats(_) => {}
         }
     }
+
+    // Attach an external mpsc event feed via `ctx.forward_receiver(...)`
+    let (feed_tx, feed_rx) = mpsc::channel(4);
+    ingestion_client
+        .call(IngestionMsg::AttachFeed(feed_rx))
+        .await?;
+    for id in [4, 5] {
+        let processed = processed_notify.notified();
+        feed_tx
+            .send(IngestionEvent {
+                id,
+                payload: format!("stream-{id}"),
+                valid: true,
+            })
+            .await?;
+        processed.await;
+        println!("  Stream event #{id}: forwarded via ctx.forward_receiver");
+    }
+    drop(feed_tx);
+
     let (persisted, _) = sink_client.call(SinkMsg::Stats).await?;
     println!("  Sink persisted count: {persisted}\n");
-    assert_eq!(persisted, 2);
+    assert_eq!(persisted, 4);
 
     // ------------------------------------------------------------------------
-    // Phase 2: Bounded mailbox backpressure (no OOM under burst load)
+    // Phase 2: Bounded mailbox backpressure + queue_stats() observation
     // ------------------------------------------------------------------------
-    println!("--- Phase 2: Bounded Mailbox Backpressure (try_cast -> MailboxFull) ---");
+    println!("--- Phase 2: Bounded Mailbox Backpressure (try_cast & queue_stats) ---");
     let (entered_tx, entered_rx) = oneshot::channel();
     let (release_tx, release_rx) = oneshot::channel();
     sink_client
@@ -287,26 +358,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }))
             .await?
         {
-            IngestionReply::Forwarded => println!("  Burst event #{id}: queued in bounded sink mailbox"),
+            IngestionReply::Forwarded => {
+                println!("  Burst event #{id}: queued in bounded sink mailbox")
+            }
             IngestionReply::BackpressureShed => {
                 shed_count += 1;
                 println!("  Burst event #{id}: MailboxFull -> shed cleanly via backpressure!");
             }
-            IngestionReply::DroppedInvalid | IngestionReply::Stats(_) => {}
+            IngestionReply::DroppedInvalid | IngestionReply::Ack | IngestionReply::Stats(_) => {}
         }
     }
-    assert!(shed_count >= 1, "bounded mailbox must shed excess burst load");
+    assert!(
+        shed_count >= 1,
+        "bounded mailbox must shed excess burst load"
+    );
+
+    let busy_stats: QueueStats = sink_client.queue_stats();
+    println!(
+        "  Sink queue_stats under backpressure: queued={}/{}, available={}, is_full={}",
+        busy_stats.queued,
+        busy_stats.max_capacity,
+        busy_stats.available,
+        busy_stats.is_full()
+    );
+    assert!(busy_stats.is_full());
+    assert_eq!(busy_stats.queued, 2);
 
     // Release sink gate and confirm queued messages drain cleanly
     let _ = release_tx.send(());
     let (persisted_after_burst, _) = sink_client.call(SinkMsg::Stats).await?;
-    println!("  Sink drained queued burst -> persisted count: {persisted_after_burst}");
-    if let IngestionReply::Stats(before_crash) = ingestion_client.call(IngestionMsg::Status).await? {
+    let drained_stats = sink_client.queue_stats();
+    println!(
+        "  Sink drained queued burst -> persisted={persisted_after_burst} (queued={}/{})",
+        drained_stats.queued, drained_stats.max_capacity
+    );
+    assert_eq!(persisted_after_burst, 6);
+    assert_eq!(drained_stats.queued, 0);
+
+    if let IngestionReply::Stats(before_crash) = ingestion_client.call(IngestionMsg::Status).await?
+    {
         println!(
-            "  Ingestion totals before crash (instance #{}): accepted={}, rejected={}, shed={}\n",
-            before_crash.instance_id, before_crash.accepted, before_crash.rejected, before_crash.shed
+            "  Ingestion totals after burst (instance #{}): accepted={}, rejected={}, shed={}\n",
+            before_crash.instance_id,
+            before_crash.accepted,
+            before_crash.rejected,
+            before_crash.shed
         );
-        assert_eq!((before_crash.accepted, before_crash.rejected, before_crash.shed), (4, 1, 3));
+        assert_eq!(
+            (
+                before_crash.accepted,
+                before_crash.rejected,
+                before_crash.shed
+            ),
+            (6, 1, 3)
+        );
     }
 
     // ------------------------------------------------------------------------
@@ -327,19 +432,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_ne!(stale_token, recovered_token);
 
     // ------------------------------------------------------------------------
-    // Phase 4: Worker crash -> 0-ms reactive rebind on the same client handle
+    // Phase 4: Worker crash, ChildStatusWatcher & SupervisorSnapshot
     // ------------------------------------------------------------------------
-    println!("--- Phase 4: Worker Crash & Transparent Rebinding ---");
+    println!("--- Phase 4: Worker Crash, Status Watcher & Supervisor Snapshot ---");
+    if let IngestionReply::Stats(pre_crash) = ingestion_client.call(IngestionMsg::Status).await? {
+        println!(
+            "  Worker #{} state before crash: {pre_crash:?}",
+            pre_crash.instance_id
+        );
+    }
+    let mut worker_status = pipeline.watch_child_status("ingestion-worker").await?;
     let _ = ingestion_client.call(IngestionMsg::SimulateBug).await;
+
+    // Wait non-invasively for replacement instance #2 via existing watch slot:
+    let new_status = worker_status
+        .wait_for(|s| matches!(s, ChildStatus::Running { instance_id: 2 }))
+        .await?;
+    println!("  ChildStatusWatcher observed recovery: {new_status:?}");
 
     // Immediately reuse `ingestion_client` with zero reconnect logic:
     match ingestion_client.call(IngestionMsg::Status).await? {
         IngestionReply::Stats(stats) => {
-            println!("  Rebound transparently to fresh worker: {stats:?}\n");
+            println!("  Rebound transparently to fresh worker: {stats:?}");
             assert_eq!(stats.instance_id, 2);
         }
         _ => unreachable!(),
     }
+
+    // Inspect ordered children, statuses, and flapping metrics (`restarts_in_window`) via bounded snapshot:
+    let snap = pipeline.snapshot().await?;
+    println!(
+        "  Supervisor '{}' snapshot: all_running={}, any_failed={}",
+        snap.name,
+        snap.all_running(),
+        snap.any_failed()
+    );
+    for child in &snap.children {
+        println!(
+            "    - {}: status={:?}, instance_id={}, restart_type={:?}, restarts_in_window={}",
+            child.name,
+            child.status,
+            child.instance_id,
+            child.restart_type,
+            child.restarts_in_window
+        );
+    }
+    assert!(snap.all_running());
+    assert!(!snap.any_failed());
+    assert_eq!(
+        snap.child("ingestion-worker").map(|c| c.restarts_in_window),
+        Some(1)
+    );
+    println!();
 
     // ------------------------------------------------------------------------
     // Phase 5: Coordinated reverse-order graceful shutdown

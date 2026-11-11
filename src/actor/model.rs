@@ -16,6 +16,10 @@ pub const EXPIRY_BUFFER: Duration = Duration::from_secs(2);
 /// Default grace period granted to an actor or child supervisor during graceful shutdown (5 seconds).
 pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Default timeout applied by [`super::supervisor::SupervisorHandle::snapshot`] when querying
+/// supervisor runtime state (2 seconds).
+pub const DEFAULT_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Result returned by supervised actor and supervisor tasks upon termination.
 /// - `Ok(())` indicates a clean, normal shutdown.
 /// - `Err(reason)` signals an abnormal crash or failure escalation that triggers supervision recovery.
@@ -186,9 +190,27 @@ impl RestartTracker {
         &self.policy
     }
 
+    /// Returns `true` if `recorded_at` falls within `window` relative to `now`.
+    fn is_within_window(recorded_at: Instant, now: Instant, window: Duration) -> bool {
+        now.saturating_duration_since(recorded_at) <= window
+    }
+
     /// Returns the number of consecutive failures within the active window.
     pub fn consecutive_failures(&self) -> usize {
         self.consecutive_failures
+    }
+
+    /// Returns the number of restarts currently inside [`RestartPolicy::time_window`].
+    ///
+    /// Unlike [`Self::consecutive_failures`], expired crash timestamps age out dynamically even
+    /// when no recent crash has occurred, making this metric directly suitable for flapping checks.
+    pub fn restarts_in_window(&self) -> usize {
+        let now = Instant::now();
+        let window = self.policy.time_window;
+        self.restarts
+            .iter()
+            .filter(|&&t| Self::is_within_window(t, now, window))
+            .count()
     }
 
     /// Records a crash.
@@ -196,8 +218,9 @@ impl RestartTracker {
     /// or `None` if the crash threshold has been exceeded.
     pub fn record_crash(&mut self) -> Option<Duration> {
         let now = Instant::now();
+        let window = self.policy.time_window;
         self.restarts
-            .retain(|&t| now.saturating_duration_since(t) <= self.policy.time_window);
+            .retain(|&t| Self::is_within_window(t, now, window));
 
         // If all past crashes are outside the time window, the component has stabilized:
         // reset consecutive failures so backoff does not stay permanently saturated!
@@ -261,4 +284,6 @@ pub enum SupervisorError {
     MaxRestartsExceeded(String, usize, Duration),
     #[error("Child '{0}' factory panicked during spawn: {1}")]
     FactoryPanicked(String, String),
+    #[error("Supervisor operation timed out after {0:?}")]
+    Timeout(Duration),
 }

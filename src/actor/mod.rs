@@ -105,14 +105,15 @@ pub use generic_actor::{
     ResourceActorConfig, ResourceClient, ResourceError, TimedResource, Worker, WorkerContext,
 };
 pub use model::{
-    DEFAULT_SHUTDOWN_TIMEOUT, EXPIRY_BUFFER, RestartPolicy, RestartTracker, RestartType,
-    ShutdownPolicy, SupervisionStrategy, SupervisorError, TaskResult,
+    DEFAULT_SHUTDOWN_TIMEOUT, DEFAULT_SNAPSHOT_TIMEOUT, EXPIRY_BUFFER, RestartPolicy,
+    RestartTracker, RestartType, ShutdownPolicy, SupervisionStrategy, SupervisorError, TaskResult,
 };
 pub use stateful_actor::{
-    ActorClient, ActorContext, ActorControl, ActorError, CallMessage, StatefulActor,
-    StatefulActorBuilder, StatefulActorConfig,
+    ActorClient, ActorContext, ActorControl, ActorError, ActorScope, CallMessage, QueueStats,
+    StatefulActor, StatefulActorBuilder, StatefulActorConfig,
 };
 pub use supervisor::{
-    ChildSpec, ShutdownSignalFn, SlotState, SpawnContext, Supervisor, SupervisorBuilder,
-    SupervisorHandle, UntypedActorFactory, UntypedSender,
+    ChildSnapshot, ChildSpec, ChildStatus, ChildStatusWatcher, ShutdownSignalFn, SlotState,
+    SpawnContext, Supervisor, SupervisorBuilder, SupervisorHandle, SupervisorSnapshot,
+    UntypedActorFactory, UntypedSender,
 };

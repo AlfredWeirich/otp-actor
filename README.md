@@ -47,6 +47,7 @@
 - [Stateful Actors (`StatefulActor`)](#stateful-actors-statefulactor)
   - [Implementing `StatefulActor`](#implementing-statefulactor)
   - [Spawning and communicating via `ActorClient`](#spawning-and-communicating-via-actorclient)
+  - [Timers, streams & scoped background tasks](#timers-streams--scoped-background-tasks)
   - [State lifecycle on restart & persistence patterns](#state-lifecycle-on-restart--persistence-patterns)
 - [Remote Actors over gRPC](#remote-actors-over-grpc)
   - [Architectural Overview](#architectural-overview)
@@ -62,6 +63,7 @@
   - [Declarative child specs](#declarative-child-specs-otp-style)
   - [Dynamic children](#dynamic-children)
   - [What happens when a supervisor crashes?](#what-happens-when-a-supervisor-crashes)
+  - [Runtime introspection & status observation](#runtime-introspection--status-observation)
 - [Client API](#client-api)
 - [Error Handling](#error-handling)
 - [Resilience Features in Detail](#resilience-features-in-detail)
@@ -82,7 +84,8 @@
 | **Strategies** | `OneForOne`, `OneForAll`, `RestForOne` (Erlang/OTP semantics) at every tree level |
 | **Restart types** | `RestartType::Transient`, `RestartType::Permanent`, `RestartType::Temporary` |
 | **Graceful shutdown** | `ShutdownPolicy::Timeout(d)`, `BrutalKill`, `Infinity` with mailbox draining & in-flight completion (`supervisor.shutdown()`, `stop_child()`, `delete_child()`) |
-| **Stateful actors** | `StatefulActor` trait (`handle` / `handle_cast`, `CallMessage<A>` / `ask`, `on_start` / `on_stop` hooks, `ActorContext<Self>` with `client()`, `supervisor()`, `send_after()`) running alongside `ResourceActor` under the same `Supervisor`s |
+| **Stateful actors** | `StatefulActor` trait (`handle` / `handle_cast`, `CallMessage<A>` / `ask`, `on_start` / `on_stop` hooks, `ActorContext<Self>` with `client()`, `supervisor()`, `send_after()`, `send_interval()` / `send_interval_with()`, `spawn_scoped()` / `ActorScope`, `forward_receiver()`) running alongside `ResourceActor` under the same `Supervisor`s |
+| **Runtime introspection** | Bounded supervisor health snapshots (`snapshot()`, `snapshot_timeout()`, ordered `SupervisorSnapshot` with `ChildStatus`, `RestartType`, `restarts_in_window`, `all_running()` / `any_failed()` helpers), read-only `watch_child_status()` (`ChildStatusWatcher`), and non-blocking `ActorClient::queue_stats()` |
 | **Escalation & Recovery** | OTP-grade crash escalation (`escalate_on_failure`), manual recovery API (`restart_child`) |
 | **Crash-loop protection** | `#[non_exhaustive]` `RestartPolicy` builder, `RestartTracker` with capped exponential backoff, permanent-failure `SlotState::Failed` with fast-fail errors |
 | **Zero-hop cache reads** | `ResourceClient::get()` reads fresh values in 0 hops directly from a `tokio::sync::watch` snapshot without crossing the actor mailbox |
@@ -148,14 +151,14 @@ flowchart TD
 
 | Component | File | Responsibility |
 | --- | --- | --- |
-| `Supervisor`, `SupervisorBuilder`, `SupervisorHandle`, `ChildSpec`, `SpawnContext`, `SlotState` | [`src/actor/supervisor.rs`](src/actor/supervisor.rs) | Unified recursive supervisor (leaf actors and child supervisors to arbitrary depth). Applies `SupervisionStrategy`, tracks restart intensity & wave tickets, publishes reactive `watch::Receiver<SlotState>` slots, and provides typed accessors (`get_resource_client`, `get_actor_client`, `get_supervisor`). |
+| `Supervisor`, `SupervisorBuilder`, `SupervisorHandle`, `SupervisorSnapshot`, `ChildSnapshot`, `ChildStatus`, `ChildStatusWatcher`, `ChildSpec`, `SpawnContext`, `SlotState` | [`src/actor/supervisor.rs`](src/actor/supervisor.rs) | Unified recursive supervisor (leaf actors and child supervisors to arbitrary depth). Applies `SupervisionStrategy`, tracks restart intensity & wave tickets, publishes reactive `watch::Receiver<SlotState>` slots, exposes bounded introspection snapshots (`snapshot`, `snapshot_timeout`) & read-only status watchers (`watch_child_status`), and provides typed accessors (`get_resource_client`, `get_actor_client`, `get_supervisor`). |
 | `ResourceActor`, `ResourceActorBuilder`, `ResourceActorConfig`, `ResourceClient`, `Worker`, `TimedResource`, `WorkerContext`, `ResourceError` | [`src/actor/generic_actor.rs`](src/actor/generic_actor.rs) | Caching/refreshing resource actor with 0-hop `watch` cache reads, fluent builder, worker abstraction, and self-healing `ResourceClient`. |
-| `StatefulActor`, `StatefulActorBuilder`, `StatefulActorConfig`, `CallMessage`, `ActorClient`, `ActorContext`, `ActorControl`, `ActorError` | [`src/actor/stateful_actor.rs`](src/actor/stateful_actor.rs) | Zero-cost general-purpose stateful actor (`gen_server` style) with `handle` / `handle_cast` / `ask`, `ActorContext<Self>` timers & handles, backpressure (`try_cast`), and self-healing `ActorClient`. |
+| `StatefulActor`, `StatefulActorBuilder`, `StatefulActorConfig`, `CallMessage`, `ActorClient`, `ActorContext`, `ActorScope`, `ActorControl`, `QueueStats`, `ActorError` | [`src/actor/stateful_actor.rs`](src/actor/stateful_actor.rs) | Zero-cost general-purpose stateful actor (`gen_server` style) with `handle` / `handle_cast` / `ask`, `ActorContext<Self>` timers & scoped stream forwarding (`send_after`, `send_interval`, `send_interval_with`, `spawn_scoped`, `forward_receiver`), backpressure (`try_cast`, `queue_stats`), and self-healing `ActorClient`. |
 | `RemoteActorClient`, `AnyActorClient`, `ActorNodeHandle`, `ActorNodeService`, `ActorNodeRegistry`, `ByteEndpoint`, `RemoteActorError`, `RemoteNodeError` | [`src/remote/mod.rs`](src/remote/mod.rs) | gRPC remote actors (`--features remote`): bounded `postcard` endpoint bridge, typed remote client, location transparency, coordinated 2-phase shutdown. |
 | Protobuf Schema & Build Script | [`proto/actor_node.proto`](proto/actor_node.proto) & [`build.rs`](build.rs) | Compact universal gRPC actor wire contract (`Call`, `Cast`, `RemoteError`), compiled automatically via `tonic-prost-build`. |
-| `SupervisionStrategy`, `RestartPolicy`, `RestartTracker`, `RestartType`, `ShutdownPolicy`, `SupervisorError`, `TaskResult`, `EXPIRY_BUFFER`, `DEFAULT_SHUTDOWN_TIMEOUT` | [`src/actor/model.rs`](src/actor/model.rs) | Shared domain model: strategies, `#[non_exhaustive]` policies & errors, restart types, shutdown policies, backoff computation, task exit results. |
+| `SupervisionStrategy`, `RestartPolicy`, `RestartTracker`, `RestartType`, `ShutdownPolicy`, `SupervisorError`, `TaskResult`, `EXPIRY_BUFFER`, `DEFAULT_SHUTDOWN_TIMEOUT`, `DEFAULT_SNAPSHOT_TIMEOUT` | [`src/actor/model.rs`](src/actor/model.rs) | Shared domain model: strategies, `#[non_exhaustive]` policies & errors, restart types, shutdown policies, sliding-window crash tracking (`restarts_in_window`) & backoff, task exit results. |
 | Quickstart (Crash & 0-ms Rebind) | [`examples/quickstart.rs`](examples/quickstart.rs) | 35-line copy-paste showcase: real actor panic isolation and automatic `watch<SlotState>` rebinding. |
-| Microservice Pipeline | [`examples/microservice_pipeline.rs`](examples/microservice_pipeline.rs) | Ingestion worker + 0-hop `ResourceActor` auth cache (`stale_while_error`) + bounded `try_cast` backpressure. |
+| Microservice Pipeline | [`examples/microservice_pipeline.rs`](examples/microservice_pipeline.rs) | Ingestion worker (`ctx.forward_receiver`, `ctx.send_interval_with`) + 0-hop `ResourceActor` auth cache (`stale_while_error`) + bounded `try_cast`/`queue_stats()` + `ChildStatusWatcher`/`SupervisorSnapshot`. |
 | `RestForOne` Pipeline | [`examples/rest_for_one_pipeline.rs`](examples/rest_for_one_pipeline.rs) | 3-stage pipeline isolating panics and restarting only downstream stages (supports `--interactive`). |
 | Demo | [`examples/otp_actor.rs`](examples/otp_actor.rs) | Eight-phase walkthrough with simulated GCP tokens and a database secret. |
 | Minimum | [`examples/minimum.rs`](examples/minimum.rs) | Output-free minimal example demonstrating both `ResourceActor` and `StatefulActor` under a root `Supervisor`. |
@@ -165,7 +168,7 @@ flowchart TD
 | Remote All-in-One Showcase | [`examples/remote/all_in_one.rs`](examples/remote/all_in_one.rs) | Full remote lifecycle: hosting, gRPC client calls, crash self-healing, client-initiated `ctx.stop()`, and 2-phase shutdown. |
 | Remote Server Node (Rechner B) | [`examples/remote/server.rs`](examples/remote/server.rs) | Standalone daemon hosting actors under OTP supervision over network gRPC (default: `http://127.0.0.1:50051`, override via `REMOTE_ADDR`). |
 | Remote Client (Rechner A) | [`examples/remote/client.rs`](examples/remote/client.rs) | Lightweight client invoking remote actors with location transparency and testing crash recovery. |
-| Integration tests | [`tests/actor_supervision_test.rs`](tests/actor_supervision_test.rs) | 72 tests covering recursive supervision, 0-hop caching, stateful actors, restart types, graceful shutdown, timeouts, backpressure, and factory panic isolation. |
+| Integration tests | [`tests/actor_supervision_test.rs`](tests/actor_supervision_test.rs) | 82 tests covering recursive supervision, 0-hop caching, stateful actors, timers & stream forwarding, `ActorScope`, runtime introspection (`snapshot`, `watch_child_status`, `queue_stats`), restart types, graceful shutdown, timeouts, backpressure, and factory panic isolation. |
 | Remote gRPC tests | [`tests/remote_grpc_test.rs`](tests/remote_grpc_test.rs) | 9 tests covering TCP/HTTP2 transport, location transparency, crash recovery, protocol versioning, request authorization, label sanitization, timeouts, and 2-phase drainage. |
 
 ---
@@ -194,7 +197,7 @@ cargo run --example quickstart
 # Run the output-free minimal example (both actor types)
 cargo run --example minimum
 
-# Run the microservice ingestion pipeline blueprint (0-hop auth + backpressure + stale-while-error)
+# Run the microservice ingestion pipeline blueprint (forward_receiver + interval + queue_stats + snapshot)
 cargo run --example microservice_pipeline
 
 # Run the RestForOne pipeline demo (or add `-- --interactive` to inject panics manually)
@@ -221,7 +224,7 @@ cargo run --example remote_server --features remote
 # Terminal 2 (Rechner A / Client):
 cargo run --example remote_client --features remote
 
-# Run all 82 core & remote tests (+ 4 doc-tests = 86 total)
+# Run all 92 core & remote tests (+ 4 doc-tests = 96 total)
 cargo test --all-features
 
 # Optimized build
@@ -235,10 +238,10 @@ To use the crate from another project in the same workspace or from crates.io, a
 
 ```toml
 [dependencies]
-otp-actor = "0.3.0"
+otp-actor = "0.3.1"
 # Optional features:
-# otp-actor = { version = "0.3.0", features = ["remote"] }
-# otp-actor = { version = "0.3.0", features = ["chaos_test"] }
+# otp-actor = { version = "0.3.1", features = ["remote"] }
+# otp-actor = { version = "0.3.1", features = ["chaos_test"] }
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -580,6 +583,9 @@ Inside `handle`, `handle_cast`, `on_start`, and `on_stop`, `ctx: &mut ActorConte
 - `ctx.client()` — returns a self-healing `ActorClient<Self>` handle to this actor.
 - `ctx.supervisor()` — returns a `&SupervisorHandle` to the parent supervisor (for dynamic sibling/child spawning).
 - `ctx.send_after(delay, msg)` — schedules a delayed fire-and-forget `cast` to `self`, returning a `tokio::task::AbortHandle`.
+- `ctx.send_interval(period, msg)` / `ctx.send_interval_with(period, make_msg)` — schedules a lifecycle-bound periodic timer (`MissedTickBehavior::Skip`; non-`Clone` compatible via closure), returning an `AbortHandle`.
+- `ctx.spawn_scoped(|scope| ...)` — spawns an instance-bound background task receiving an [`ActorScope<Self>`](src/actor/stateful_actor.rs) (`cancelled()`, `cast()`, `try_cast()`, `instance_id()`) that cancels automatically when this instance exits or panics.
+- `ctx.forward_receiver(rx, map_msg)` — forwards items from an external `tokio::sync::mpsc::Receiver` into `self` as `cast` messages without idle permit starvation.
 - `ctx.stop()` — instructs the actor to drain its mailbox, invoke `on_stop`, and exit cleanly with `Ok(())`.
 - `ctx.fail("reason")` — escalates a fatal failure to the `Supervisor`, triggering supervision recovery (`OneForOne`, `OneForAll`, `RestForOne`).
 
@@ -614,6 +620,50 @@ assert_eq!((current, total), (16, 16));
 | `.shutdown_policy(p)` | `ShutdownPolicy::Timeout(5 s)` | How the supervisor terminates the actor on stop/shutdown (`Timeout(Duration)`, `BrutalKill`, or `Infinity`). |
 | `.shutdown_timeout(d)` | — | Shorthand for `.shutdown_policy(ShutdownPolicy::Timeout(d))`. |
 | `.handler_timeout(d)` | `None` (disabled) | Aborts a `handle()` or `handle_cast()` execution that exceeds `d`, immediately returns `Err(ActorError::Timeout(d))` to `call` callers, and escalates to the supervisor (`ctx.fail(...)`) so a fresh instance is booted via `on_start` without leaving partially mutated `&mut self` state. |
+
+### Timers, streams & scoped background tasks
+
+Instead of manually spawning detached `tokio::spawn` loops with raw `ActorClient` handles (which can outlive an actor restart and leak work or inject stale messages into a fresh incarnation), bind background tasks directly to the current actor instance via `ActorContext`:
+
+```rust
+async fn on_start(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), String> {
+    // Periodic ticks: first tick arrives after `period`, uses MissedTickBehavior::Skip under
+    // backpressure, and stops automatically if this actor instance exits, crashes, or panics.
+    ctx.send_interval(Duration::from_secs(5), Msg::Heartbeat);
+
+    // Non-Clone / lazy payload variant (`make_msg` runs only after reserving a mailbox permit):
+    ctx.send_interval_with(Duration::from_secs(1), || Msg::Tick(Instant::now()));
+
+    Ok(())
+}
+```
+
+For external channels or custom async loops:
+
+```rust
+// 1. Forward external mpsc streams without holding mailbox permits while idle:
+ctx.forward_receiver(external_rx, Msg::InboundEvent);
+
+// 2. Or spawn a custom task bound to this exact instance via ActorScope<Self>:
+ctx.spawn_scoped(|mut scope| async move {
+    loop {
+        tokio::select! {
+            biased;
+            _ = scope.cancelled() => break,
+            Some(item) = stream.next() => {
+                if scope.cast(Msg::Item(item)).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+});
+```
+
+Key design guarantees:
+- **Zero-duration guard:** `send_interval` and `send_interval_with` ignore `Duration::ZERO` (logging a warning and returning a completed `AbortHandle`) rather than panicking.
+- **No idle permit starvation:** `send_interval_with` and `forward_receiver` wait for input *first* and only then reserve a bounded mailbox slot (`tx.reserve()`), so even `channel_capacity(1)` actors never deadlock waiting on an idle timer/stream.
+- **No cross-instance leaks:** Unlike `ActorClient`, `ActorScope<A>` is pinned to a single `instance_id` and intentionally **never** rebinds after a crash—returning `Err(ActorError::ActorUnavailable)` once that instance exits.
 
 ### State Lifecycle on Restart & Persistence Patterns
 
@@ -678,7 +728,7 @@ When built with `--features remote`, the crate enables distributed actor communi
 
 ```toml
 [dependencies]
-otp-actor = { version = "0.3.0", features = ["remote"] }
+otp-actor = { version = "0.3.1", features = ["remote"] }
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 ```
@@ -990,7 +1040,7 @@ pub struct RestartPolicy {
 
 Defaults: `max_restarts = 5`, `time_window = 10 s`, `initial_backoff = 50 ms`, `max_backoff = 2 s`, `backoff_multiplier = 2.0`. Configure cleanly via `RestartPolicy::new(max_restarts, time_window)` and fluent builder methods (`.max_restarts(...)`, `.time_window(...)`, `.initial_backoff(...)`, `.max_backoff(...)`, `.backoff_multiplier(...)`).
 
-Behaviour (implemented by `RestartTracker`, exposing `.policy()` and `.consecutive_failures()`):
+Behaviour (implemented by `RestartTracker`, exposing `.policy()`, `.consecutive_failures()`, and `.restarts_in_window()`):
 
 - Each crash is recorded; entries older than `time_window` are discarded.
 - If the number of recent restarts reaches `max_restarts`, the component is marked **permanently failed** (`SlotState::Failed`). Pending and future lookups then fail fast with `MaxRestartsExceeded`.
@@ -1084,6 +1134,30 @@ sequenceDiagram
 
 Because children are owned by their supervisor, a supervisor crash also replaces its subtree with fresh instances (their in-memory cache/state starts empty again, and `instance_id` restarts at 1). Clients re-bind seamlessly via `SlotState` watch channels apart from the one-time re-bind latency.
 
+### Runtime introspection & status observation
+
+`otp-actor` provides non-invasive, zero-hot-path-overhead primitives for health endpoints, flapping detection, and lifecycle observation:
+
+- **Bounded supervisor snapshots (`snapshot()` / `snapshot_timeout(d)`):**
+  Returns `SupervisorSnapshot` containing the supervisor's `name`, `instance_id`, `strategy`, and ordered `children: Vec<ChildSnapshot>` (`name`, `status: ChildStatus`, `instance_id`, `restart_type`, `restarts_in_window`). Queries are bounded by `DEFAULT_SNAPSHOT_TIMEOUT` (2 s) or a custom duration (`SupervisorError::Timeout`), ensuring health probes never hang indefinitely if a supervisor is stalled in shutdown or heavy restarts.
+  `SupervisorSnapshot` offers raw inspection helpers (`child(name)`, `all_running()`, `any_failed()`, `any_restarting()`, `running_count()`, `restarting_count()`, `stopped_count()`, `failed_count()`) rather than an opinionated `is_healthy()`, leaving readiness policies (e.g., whether a `Restarting` child in backoff counts as `200 OK` vs `503`) to your service. Snapshot types intentionally omit `serde` because `ChildStatus::Failed(SupervisorError)` and `Instant`-backed restart tracking belong strictly in-process.
+- **Zero-channel-duplication status watcher (`watch_child_status(name)`):**
+  Returns a read-only `ChildStatusWatcher` wrapping the supervisor's existing per-child `watch::Receiver<SlotState>` channel (`child_name()`, `current()`, `changed()`, `wait_for(...)`), without exposing internal `UntypedSender` handles or maintaining a second status channel. Unlike internal data-plane resolution, `watch_child_status` succeeds for `Stopped` and `Failed` children too. `ChildStatus` exposes only externally observable states (`Running { instance_id }`, `Restarting { instance_id }`, `Stopped`, `Failed(SupervisorError)`).
+- **Approximate mailbox depth (`ActorClient::queue_stats()`):**
+  Reads the locally cached bounded channel sender (`max_capacity`, `available`, `queued`, `is_closed`, `is_full()`) without contacting the supervisor or locking across `.await`. Values are approximate point-in-time snapshots under concurrent traffic; notably, immediately after an actor crash and *before* the next `call`/`cast` triggers rebinding, `queue_stats()` still inspects the exited instance's closed mailbox (`is_closed == true`).
+
+```rust
+// Observe transitions without polling:
+let mut watcher = supervisor.watch_child_status("worker").await?;
+let snap = supervisor.snapshot().await?;
+if !snap.any_failed() && snap.all_running() {
+    // Check flapping per child:
+    for child in &snap.children {
+        println!("{} restarts_in_window={}", child.name, child.restarts_in_window);
+    }
+}
+```
+
 ---
 
 ## Client API
@@ -1106,6 +1180,9 @@ Because children are owned by their supervisor, a supervisor crash also replaces
 | `restart_child(name)` | Manually recovers a failed or stopped child (and dependent siblings under `OneForAll` / `RestForOne`), gracefully awaiting termination of any running instance before spawning the replacement. |
 | `stop_child(name)` | Gracefully stops a supervised child according to its `ShutdownPolicy` and disables auto-restart on supervisor reboot. |
 | `delete_child(name)` | Gracefully stops (if running) and completely removes a child's specification and state from the supervisor. |
+| `snapshot()` | Captures a point-in-time `SupervisorSnapshot` bounded by `DEFAULT_SNAPSHOT_TIMEOUT` (2 s). Returns ordered child snapshots (`ChildStatus`, `instance_id`, `RestartType`, `restarts_in_window`) and helpers (`all_running()`, `any_failed()`, etc.). |
+| `snapshot_timeout(d)` | Like `snapshot()`, bounded by an explicit `Duration` → `SupervisorError::Timeout(d)`. |
+| `watch_child_status(name)` | Returns a read-only `ChildStatusWatcher` wrapping the child's existing `SlotState` watch channel (`current()`, `changed()`, `wait_for(...)`). Succeeds on `Stopped` and `Failed` children too. |
 | `request_shutdown()` | Enqueues graceful shutdown without waiting for completion (safe to call from inside a child actor's message handler via `ctx.supervisor()` without deadlocking). |
 | `shutdown()` | Sequentially shuts down all supervised children in reverse registration order and terminates this supervisor (cascading recursively into child supervisors). Do not `.await` from inside a supervised child's own message handler; use `request_shutdown()` instead. |
 | `resolve_child_channel::<S>(name)` / `resolve_child_channel_untyped(name)` | Low-level endpoint lookup. |
@@ -1136,6 +1213,7 @@ Because children are owned by their supervisor, a supervisor crash also replaces
 | `cast(msg)` | Sends a fire-and-forget message. Re-binds reactively via `SlotState` if the channel was closed. |
 | `try_cast(msg)` | Non-blocking enqueue attempt. Returns `Err(ActorError::MailboxFull)` immediately when the bounded mailbox is at capacity. |
 | `cast_timeout(msg, d)` | Like `cast(msg)` with a client-side deadline → `ActorError::Timeout(Duration)`. |
+| `queue_stats()` | Returns approximate mailbox metrics (`QueueStats`: `max_capacity`, `available`, `queued`, `is_closed`, `is_full()`) from the cached sender without contacting the supervisor. After a crash before the next `call`/`cast` rebinds, reports the exited instance's closed channel. |
 | `shutdown()` | Sends a graceful shutdown command directly to the actor (drains mailbox, runs `on_stop`, and exits cleanly; re-binds if needed). |
 | `simulate_crash()` | Chaos *(requires `chaos_test` or test cfg)*: terminates the actor with a crash error (`TaskResult::Err`) to exercise supervision. |
 | `name()` / `service_name()` / `supervisor()` | The actor's name, managing supervisor name, and `&SupervisorHandle`. |
@@ -1173,6 +1251,7 @@ pub enum SupervisorError {
     SupervisorUnavailable,
     MaxRestartsExceeded(String, usize, Duration),
     FactoryPanicked(String, String),
+    Timeout(Duration),
 }
 ```
 
@@ -1243,8 +1322,8 @@ The output is intentionally verbose (emoji-tagged log lines such as `🔥 Eager 
 ## Testing
 
 ```bash
-cargo test                                            # core suite + doc-tests (72 + 4 = 76)
-cargo test --all-features                             # core, remote gRPC, codec unit & doc-tests (72 + 9 + 1 + 4 = 86)
+cargo test                                            # core suite + doc-tests (82 + 4 = 86)
+cargo test --all-features                             # core, remote gRPC, codec unit & doc-tests (82 + 9 + 1 + 4 = 96)
 cargo test --test actor_supervision_test              # core integration suite only
 cargo test --test remote_grpc_test --features remote  # remote gRPC suite only
 cargo test test_strategy_rest_for_one -- --nocapture  # a single test with logs
@@ -1254,7 +1333,7 @@ cargo test test_strategy_rest_for_one -- --nocapture  # a single test with logs
 
 > **Remote test suite ([`tests/remote_grpc_test.rs`](tests/remote_grpc_test.rs)):** 9 tests (7 end-to-end TCP/HTTP2 integration tests + 2 in-process gRPC service unit tests) covering request/response `call`, `cast`, `cast_timeout`, domain error round-tripping, location transparency (`AnyActorClient`), crash recovery over an active channel, wire protocol version checks, request authorization hooks, untrusted label sanitization, timeout clamping, trailing-byte rejection, and coordinated 2-phase graceful shutdown.
 
-The integration suite in [`tests/actor_supervision_test.rs`](tests/actor_supervision_test.rs) covers 72 deterministic tests:
+The integration suite in [`tests/actor_supervision_test.rs`](tests/actor_supervision_test.rs) covers 82 deterministic tests:
 
 | Topic | Tests |
 | --- | --- |
@@ -1262,6 +1341,8 @@ The integration suite in [`tests/actor_supervision_test.rs`](tests/actor_supervi
 | Strategies & recursive tree | `test_strategy_one_for_all`, `test_strategy_rest_for_one`, `test_top_level_supervisor_supports_rest_for_one_strategy`, `test_three_level_nested_supervisor_hierarchy_and_subtree_recovery`, `test_rest_for_one_overlapping_backoffs_and_failed_downstream_recovery`, `test_sibling_isolation_during_crash`, `test_root_supervisor_shutdown_aborts_entire_tree`, `test_one_for_all_and_restart_child_graceful_on_stop_without_overlap`, `test_duplicate_service_supervisor_does_not_boot_children` |
 | Restart types & graceful shutdown | `test_restart_type_permanent_restarts_on_normal_exit`, `test_restart_type_transient_stops_on_normal_exit_but_restarts_on_crash`, `test_restart_type_temporary_never_restarts_even_on_crash`, `test_stop_child_completes_in_flight_worker_gracefully`, `test_stop_child_prevents_overlapping_start_child_while_on_stop_running`, `test_shutdown_policy_timeout_aborts_hung_actor`, `test_root_supervisor_graceful_shutdown_cascade`, `test_sequential_graceful_shutdown_in_reverse_registration_order`, `test_stopped_and_deleted_children_do_not_resurrect_on_supervisor_restart`, `test_root_supervisor_drop_aborts_services_even_with_active_handles`, `test_request_shutdown_from_actor_handler_does_not_deadlock` |
 | Stateful actors (`StatefulActor`) | `test_stateful_actor_call_and_cast_with_crash_recovery`, `test_handle_cast_call_message_ask_and_send_after`, `test_try_cast_mailbox_full_and_cast_timeout`, `test_stateful_actor_lifecycle_hooks_on_start_and_on_stop`, `test_mixed_supervision_resource_actor_and_stateful_actor_one_for_all`, `test_stateful_actor_ctx_stop_drains_all_queued_messages`, `test_stateful_actor_graceful_shutdown_drains_messages_queued_after_shutdown_envelope`, `test_stateful_actor_handler_timeout_fails_fast_and_restarts_cleanly`, `test_stateful_actor_non_clone_message_rebind_and_call_retry_mid_handler`, `test_stateful_actor_on_start_failure_triggers_supervisor_recovery` |
+| Timers, streams & scoped tasks | `test_actor_context_send_interval_ticks_abort_and_lifecycle_cancel`, `test_actor_context_send_interval_with_non_clone_and_skips_missed_ticks_under_backpressure`, `test_actor_context_send_interval_cancels_on_panic_and_ignores_zero_or_max_duration`, `test_actor_context_forward_receiver_no_permit_starvation_backpressure_and_cleanup`, `test_actor_context_spawn_scoped_panic_isolation_and_no_cross_instance_leak` |
+| Runtime introspection | `test_restart_tracker_restarts_in_window_ages_out_without_new_crash`, `test_supervisor_snapshot_ordered_children_helpers_and_flapping`, `test_supervisor_snapshot_timeout_during_backoff_and_fast_fail_on_shutdown`, `test_supervisor_watch_child_status_allows_stopped_and_failed_and_observes_transitions`, `test_actor_client_queue_stats_backpressure_and_post_crash_pre_rebind_caveat` |
 | Crash-loop & backoff | `test_crash_loop_protection`, `test_root_supervisor_crash_loop_protection`, `test_backoff_overflow_prevention`, `test_backoff_decays_after_stability`, `test_supervisor_nonblocking_backoff`, `test_retry_storm_exponential_backoff`, `test_restart_tracker_enforces_max_restarts_when_backoff_exceeds_time_window_and_delete_service`, `test_one_for_all_max_restarts_preserves_stopped_and_removes_temporary_siblings` |
 | Recovery & manual intervention | `test_worker_panic_auto_recovery`, `test_max_consecutive_failures_escalates_without_panic`, `test_one_for_all_survives_and_heals_after_supervisor_crash`, `test_client_channel_rebind_during_slow_backoff`, `test_client_control_commands_rebind_after_crash`, `test_restart_child_recovers_failed_actor`, `test_restart_service_recovers_failed_supervisor`, `test_root_restart_service_honors_shutdown_policy_without_overlap`, `test_delete_and_start_child_during_backoff_ignores_stale_timer`, `test_escalate_on_failure_triggers_root_supervisor_restart`, `test_factory_panic_returns_factory_panicked_and_allows_recovery`, `test_factory_panic_during_auto_recovery_retries_and_escalates` |
 | Child specs | `test_child_spec_builder_pattern`, `test_dynamic_start_child`, `test_child_spec_with_custom_struct_worker`, `test_child_spec_with_closure_capturing_env`, `test_zero_channel_capacity_and_spec_poisoning_protection` |
@@ -1289,9 +1370,9 @@ The integration suite in [`tests/actor_supervision_test.rs`](tests/actor_supervi
 │   ├── actor
 │   │   ├── mod.rs                      # module docs + public re-exports
 │   │   ├── generic_actor.rs            # Worker trait, ResourceActorBuilder, ResourceActorConfig, ResourceActor, ResourceClient
-│   │   ├── stateful_actor.rs           # StatefulActor trait, CallMessage, ActorContext, StatefulActorBuilder, ActorClient
-│   │   ├── model.rs                    # SupervisionStrategy, RestartType, ShutdownPolicy, RestartPolicy, SupervisorError
-│   │   └── supervisor.rs               # Unified recursive Supervisor, SupervisorBuilder, SupervisorHandle, ChildSpec, SlotState
+│   │   ├── stateful_actor.rs           # StatefulActor trait, CallMessage, ActorContext, ActorScope, QueueStats, StatefulActorBuilder, ActorClient
+│   │   ├── model.rs                    # SupervisionStrategy, RestartType, ShutdownPolicy, RestartPolicy, RestartTracker, SupervisorError
+│   │   └── supervisor.rs               # Unified recursive Supervisor, SupervisorHandle, SupervisorSnapshot, ChildStatus, ChildStatusWatcher, ChildSpec, SlotState
 │   └── remote                          # optional (`--features remote`) distributed gRPC subsystem
 │       ├── mod.rs                      # module docs + public re-exports
 │       ├── client.rs                   # RemoteActorClient, AnyActorClient
@@ -1302,7 +1383,7 @@ The integration suite in [`tests/actor_supervision_test.rs`](tests/actor_supervi
 │       └── server.rs                   # ActorNodeService + ActorNodeHandle (2-phase shutdown)
 ├── examples
 │   ├── quickstart.rs                   # 35-line panic isolation & 0-ms watch<SlotState> rebind showcase
-│   ├── microservice_pipeline.rs        # ingestion worker + 0-hop auth cache + bounded try_cast backpressure
+│   ├── microservice_pipeline.rs        # ingestion worker (forward_receiver, send_interval_with) + auth cache + queue_stats + snapshot/watcher
 │   ├── rest_for_one_pipeline.rs        # 3-stage RestForOne panic recovery (automated & --interactive)
 │   ├── minimum.rs                      # output-free minimal example for both actor types
 │   ├── otp_actor.rs                    # full 8-phase demo walkthrough
@@ -1315,7 +1396,7 @@ The integration suite in [`tests/actor_supervision_test.rs`](tests/actor_supervi
 │       ├── server.rs                   # standalone gRPC server node
 │       └── client.rs                   # standalone gRPC client
 └── tests
-    ├── actor_supervision_test.rs       # 72 core integration tests
+    ├── actor_supervision_test.rs       # 82 core integration tests
     └── remote_grpc_test.rs             # 9 gRPC remote tests (`--features remote`)
 ```
 
@@ -1327,14 +1408,15 @@ use otp_actor::{
     DEFAULT_FAILURE_COOLDOWN, DEFAULT_WORKER_TIMEOUT, ResourceActor, ResourceActorBuilder,
     ResourceActorConfig, ResourceClient, ResourceError, TimedResource, Worker, WorkerContext,
     // stateful actors & clients (StatefulActor)
-    ActorClient, ActorContext, ActorControl, ActorError, CallMessage, StatefulActor,
-    StatefulActorBuilder, StatefulActorConfig,
+    ActorClient, ActorContext, ActorControl, ActorError, ActorScope, CallMessage, QueueStats,
+    StatefulActor, StatefulActorBuilder, StatefulActorConfig,
     // supervision model
-    DEFAULT_SHUTDOWN_TIMEOUT, EXPIRY_BUFFER, RestartPolicy, RestartTracker, RestartType,
-    ShutdownPolicy, SupervisionStrategy, SupervisorError, TaskResult,
-    // unified recursive supervisor
-    ChildSpec, ShutdownSignalFn, SlotState, SpawnContext, Supervisor, SupervisorBuilder,
-    SupervisorHandle, UntypedActorFactory, UntypedSender,
+    DEFAULT_SHUTDOWN_TIMEOUT, DEFAULT_SNAPSHOT_TIMEOUT, EXPIRY_BUFFER, RestartPolicy,
+    RestartTracker, RestartType, ShutdownPolicy, SupervisionStrategy, SupervisorError, TaskResult,
+    // unified recursive supervisor & runtime introspection
+    ChildSnapshot, ChildSpec, ChildStatus, ChildStatusWatcher, ShutdownSignalFn, SlotState,
+    SpawnContext, Supervisor, SupervisorBuilder, SupervisorHandle, SupervisorSnapshot,
+    UntypedActorFactory, UntypedSender,
 };
 
 // With `--features remote`:

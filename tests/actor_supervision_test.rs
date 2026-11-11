@@ -4,9 +4,10 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use otp_actor::actor::{
-    ActorContext, ActorError, CallMessage, ChildSpec, ResourceActor, ResourceError, RestartPolicy,
-    RestartTracker, RestartType, ShutdownPolicy, StatefulActor, StatefulActorBuilder,
-    SupervisionStrategy, Supervisor, SupervisorError, TimedResource, Worker, WorkerContext,
+    ActorContext, ActorError, ActorScope, CallMessage, ChildSpec, ChildStatus, QueueStats,
+    ResourceActor, ResourceError, RestartPolicy, RestartTracker, RestartType, ShutdownPolicy,
+    StatefulActor, StatefulActorBuilder, SupervisionStrategy, Supervisor, SupervisorError,
+    SupervisorSnapshot, TimedResource, Worker, WorkerContext,
 };
 
 #[tokio::test]
@@ -4132,6 +4133,985 @@ async fn test_factory_panic_during_auto_recovery_retries_and_escalates() {
         matches!(parent_err, SupervisorError::MaxRestartsExceeded(ref name, _, _) if name == "escalating-sub-sup"),
         "Parent supervisor should detect child supervisor escalation, got {parent_err:?}"
     );
+
+    root.shutdown().await.unwrap();
+}
+
+// ============================================================================
+// ActorContext::send_interval & ActorContext::send_interval_with Tests
+// ============================================================================
+
+#[derive(Clone, Default)]
+struct IntervalActor {
+    ticks: usize,
+    tick_notify: Option<Arc<tokio::sync::Notify>>,
+    active_handle: Option<tokio::task::AbortHandle>,
+}
+
+#[derive(Clone)]
+struct TimerDropProbe(Arc<AtomicUsize>);
+
+impl Drop for TimerDropProbe {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[derive(Clone)]
+enum IntervalMsg {
+    StartCloneInterval(Duration),
+    StartWithDropProbe {
+        period: Duration,
+        dropped: Arc<AtomicUsize>,
+    },
+    CancelInterval,
+    Tick,
+    GetState,
+    TriggerPanic,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct IntervalStatus {
+    instance_id: usize,
+    ticks: usize,
+}
+
+impl StatefulActor for IntervalActor {
+    type Message = IntervalMsg;
+    type Response = IntervalStatus;
+    type Error = String;
+
+    async fn handle(
+        &mut self,
+        msg: Self::Message,
+        ctx: &mut ActorContext<Self>,
+    ) -> Result<Self::Response, Self::Error> {
+        match msg {
+            IntervalMsg::StartCloneInterval(period) => {
+                if let Some(prev) = self.active_handle.take() {
+                    prev.abort();
+                }
+                self.active_handle = Some(ctx.send_interval(period, IntervalMsg::Tick));
+            }
+            IntervalMsg::StartWithDropProbe { period, dropped } => {
+                if let Some(prev) = self.active_handle.take() {
+                    prev.abort();
+                }
+                let probe = TimerDropProbe(dropped);
+                self.active_handle = Some(ctx.send_interval_with(period, move || {
+                    let _keep = &probe;
+                    IntervalMsg::Tick
+                }));
+            }
+            IntervalMsg::CancelInterval => {
+                if let Some(handle) = self.active_handle.take() {
+                    handle.abort();
+                }
+            }
+            IntervalMsg::Tick => {
+                self.ticks += 1;
+                if let Some(notify) = &self.tick_notify {
+                    notify.notify_waiters();
+                }
+            }
+            IntervalMsg::GetState => {}
+            IntervalMsg::TriggerPanic => panic!("intentional panic for timer cancellation test"),
+        }
+
+        Ok(IntervalStatus {
+            instance_id: ctx.instance_id(),
+            ticks: self.ticks,
+        })
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_actor_context_send_interval_ticks_abort_and_lifecycle_cancel() {
+    let root = Supervisor::new("root");
+    let tick_notify = Arc::new(tokio::sync::Notify::new());
+    let notify_for_actor = tick_notify.clone();
+
+    let client = StatefulActorBuilder::new("interval-actor", move |_| IntervalActor {
+        ticks: 0,
+        tick_notify: Some(notify_for_actor.clone()),
+        active_handle: None,
+    })
+    .spawn(&root)
+    .await
+    .unwrap();
+
+    // 1. Start a 5s interval; must NOT fire immediately at t = 0
+    client
+        .call(IntervalMsg::StartCloneInterval(Duration::from_secs(5)))
+        .await
+        .unwrap();
+    tokio::task::yield_now().await;
+    assert_eq!(client.call(IntervalMsg::GetState).await.unwrap().ticks, 0);
+
+    // 2. Advance across 3 full periods and verify deterministic ticks
+    for expected in 1..=3 {
+        let notified = tick_notify.notified();
+        tokio::time::advance(Duration::from_secs(5)).await;
+        notified.await;
+        assert_eq!(
+            client.call(IntervalMsg::GetState).await.unwrap().ticks,
+            expected
+        );
+    }
+
+    // 3. Aborting the returned AbortHandle stops further ticks permanently
+    client.call(IntervalMsg::CancelInterval).await.unwrap();
+    tokio::time::advance(Duration::from_secs(20)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(client.call(IntervalMsg::GetState).await.unwrap().ticks, 3);
+
+    // 4. Starting a 1-hour interval and shutting down immediately drops the timer task
+    let dropped = Arc::new(AtomicUsize::new(0));
+    client
+        .call(IntervalMsg::StartWithDropProbe {
+            period: Duration::from_secs(3600),
+            dropped: dropped.clone(),
+        })
+        .await
+        .unwrap();
+    tokio::task::yield_now().await;
+    assert_eq!(dropped.load(Ordering::SeqCst), 0);
+
+    root.shutdown().await.unwrap();
+    for _ in 0..5 {
+        if dropped.load(Ordering::SeqCst) == 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        dropped.load(Ordering::SeqCst),
+        1,
+        "Sleeping 1h interval task must exit immediately upon actor shutdown"
+    );
+}
+
+#[derive(Default)]
+struct NonCloneIntervalActor {
+    received_seqs: Vec<u64>,
+    tick_notify: Option<Arc<tokio::sync::Notify>>,
+}
+
+struct NonCloneToken(u64);
+
+enum NonCloneIntervalMsg {
+    Start(Duration),
+    Hold(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    ),
+    Tick(NonCloneToken),
+    GetSeqs,
+}
+
+impl StatefulActor for NonCloneIntervalActor {
+    type Message = NonCloneIntervalMsg;
+    type Response = Vec<u64>;
+    type Error = String;
+
+    async fn handle(
+        &mut self,
+        msg: Self::Message,
+        ctx: &mut ActorContext<Self>,
+    ) -> Result<Self::Response, Self::Error> {
+        match msg {
+            NonCloneIntervalMsg::Start(period) => {
+                let mut seq = 0u64;
+                ctx.send_interval_with(period, move || {
+                    seq += 1;
+                    NonCloneIntervalMsg::Tick(NonCloneToken(seq))
+                });
+            }
+            NonCloneIntervalMsg::Hold(entered_tx, release_rx) => {
+                let _ = entered_tx.send(());
+                let _ = release_rx.await;
+            }
+            NonCloneIntervalMsg::Tick(token) => {
+                self.received_seqs.push(token.0);
+                if let Some(notify) = &self.tick_notify {
+                    notify.notify_waiters();
+                }
+            }
+            NonCloneIntervalMsg::GetSeqs => {}
+        }
+        Ok(self.received_seqs.clone())
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_actor_context_send_interval_with_non_clone_and_skips_missed_ticks_under_backpressure()
+{
+    let root = Supervisor::new("root");
+    let tick_notify = Arc::new(tokio::sync::Notify::new());
+    let notify_for_actor = tick_notify.clone();
+
+    let client = StatefulActorBuilder::new("non-clone-interval", move |_| NonCloneIntervalActor {
+        received_seqs: Vec::new(),
+        tick_notify: Some(notify_for_actor.clone()),
+    })
+    .channel_capacity(1)
+    .spawn(&root)
+    .await
+    .unwrap();
+
+    client
+        .call(NonCloneIntervalMsg::Start(Duration::from_secs(5)))
+        .await
+        .unwrap();
+
+    // Verify normal non-Clone generation for tick #1 at t = 5s
+    let first = tick_notify.notified();
+    tokio::time::advance(Duration::from_secs(5)).await;
+    first.await;
+    assert_eq!(
+        client.call(NonCloneIntervalMsg::GetSeqs).await.unwrap(),
+        vec![1]
+    );
+
+    // Block actor handler while advancing across 3 full intervals (t = 10s, 15s, 20s)
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    client
+        .cast(NonCloneIntervalMsg::Hold(entered_tx, release_rx))
+        .await
+        .unwrap();
+    entered_rx.await.unwrap();
+
+    // Advance 16s so t=10s fills the 1-slot mailbox (seq 2) and t=15s/20s are skipped cleanly
+    let second = tick_notify.notified();
+    tokio::time::advance(Duration::from_secs(16)).await;
+    tokio::task::yield_now().await;
+
+    // Release handler and let the single queued tick drain; MissedTickBehavior::Skip prevents burst catch-up
+    let _ = release_tx.send(());
+    second.await;
+    assert_eq!(
+        client.call(NonCloneIntervalMsg::GetSeqs).await.unwrap(),
+        vec![1, 2],
+        "Backpressure + MissedTickBehavior::Skip must not burst missed ticks"
+    );
+
+    // Next tick arrives cleanly on the original 5s grid at t = 25s
+    let third = tick_notify.notified();
+    tokio::time::advance(Duration::from_secs(4)).await;
+    third.await;
+    assert_eq!(
+        client.call(NonCloneIntervalMsg::GetSeqs).await.unwrap(),
+        vec![1, 2, 3]
+    );
+
+    root.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_actor_context_send_interval_cancels_on_panic_and_ignores_zero_or_max_duration() {
+    let root = Supervisor::new("root");
+    let client = StatefulActorBuilder::from_default::<IntervalActor>("panic-interval-actor")
+        .restart_type(RestartType::Permanent)
+        .restart_policy(RestartPolicy::default().initial_backoff(Duration::from_millis(10)))
+        .spawn(&root)
+        .await
+        .unwrap();
+
+    // 1. Zero and MAX durations must not panic
+    client
+        .call(IntervalMsg::StartCloneInterval(Duration::ZERO))
+        .await
+        .unwrap();
+    client
+        .call(IntervalMsg::StartCloneInterval(Duration::MAX))
+        .await
+        .unwrap();
+
+    // 2. Active 1h interval on instance #1 is dropped immediately when instance #1 panics
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let st = client
+        .call(IntervalMsg::StartWithDropProbe {
+            period: Duration::from_secs(3600),
+            dropped: dropped.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(st.instance_id, 1);
+
+    let crash = client.call(IntervalMsg::TriggerPanic).await;
+    assert!(matches!(crash, Err(ActorError::ActorUnavailable)));
+
+    let recovered = client.call_retry(IntervalMsg::GetState).await.unwrap();
+    assert_eq!(recovered.instance_id, 2);
+
+    for _ in 0..50 {
+        if dropped.load(Ordering::SeqCst) == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(
+        dropped.load(Ordering::SeqCst),
+        1,
+        "Sleeping interval task from crashed instance #1 must be cancelled on panic unwind"
+    );
+
+    root.shutdown().await.unwrap();
+}
+
+// ============================================================================
+// ActorContext::forward_receiver & ActorContext::spawn_scoped (ActorScope)
+// ============================================================================
+
+#[derive(Clone, Default)]
+struct StreamActor {
+    items: Vec<u64>,
+    item_notify: Option<Arc<tokio::sync::Notify>>,
+}
+
+struct NonCloneItem(u64);
+
+enum StreamMsg {
+    AttachReceiver {
+        rx: tokio::sync::mpsc::Receiver<u64>,
+        dropped: Arc<AtomicUsize>,
+    },
+    SpawnScopedWorker {
+        rx: tokio::sync::mpsc::Receiver<u64>,
+        dropped: Arc<AtomicUsize>,
+        exited: Arc<AtomicBool>,
+        scope_out: tokio::sync::oneshot::Sender<ActorScope<StreamActor>>,
+    },
+    Hold(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    ),
+    Item(NonCloneItem),
+    GetState,
+    PanicNow,
+}
+
+impl StatefulActor for StreamActor {
+    type Message = StreamMsg;
+    type Response = (usize, Vec<u64>);
+    type Error = String;
+
+    async fn handle(
+        &mut self,
+        msg: Self::Message,
+        ctx: &mut ActorContext<Self>,
+    ) -> Result<Self::Response, Self::Error> {
+        match msg {
+            StreamMsg::AttachReceiver { rx, dropped } => {
+                let probe = TimerDropProbe(dropped);
+                ctx.forward_receiver(rx, move |n| {
+                    let _keep = &probe;
+                    StreamMsg::Item(NonCloneItem(n))
+                });
+            }
+            StreamMsg::SpawnScopedWorker {
+                mut rx,
+                dropped,
+                exited,
+                scope_out,
+            } => {
+                ctx.spawn_scoped(move |mut scope| async move {
+                    let _probe = TimerDropProbe(dropped);
+                    let _ = scope_out.send(scope.clone());
+
+                    loop {
+                        tokio::select! {
+                            biased;
+                            _ = scope.cancelled() => {
+                                exited.store(true, Ordering::SeqCst);
+                                break;
+                            }
+                            maybe_item = rx.recv() => match maybe_item {
+                                Some(v) => {
+                                    if scope.cast(StreamMsg::Item(NonCloneItem(v))).await.is_err() {
+                                        exited.store(true, Ordering::SeqCst);
+                                        break;
+                                    }
+                                }
+                                None => break,
+                            }
+                        }
+                    }
+                });
+            }
+            StreamMsg::Hold(entered_tx, release_rx) => {
+                let _ = entered_tx.send(());
+                let _ = release_rx.await;
+            }
+            StreamMsg::Item(item) => {
+                self.items.push(item.0);
+                if let Some(notify) = &self.item_notify {
+                    notify.notify_waiters();
+                }
+            }
+            StreamMsg::GetState => {}
+            StreamMsg::PanicNow => panic!("intentional stream actor panic"),
+        }
+        Ok((ctx.instance_id(), self.items.clone()))
+    }
+}
+
+#[tokio::test]
+async fn test_actor_context_forward_receiver_no_permit_starvation_backpressure_and_cleanup() {
+    let root = Supervisor::new("root");
+    let item_notify = Arc::new(tokio::sync::Notify::new());
+    let notify_for_actor = item_notify.clone();
+
+    let client = StatefulActorBuilder::new("stream-forwarder", move |_| StreamActor {
+        items: Vec::new(),
+        item_notify: Some(notify_for_actor.clone()),
+    })
+    .channel_capacity(1)
+    .spawn(&root)
+    .await
+    .unwrap();
+
+    // 1. Attach receiver with channel_capacity(1); idle forwarder must not hold a mailbox permit
+    let (ext_tx, ext_rx) = tokio::sync::mpsc::channel(4);
+    let dropped = Arc::new(AtomicUsize::new(0));
+    client
+        .call(StreamMsg::AttachReceiver {
+            rx: ext_rx,
+            dropped: dropped.clone(),
+        })
+        .await
+        .unwrap();
+
+    // Call succeeds immediately even while receiver is idle and capacity is 1
+    assert_eq!(client.call(StreamMsg::GetState).await.unwrap(), (1, vec![]));
+
+    // 2. Forward items cleanly and exit when external sender drops
+    let n1 = item_notify.notified();
+    ext_tx.send(10).await.unwrap();
+    n1.await;
+
+    let n2 = item_notify.notified();
+    ext_tx.send(20).await.unwrap();
+    n2.await;
+    drop(ext_tx);
+
+    for _ in 0..50 {
+        if dropped.load(Ordering::SeqCst) == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(
+        dropped.load(Ordering::SeqCst),
+        1,
+        "Forwarder must terminate cleanly when external sender drops"
+    );
+
+    // 3. Backpressure preservation under full mailbox + cleanup when actor stops with open sender
+    let (ext_tx2, ext_rx2) = tokio::sync::mpsc::channel(1);
+    let dropped2 = Arc::new(AtomicUsize::new(0));
+    client
+        .call(StreamMsg::AttachReceiver {
+            rx: ext_rx2,
+            dropped: dropped2.clone(),
+        })
+        .await
+        .unwrap();
+
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    client
+        .cast(StreamMsg::Hold(entered_tx, release_rx))
+        .await
+        .unwrap();
+    entered_rx.await.unwrap();
+
+    // Send items while actor is blocked inside Hold
+    ext_tx2.send(30).await.unwrap();
+    let n3 = item_notify.notified();
+    let _ = release_tx.send(());
+    n3.await;
+
+    assert_eq!(
+        client.call(StreamMsg::GetState).await.unwrap().1,
+        vec![10, 20, 30]
+    );
+
+    // Keep ext_tx2 intentionally alive and shut down supervisor; forwarder must cancel immediately
+    root.shutdown().await.unwrap();
+    for _ in 0..50 {
+        if dropped2.load(Ordering::SeqCst) == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(
+        dropped2.load(Ordering::SeqCst),
+        1,
+        "Idle forwarder must cancel cleanly on actor shutdown even if external sender remains open"
+    );
+    drop(ext_tx2);
+}
+
+#[tokio::test]
+async fn test_actor_context_spawn_scoped_panic_isolation_and_no_cross_instance_leak() {
+    let root = Supervisor::new("root");
+    let item_notify = Arc::new(tokio::sync::Notify::new());
+    let notify_for_actor = item_notify.clone();
+
+    let client = StatefulActorBuilder::new("scoped-actor", move |_| StreamActor {
+        items: Vec::new(),
+        item_notify: Some(notify_for_actor.clone()),
+    })
+    .channel_capacity(1)
+    .restart_type(RestartType::Permanent)
+    .restart_policy(RestartPolicy::default().initial_backoff(Duration::from_millis(10)))
+    .spawn(&root)
+    .await
+    .unwrap();
+
+    let (ext_tx, ext_rx) = tokio::sync::mpsc::channel(4);
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let exited = Arc::new(AtomicBool::new(false));
+    let (scope_tx, scope_rx) = tokio::sync::oneshot::channel();
+
+    client
+        .call(StreamMsg::SpawnScopedWorker {
+            rx: ext_rx,
+            dropped: dropped.clone(),
+            exited: exited.clone(),
+            scope_out: scope_tx,
+        })
+        .await
+        .unwrap();
+
+    let scope = scope_rx.await.unwrap();
+    assert_eq!(scope.name(), "scoped-actor");
+    assert_eq!(scope.instance_id(), 1);
+    assert!(!scope.is_cancelled());
+
+    // 1. Forward via ActorScope into instance #1
+    let n1 = item_notify.notified();
+    ext_tx.send(7).await.unwrap();
+    n1.await;
+    assert_eq!(client.call(StreamMsg::GetState).await.unwrap(), (1, vec![7]));
+
+    // 2. Check scope.try_cast MailboxFull under capacity = 1 backpressure
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    client
+        .cast(StreamMsg::Hold(entered_tx, release_rx))
+        .await
+        .unwrap();
+    entered_rx.await.unwrap();
+
+    assert!(scope.try_cast(StreamMsg::Item(NonCloneItem(8))).is_ok());
+    assert!(matches!(
+        scope.try_cast(StreamMsg::Item(NonCloneItem(9))),
+        Err(ActorError::MailboxFull)
+    ));
+    let _ = release_tx.send(());
+
+    // 3. Panic instance #1: scoped task exits immediately and old scope MUST NOT leak to instance #2
+    let crash = client.call(StreamMsg::PanicNow).await;
+    assert!(matches!(crash, Err(ActorError::ActorUnavailable)));
+
+    let (inst, items_after_restart) = client.call(StreamMsg::GetState).await.unwrap();
+    assert_eq!(inst, 2);
+    assert!(items_after_restart.is_empty());
+
+    for _ in 0..50 {
+        if dropped.load(Ordering::SeqCst) == 1 && exited.load(Ordering::SeqCst) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert!(exited.load(Ordering::SeqCst));
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    assert!(scope.is_cancelled());
+
+    // Old scope rejects new casts instead of silently rebinding to instance #2
+    assert!(matches!(
+        scope.cast(StreamMsg::Item(NonCloneItem(999))).await,
+        Err(ActorError::ActorUnavailable)
+    ));
+    assert!(matches!(
+        scope.try_cast(StreamMsg::Item(NonCloneItem(999))),
+        Err(ActorError::ActorUnavailable)
+    ));
+    assert_eq!(client.call(StreamMsg::GetState).await.unwrap(), (2, vec![]));
+
+    drop(ext_tx);
+    root.shutdown().await.unwrap();
+}
+
+// ============================================================================
+// Phase-1 Runtime Introspection MVP Tests
+// ============================================================================
+
+#[tokio::test(start_paused = true)]
+async fn test_restart_tracker_restarts_in_window_ages_out_without_new_crash() {
+    let policy = RestartPolicy::new(3, Duration::from_secs(10)).initial_backoff(Duration::ZERO);
+    let mut tracker = RestartTracker::new(policy);
+
+    assert_eq!(tracker.restarts_in_window(), 0);
+    assert!(tracker.record_crash().is_some());
+    assert!(tracker.record_crash().is_some());
+    assert_eq!(tracker.restarts_in_window(), 2);
+
+    tokio::time::advance(Duration::from_secs(6)).await;
+    assert_eq!(tracker.restarts_in_window(), 2);
+    assert!(tracker.record_crash().is_some());
+    assert_eq!(tracker.restarts_in_window(), 3);
+
+    // Budget exhausted
+    assert!(tracker.record_crash().is_none());
+    assert_eq!(tracker.restarts_in_window(), 3);
+
+    // Advance 5s without a new crash: first two (11s old) age out; third (5s old) stays inside 10s window
+    tokio::time::advance(Duration::from_secs(5)).await;
+    assert_eq!(tracker.restarts_in_window(), 1);
+
+    // Advance another 6s without a new crash: all three have aged out cleanly
+    tokio::time::advance(Duration::from_secs(6)).await;
+    assert_eq!(tracker.restarts_in_window(), 0);
+}
+
+#[tokio::test]
+async fn test_supervisor_snapshot_ordered_children_helpers_and_flapping() {
+    let root = Supervisor::builder("app-sup")
+        .strategy(SupervisionStrategy::RestForOne)
+        .spawn_root();
+
+    let alpha_policy = RestartPolicy::new(2, Duration::from_secs(10))
+        .initial_backoff(Duration::from_millis(5))
+        .max_backoff(Duration::from_millis(5));
+
+    let alpha = StatefulActorBuilder::from_default::<StreamActor>("alpha")
+        .restart_type(RestartType::Permanent)
+        .restart_policy(alpha_policy)
+        .spawn(&root)
+        .await
+        .unwrap();
+
+    let _beta = StatefulActorBuilder::from_default::<StreamActor>("beta")
+        .restart_type(RestartType::Transient)
+        .spawn(&root)
+        .await
+        .unwrap();
+
+    let _gamma = StatefulActorBuilder::from_default::<StreamActor>("gamma")
+        .restart_type(RestartType::Temporary)
+        .spawn(&root)
+        .await
+        .unwrap();
+
+    // 1. Healthy baseline snapshot preserves registration order and raw helpers
+    let snap: SupervisorSnapshot = root.snapshot().await.unwrap();
+    assert_eq!(snap.name, "app-sup");
+    assert_eq!(snap.instance_id, 1);
+    assert_eq!(snap.strategy, SupervisionStrategy::RestForOne);
+    assert!(snap.all_running());
+    assert!(!snap.any_failed());
+    assert!(!snap.any_restarting());
+    assert_eq!(snap.running_count(), 3);
+    assert_eq!(snap.stopped_count(), 0);
+    assert_eq!(snap.failed_count(), 0);
+
+    let names: Vec<&str> = snap.children.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, vec!["alpha", "beta", "gamma"]);
+    assert_eq!(
+        snap.child("alpha").unwrap().status,
+        ChildStatus::Running { instance_id: 1 }
+    );
+    assert_eq!(
+        snap.child("alpha").unwrap().restart_type,
+        RestartType::Permanent
+    );
+    assert_eq!(snap.child("alpha").unwrap().restarts_in_window, 0);
+    assert_eq!(
+        snap.child("gamma").unwrap().restart_type,
+        RestartType::Temporary
+    );
+
+    // 2. Stop beta explicitly -> appears as Stopped without disappearing from snapshot
+    root.stop_child("beta").await.unwrap();
+    let snap_stopped = root.snapshot().await.unwrap();
+    assert!(!snap_stopped.all_running());
+    assert!(!snap_stopped.any_failed());
+    assert_eq!(snap_stopped.running_count(), 2);
+    assert_eq!(snap_stopped.stopped_count(), 1);
+    assert_eq!(
+        snap_stopped.child("beta").unwrap().status,
+        ChildStatus::Stopped
+    );
+
+    // 3. Crash alpha once: under RestForOne, Stopped beta stays Stopped, Temporary gamma is removed
+    let mut alpha_watch = root.watch_child_status("alpha").await.unwrap();
+    let _ = alpha.call(StreamMsg::PanicNow).await;
+    alpha_watch
+        .wait_for(|s| matches!(s, ChildStatus::Running { instance_id: 2 }))
+        .await
+        .unwrap();
+
+    let snap_after_first_crash = root.snapshot().await.unwrap();
+    assert!(snap_after_first_crash.child("gamma").is_none());
+    assert_eq!(
+        snap_after_first_crash.child("beta").unwrap().status,
+        ChildStatus::Stopped
+    );
+    let alpha_snap = snap_after_first_crash.child("alpha").unwrap();
+    assert_eq!(alpha_snap.instance_id, 2);
+    assert_eq!(alpha_snap.restarts_in_window, 1);
+
+    // 4. Exhaust alpha's restart budget (2 restarts within window) -> Failed + flapping metric visible
+    let _ = alpha.call(StreamMsg::PanicNow).await;
+    alpha_watch
+        .wait_for(|s| matches!(s, ChildStatus::Running { instance_id: 3 }))
+        .await
+        .unwrap();
+    let _ = alpha.call(StreamMsg::PanicNow).await;
+    alpha_watch.wait_for(|s| s.is_failed()).await.unwrap();
+
+    let snap_failed = root.snapshot().await.unwrap();
+    assert!(!snap_failed.all_running());
+    assert!(snap_failed.any_failed());
+    assert_eq!(snap_failed.failed_count(), 1);
+    assert_eq!(snap_failed.stopped_count(), 1);
+    let alpha_failed = snap_failed.child("alpha").unwrap();
+    assert!(matches!(
+        alpha_failed.status,
+        ChildStatus::Failed(SupervisorError::MaxRestartsExceeded(ref name, 2, _)) if name == "alpha"
+    ));
+    assert_eq!(alpha_failed.instance_id, 3);
+    assert_eq!(alpha_failed.restarts_in_window, 2);
+
+    root.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_supervisor_snapshot_timeout_during_backoff_and_fast_fail_on_shutdown() {
+    let root = Supervisor::new("timeout-root");
+
+    // 1. Sub-supervisor stuck in a 5s restart backoff: snapshot_timeout must fail with Timeout(deadline)
+    let child_sup = Supervisor::builder("slow-backoff-sup")
+        .restart_type(RestartType::Permanent)
+        .restart_policy(
+            RestartPolicy::new(5, Duration::from_secs(60)).initial_backoff(Duration::from_secs(5)),
+        )
+        .spawn(&root)
+        .await
+        .unwrap();
+
+    let mut watcher = root.watch_child_status("slow-backoff-sup").await.unwrap();
+    child_sup.simulate_crash().await.unwrap();
+    watcher.wait_for(|s| s.is_restarting()).await.unwrap();
+
+    let deadline = Duration::from_millis(30);
+    let backoff_start = Instant::now();
+    let backoff_res = child_sup.snapshot_timeout(deadline).await;
+    assert!(
+        matches!(backoff_res, Err(SupervisorError::Timeout(d)) if d == deadline),
+        "Expected Snapshot timeout during supervisor backoff, got {backoff_res:?}"
+    );
+    assert!(
+        backoff_start.elapsed() < Duration::from_millis(250),
+        "snapshot_timeout stalled too long during backoff: {:?}",
+        backoff_start.elapsed()
+    );
+
+    // 2. Root supervisor blocked inside a slow child's ShutdownPolicy: fails immediately (never hangs 5s)
+    let holder = StatefulActorBuilder::from_default::<StreamActor>("holder")
+        .shutdown_timeout(Duration::from_secs(5))
+        .spawn(&root)
+        .await
+        .unwrap();
+
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    holder
+        .cast(StreamMsg::Hold(entered_tx, release_rx))
+        .await
+        .unwrap();
+    entered_rx.await.unwrap();
+
+    let root_for_shutdown = root.clone();
+    let shutdown_task = tokio::spawn(async move { root_for_shutdown.shutdown().await });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let shutdown_start = Instant::now();
+    let shutdown_res = root.snapshot_timeout(deadline).await;
+    assert!(
+        matches!(
+            shutdown_res,
+            Err(SupervisorError::Timeout(_) | SupervisorError::SupervisorUnavailable)
+        ),
+        "Expected fast Timeout or SupervisorUnavailable during blocked shutdown, got {shutdown_res:?}"
+    );
+    assert!(
+        shutdown_start.elapsed() < Duration::from_millis(250),
+        "snapshot_timeout stalled too long during shutdown: {:?}",
+        shutdown_start.elapsed()
+    );
+
+    let _ = release_tx.send(());
+    shutdown_task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn test_supervisor_watch_child_status_allows_stopped_and_failed_and_observes_transitions() {
+    let root = Supervisor::new("watch-sup");
+
+    let flaky_policy = RestartPolicy::new(1, Duration::from_secs(10))
+        .initial_backoff(Duration::from_millis(40))
+        .max_backoff(Duration::from_millis(40));
+
+    let flaky = StatefulActorBuilder::from_default::<StreamActor>("flaky-worker")
+        .restart_type(RestartType::Permanent)
+        .restart_policy(flaky_policy)
+        .spawn(&root)
+        .await
+        .unwrap();
+
+    let _transient = StatefulActorBuilder::from_default::<StreamActor>("transient-worker")
+        .restart_type(RestartType::Transient)
+        .spawn(&root)
+        .await
+        .unwrap();
+
+    let mut watcher = root.watch_child_status("flaky-worker").await.unwrap();
+    assert_eq!(watcher.child_name(), "flaky-worker");
+    assert_eq!(watcher.current(), ChildStatus::Running { instance_id: 1 });
+    assert_eq!(watcher.current().instance_id(), Some(1));
+
+    // 1. Observe Restarting (in backoff) -> Running instance 2
+    let _ = flaky.call(StreamMsg::PanicNow).await;
+    watcher.changed().await.unwrap();
+    assert_eq!(
+        watcher.current(),
+        ChildStatus::Restarting { instance_id: 1 }
+    );
+    assert!(watcher.current().is_restarting());
+
+    let running_2 = watcher
+        .wait_for(|s| matches!(s, ChildStatus::Running { instance_id: 2 }))
+        .await
+        .unwrap();
+    assert_eq!(running_2, ChildStatus::Running { instance_id: 2 });
+
+    // 2. Exhaust restart budget -> observe Failed
+    let _ = flaky.call(StreamMsg::PanicNow).await;
+    let failed_state = watcher.wait_for(|s| s.is_failed()).await.unwrap();
+    assert!(matches!(
+        failed_state,
+        ChildStatus::Failed(SupervisorError::MaxRestartsExceeded(ref name, 1, _)) if name == "flaky-worker"
+    ));
+    assert_eq!(failed_state.instance_id(), None);
+
+    // 3. New watch_child_status call succeeds on already-Failed and already-Stopped children
+    let late_failed_watcher = root.watch_child_status("flaky-worker").await.unwrap();
+    assert!(late_failed_watcher.current().is_failed());
+
+    root.stop_child("transient-worker").await.unwrap();
+    let mut stopped_watcher = root.watch_child_status("transient-worker").await.unwrap();
+    assert_eq!(stopped_watcher.current(), ChildStatus::Stopped);
+    assert!(stopped_watcher.current().is_stopped());
+
+    // 4. Manual restart_child revives the same watcher without re-subscribing
+    root.restart_child("flaky-worker").await.unwrap();
+    let recovered = watcher.wait_for(|s| s.is_running()).await.unwrap();
+    assert!(matches!(recovered, ChildStatus::Running { instance_id } if instance_id >= 3));
+
+    // 5. delete_child removes slot -> new watch fails with ChildNotFound; existing watcher closes cleanly
+    root.delete_child("transient-worker").await.unwrap();
+    let missing = root.watch_child_status("transient-worker").await;
+    assert!(
+        matches!(missing, Err(SupervisorError::ChildNotFound(ref n)) if n == "transient-worker")
+    );
+
+    loop {
+        match stopped_watcher.changed().await {
+            Ok(()) => assert_eq!(stopped_watcher.current(), ChildStatus::Stopped),
+            Err(SupervisorError::SupervisorUnavailable) => break,
+            Err(other) => panic!("Unexpected watcher error: {other:?}"),
+        }
+    }
+
+    root.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_actor_client_queue_stats_backpressure_and_post_crash_pre_rebind_caveat() {
+    let root = Supervisor::new("queue-stats-sup");
+
+    let client = StatefulActorBuilder::from_default::<StreamActor>("bounded-worker")
+        .channel_capacity(2)
+        .restart_type(RestartType::Permanent)
+        .restart_policy(RestartPolicy::default().initial_backoff(Duration::from_millis(10)))
+        .spawn(&root)
+        .await
+        .unwrap();
+
+    // 1. Empty mailbox baseline
+    let s0: QueueStats = client.queue_stats();
+    assert_eq!(s0.max_capacity, 2);
+    assert_eq!(s0.available, 2);
+    assert_eq!(s0.queued, 0);
+    assert!(!s0.is_closed);
+    assert!(!s0.is_full());
+
+    // 2. Fill mailbox while actor is parked in Hold
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    client
+        .cast(StreamMsg::Hold(entered_tx, release_rx))
+        .await
+        .unwrap();
+    entered_rx.await.unwrap();
+
+    client.try_cast(StreamMsg::Item(NonCloneItem(1))).unwrap();
+    let s1 = client.queue_stats();
+    assert_eq!(s1.max_capacity, 2);
+    assert_eq!(s1.available, 1);
+    assert_eq!(s1.queued, 1);
+    assert!(!s1.is_full());
+
+    client.try_cast(StreamMsg::Item(NonCloneItem(2))).unwrap();
+    let s2 = client.queue_stats();
+    assert_eq!(s2.max_capacity, 2);
+    assert_eq!(s2.available, 0);
+    assert_eq!(s2.queued, 2);
+    assert!(s2.is_full());
+
+    let _ = release_tx.send(());
+    assert_eq!(
+        client.call(StreamMsg::GetState).await.unwrap().1,
+        vec![1, 2]
+    );
+    let s_drained = client.queue_stats();
+    assert_eq!(s_drained.queued, 0);
+    assert_eq!(s_drained.available, 2);
+
+    // 3. After crash + restart, BEFORE the client's next call/cast, queue_stats still inspects
+    // the cached dead mailbox of instance #1 (is_closed == true)
+    let mut watcher = root.watch_child_status("bounded-worker").await.unwrap();
+    let _ = client.call(StreamMsg::PanicNow).await;
+    watcher
+        .wait_for(|s| matches!(s, ChildStatus::Running { instance_id: 2 }))
+        .await
+        .unwrap();
+
+    let pre_rebind = client.queue_stats();
+    assert!(pre_rebind.is_closed);
+
+    // 4. After the next call triggers transparent rebind, queue_stats reports the live instance #2 mailbox
+    assert_eq!(client.call(StreamMsg::GetState).await.unwrap(), (2, vec![]));
+    let post_rebind = client.queue_stats();
+    assert!(!post_rebind.is_closed);
+    assert_eq!(post_rebind.max_capacity, 2);
+    assert_eq!(post_rebind.available, 2);
+    assert_eq!(post_rebind.queued, 0);
 
     root.shutdown().await.unwrap();
 }

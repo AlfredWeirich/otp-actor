@@ -12,7 +12,7 @@
 //!   or its supervisor crashes and restarts.
 //! - **Request/Response, Typed Sub-Messages & Fire-and-Forget**: Supports [`ActorClient::call`], [`ActorClient::ask`]
 //!   (via [`CallMessage`]), [`ActorClient::cast`], [`ActorClient::try_cast`], and [`ActorClient::cast_timeout`].
-//! - **Rich Execution Context**: [`ActorContext<A>`] provides `client()`, `supervisor()`, and `send_after()` timers.
+//! - **Rich Execution Context**: [`ActorContext<A>`] provides `client()`, `supervisor()`, `send_after()`, `send_interval()`, `spawn_scoped()`, and `forward_receiver()`.
 
 use std::future::Future;
 use std::marker::PhantomData;
@@ -23,6 +23,7 @@ use tokio::sync::{
     mpsc::{self, Receiver, Sender, WeakSender},
     oneshot, watch,
 };
+use tokio::time::{Instant, MissedTickBehavior, interval_at};
 
 use super::model::{RestartPolicy, RestartType, ShutdownPolicy, SupervisorError, TaskResult};
 use super::supervisor::{
@@ -40,12 +41,111 @@ pub enum ActorControl {
     Fail(String),
 }
 
+/// Execution and messaging scope passed to instance-bound background tasks spawned via
+/// [`ActorContext::spawn_scoped`].
+///
+/// Unlike [`ActorClient`], an [`ActorScope`] is pinned to the single actor instance
+/// (`instance_id`) that created it: once that instance stops, crashes, or panics,
+/// [`Self::cancelled`] completes immediately and [`Self::cast`] / [`Self::try_cast`] return
+/// [`ActorError::ActorUnavailable`] instead of rebinding onto a restarted replacement instance.
+pub struct ActorScope<A: StatefulActor> {
+    name: String,
+    instance_id: usize,
+    weak_sender: WeakSender<ActorEnvelope<A>>,
+    cancel_rx: watch::Receiver<bool>,
+}
+
+impl<A: StatefulActor> Clone for ActorScope<A> {
+    fn clone(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            instance_id: self.instance_id,
+            weak_sender: self.weak_sender.clone(),
+            cancel_rx: self.cancel_rx.clone(),
+        }
+    }
+}
+
+impl<A: StatefulActor> std::fmt::Debug for ActorScope<A> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActorScope")
+            .field("name", &self.name)
+            .field("instance_id", &self.instance_id)
+            .field("cancelled", &*self.cancel_rx.borrow())
+            .finish()
+    }
+}
+
+impl<A: StatefulActor> ActorScope<A> {
+    /// Returns the registered name of the owning actor.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns the instance ID (`1`, `2`, ...) to which this scope is pinned.
+    pub fn instance_id(&self) -> usize {
+        self.instance_id
+    }
+
+    /// Returns `true` if this actor instance has exited, panicked, or begun stopping its lifecycle tasks.
+    pub fn is_cancelled(&self) -> bool {
+        *self.cancel_rx.borrow()
+    }
+
+    /// Completes as soon as the owning actor instance exits, crashes, panics, or enters final stop hooks.
+    ///
+    /// This method is cancel-safe and designed for direct use in `tokio::select!`.
+    pub async fn cancelled(&mut self) {
+        let _ = self.cancel_rx.wait_for(|&cancelled| cancelled).await;
+    }
+
+    /// Sends `msg` via `cast` to the owning actor instance, respecting bounded mailbox backpressure.
+    ///
+    /// Aborts immediately with [`ActorError::ActorUnavailable`] if the actor instance exits or is
+    /// cancelled before the message can be enqueued. Never rebinds onto a restarted replacement instance.
+    pub async fn cast(&self, msg: A::Message) -> Result<(), ActorError<A::Error>> {
+        if self.is_cancelled() {
+            return Err(ActorError::ActorUnavailable);
+        }
+        let Some(tx) = self.weak_sender.upgrade() else {
+            return Err(ActorError::ActorUnavailable);
+        };
+        let mut cancel_rx = self.cancel_rx.clone();
+        tokio::select! {
+            biased;
+            _ = cancel_rx.wait_for(|&cancelled| cancelled) => Err(ActorError::ActorUnavailable),
+            res = tx.send(ActorEnvelope::Cast { msg }) => {
+                res.map_err(|_| ActorError::ActorUnavailable)
+            }
+        }
+    }
+
+    /// Attempts to enqueue `msg` via `cast` into the owning actor instance without waiting.
+    ///
+    /// Returns [`ActorError::MailboxFull`] if the mailbox is at capacity, or
+    /// [`ActorError::ActorUnavailable`] if the instance has been cancelled or closed.
+    pub fn try_cast(&self, msg: A::Message) -> Result<(), ActorError<A::Error>> {
+        if self.is_cancelled() {
+            return Err(ActorError::ActorUnavailable);
+        }
+        let Some(tx) = self.weak_sender.upgrade() else {
+            return Err(ActorError::ActorUnavailable);
+        };
+        match tx.try_send(ActorEnvelope::Cast { msg }) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => Err(ActorError::MailboxFull),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(ActorError::ActorUnavailable),
+        }
+    }
+}
+
 /// Execution and lifecycle context provided to [`StatefulActor`] callbacks.
 pub struct ActorContext<A: StatefulActor> {
     name: String,
     instance_id: usize,
     control: ActorControl,
     weak_sender: WeakSender<ActorEnvelope<A>>,
+    cancel_rx: watch::Receiver<bool>,
     supervisor: SupervisorHandle,
 }
 
@@ -56,6 +156,7 @@ impl<A: StatefulActor> Clone for ActorContext<A> {
             instance_id: self.instance_id,
             control: self.control.clone(),
             weak_sender: self.weak_sender.clone(),
+            cancel_rx: self.cancel_rx.clone(),
             supervisor: self.supervisor.clone(),
         }
     }
@@ -72,11 +173,12 @@ impl<A: StatefulActor> std::fmt::Debug for ActorContext<A> {
 }
 
 impl<A: StatefulActor> ActorContext<A> {
-    /// Creates a new actor context for the given actor name, instance ID, weak self-sender, and parent supervisor handle.
+    /// Creates a new actor context for the given actor name, instance ID, weak self-sender, lifecycle signal, and parent supervisor handle.
     pub(crate) fn new(
         name: impl Into<String>,
         instance_id: usize,
         weak_sender: WeakSender<ActorEnvelope<A>>,
+        cancel_rx: watch::Receiver<bool>,
         supervisor: SupervisorHandle,
     ) -> Self {
         Self {
@@ -84,6 +186,7 @@ impl<A: StatefulActor> ActorContext<A> {
             instance_id,
             control: ActorControl::Continue,
             weak_sender,
+            cancel_rx,
             supervisor,
         }
     }
@@ -123,13 +226,173 @@ impl<A: StatefulActor> ActorContext<A> {
 
     /// Schedules `msg` to be delivered to this actor via `cast` after `delay`.
     ///
-    /// Returns a [`tokio::task::AbortHandle`] that can be used to cancel the scheduled timer.
+    /// The timer task aborts automatically if this actor instance stops or panics before `delay` elapses.
+    /// Returns a [`tokio::task::AbortHandle`] that can be used to cancel the scheduled timer early.
     pub fn send_after(&self, delay: Duration, msg: A::Message) -> tokio::task::AbortHandle {
         let weak_tx = self.weak_sender.clone();
+        let mut cancel_rx = self.cancel_rx.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(delay).await;
+            tokio::select! {
+                biased;
+                _ = cancel_rx.wait_for(|&cancelled| cancelled) => return,
+                _ = tokio::time::sleep(delay) => {}
+            }
             if let Some(tx) = weak_tx.upgrade() {
-                let _ = tx.send(ActorEnvelope::Cast { msg }).await;
+                tokio::select! {
+                    biased;
+                    _ = cancel_rx.wait_for(|&cancelled| cancelled) => {}
+                    _ = tx.send(ActorEnvelope::Cast { msg }) => {}
+                }
+            }
+        })
+        .abort_handle()
+    }
+
+    /// Periodically delivers clones of `msg` to this actor via `cast` every `period`.
+    ///
+    /// The first message is scheduled after one full `period` (not immediately at call time).
+    /// Missed ticks caused by slow handlers or full mailboxes are skipped rather than burst-queued
+    /// (`MissedTickBehavior::Skip`), and the background task terminates immediately when this actor
+    /// instance stops, crashes, or panics.
+    ///
+    /// If `period` is [`Duration::ZERO`], logs a warning and returns an already-completed
+    /// [`tokio::task::AbortHandle`] instead of panicking.
+    ///
+    /// For non-`Clone` messages or dynamically generated payloads, use [`Self::send_interval_with`].
+    pub fn send_interval(&self, period: Duration, msg: A::Message) -> tokio::task::AbortHandle
+    where
+        A::Message: Clone,
+    {
+        self.send_interval_with(period, move || msg.clone())
+    }
+
+    /// Periodically generates and delivers messages via `cast` every `period` using `make_msg`.
+    ///
+    /// Unlike [`Self::send_interval`], this works with non-`Clone` message types and lets each tick
+    /// compute fresh payloads. `make_msg` is invoked only after a bounded mailbox permit is reserved,
+    /// avoiding wasted allocations if the actor stops while backpressured.
+    ///
+    /// The first tick fires after `period`, missed ticks under backpressure are skipped
+    /// (`MissedTickBehavior::Skip`), and the timer task stops immediately when the current actor
+    /// instance exits or panics. If `period` is [`Duration::ZERO`], logs a warning and returns an
+    /// already-completed [`tokio::task::AbortHandle`].
+    pub fn send_interval_with<F>(
+        &self,
+        period: Duration,
+        mut make_msg: F,
+    ) -> tokio::task::AbortHandle
+    where
+        F: FnMut() -> A::Message + Send + 'static,
+    {
+        if period.is_zero() {
+            tracing::warn!(
+                actor = %self.name,
+                instance = self.instance_id,
+                "Ignoring send_interval_with called with zero duration."
+            );
+            return tokio::spawn(async {}).abort_handle();
+        }
+
+        let weak_tx = self.weak_sender.clone();
+        let mut cancel_rx = self.cancel_rx.clone();
+        tokio::spawn(async move {
+            let Some(start) = Instant::now().checked_add(period) else {
+                let _ = cancel_rx.wait_for(|&cancelled| cancelled).await;
+                return;
+            };
+
+            let mut ticker = interval_at(start, period);
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel_rx.wait_for(|&cancelled| cancelled) => break,
+                    _ = ticker.tick() => {}
+                }
+
+                let Some(tx) = weak_tx.upgrade() else {
+                    break;
+                };
+
+                let permit = tokio::select! {
+                    biased;
+                    _ = cancel_rx.wait_for(|&cancelled| cancelled) => break,
+                    res = tx.reserve() => match res {
+                        Ok(permit) => permit,
+                        Err(_) => break,
+                    }
+                };
+
+                permit.send(ActorEnvelope::Cast { msg: make_msg() });
+            }
+        })
+        .abort_handle()
+    }
+
+    /// Spawns a background task bound to this actor instance's lifecycle.
+    ///
+    /// The spawned future receives an [`ActorScope<A>`] pinned to the current `instance_id` for
+    /// observing cancellation (`scope.cancelled()`) and sending messages via `scope.cast(...)` /
+    /// `scope.try_cast(...)`. When this actor instance stops (right before `on_stop` after mailbox
+    /// draining), fails, or panics, the scope cancels immediately so external stream/socket loops
+    /// shut down cleanly without leaking tasks or forwarding stale events to a restarted instance.
+    pub fn spawn_scoped<F, Fut>(&self, task: F) -> tokio::task::AbortHandle
+    where
+        F: FnOnce(ActorScope<A>) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let scope = ActorScope {
+            name: self.name.clone(),
+            instance_id: self.instance_id,
+            weak_sender: self.weak_sender.clone(),
+            cancel_rx: self.cancel_rx.clone(),
+        };
+        tokio::spawn(task(scope)).abort_handle()
+    }
+
+    /// Forwards items from an [`mpsc::Receiver<T>`] into this actor as `cast` messages via `map_msg`.
+    ///
+    /// Items are pulled one at a time while waiting for mailbox space (`tx.reserve()`), so idle
+    /// forwarders never hold mailbox permits or starve `call`/`cast` callers even with
+    /// `channel_capacity(1)`. The task exits automatically when `rx` closes or when the current
+    /// actor instance stops, crashes, or panics.
+    pub fn forward_receiver<T, F>(
+        &self,
+        mut rx: mpsc::Receiver<T>,
+        mut map_msg: F,
+    ) -> tokio::task::AbortHandle
+    where
+        T: Send + 'static,
+        F: FnMut(T) -> A::Message + Send + 'static,
+    {
+        let weak_tx = self.weak_sender.clone();
+        let mut cancel_rx = self.cancel_rx.clone();
+        tokio::spawn(async move {
+            loop {
+                let item = tokio::select! {
+                    biased;
+                    _ = cancel_rx.wait_for(|&cancelled| cancelled) => break,
+                    maybe_item = rx.recv() => match maybe_item {
+                        Some(item) => item,
+                        None => break,
+                    }
+                };
+
+                let Some(tx) = weak_tx.upgrade() else {
+                    break;
+                };
+
+                let permit = tokio::select! {
+                    biased;
+                    _ = cancel_rx.wait_for(|&cancelled| cancelled) => break,
+                    res = tx.reserve() => match res {
+                        Ok(permit) => permit,
+                        Err(_) => break,
+                    }
+                };
+
+                permit.send(ActorEnvelope::Cast { msg: map_msg(item) });
             }
         })
         .abort_handle()
@@ -462,6 +725,21 @@ pub(crate) struct StatefulActorRunner<A: StatefulActor> {
     instance_id: usize,
 }
 
+/// Drop guard broadcasting `true` on the instance lifecycle channel whenever the actor task returns or unwinds.
+struct InstanceCancelGuard(watch::Sender<bool>);
+
+impl InstanceCancelGuard {
+    fn cancel(&self) {
+        let _ = self.0.send(true);
+    }
+}
+
+impl Drop for InstanceCancelGuard {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
 impl<A: StatefulActor> StatefulActorRunner<A> {
     pub(crate) fn new(
         config: StatefulActorConfig,
@@ -538,7 +816,11 @@ impl<A: StatefulActor> StatefulActorRunner<A> {
     }
 
     /// Drains remaining queued messages in the mailbox and runs `on_stop` before exiting cleanly.
-    async fn finish_graceful_shutdown(&mut self, ctx: &mut ActorContext<A>) -> TaskResult {
+    async fn finish_graceful_shutdown(
+        &mut self,
+        ctx: &mut ActorContext<A>,
+        cancel_guard: &InstanceCancelGuard,
+    ) -> TaskResult {
         tracing::info!(
             actor = %self.config.name,
             instance = self.instance_id,
@@ -576,6 +858,7 @@ impl<A: StatefulActor> StatefulActorRunner<A> {
             }
         }
 
+        cancel_guard.cancel();
         self.actor.on_stop(ctx).await;
 
         tracing::info!(
@@ -588,10 +871,14 @@ impl<A: StatefulActor> StatefulActorRunner<A> {
 
     /// Runs the actor lifecycle (`on_start` -> message loop -> `on_stop`).
     pub(crate) async fn run(mut self) -> TaskResult {
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let cancel_guard = InstanceCancelGuard(cancel_tx);
+
         let mut ctx = ActorContext::new(
             self.config.name.clone(),
             self.instance_id,
             self.weak_sender.clone(),
+            cancel_rx,
             self.supervisor.clone(),
         );
 
@@ -616,6 +903,8 @@ impl<A: StatefulActor> StatefulActorRunner<A> {
         match &ctx.control {
             ActorControl::Continue => {}
             ActorControl::Stop => {
+                self.receiver.close();
+                cancel_guard.cancel();
                 self.actor.on_stop(&mut ctx).await;
                 return Ok(());
             }
@@ -633,7 +922,7 @@ impl<A: StatefulActor> StatefulActorRunner<A> {
 
         loop {
             if *self.shutdown_rx.borrow() {
-                return self.finish_graceful_shutdown(&mut ctx).await;
+                return self.finish_graceful_shutdown(&mut ctx, &cancel_guard).await;
             }
 
             tokio::select! {
@@ -641,12 +930,13 @@ impl<A: StatefulActor> StatefulActorRunner<A> {
 
                 Ok(()) = self.shutdown_rx.changed() => {
                     if *self.shutdown_rx.borrow() {
-                        return self.finish_graceful_shutdown(&mut ctx).await;
+                        return self.finish_graceful_shutdown(&mut ctx, &cancel_guard).await;
                     }
                 }
 
                 env_opt = self.receiver.recv() => {
                     let Some(envelope) = env_opt else {
+                        cancel_guard.cancel();
                         self.actor.on_stop(&mut ctx).await;
                         return Ok(());
                     };
@@ -665,7 +955,7 @@ impl<A: StatefulActor> StatefulActorRunner<A> {
                             match &ctx.control {
                                 ActorControl::Continue => {}
                                 ActorControl::Stop => {
-                                    return self.finish_graceful_shutdown(&mut ctx).await;
+                                    return self.finish_graceful_shutdown(&mut ctx, &cancel_guard).await;
                                 }
                                 ActorControl::Fail(reason) => {
                                     let reason_owned = reason.clone();
@@ -696,7 +986,7 @@ impl<A: StatefulActor> StatefulActorRunner<A> {
                             match &ctx.control {
                                 ActorControl::Continue => {}
                                 ActorControl::Stop => {
-                                    return self.finish_graceful_shutdown(&mut ctx).await;
+                                    return self.finish_graceful_shutdown(&mut ctx, &cancel_guard).await;
                                 }
                                 ActorControl::Fail(reason) => {
                                     let reason_owned = reason.clone();
@@ -712,7 +1002,7 @@ impl<A: StatefulActor> StatefulActorRunner<A> {
                         }
 
                         ActorEnvelope::Shutdown => {
-                            return self.finish_graceful_shutdown(&mut ctx).await;
+                            return self.finish_graceful_shutdown(&mut ctx, &cancel_guard).await;
                         }
 
                         #[cfg(any(test, feature = "chaos_test"))]
@@ -737,6 +1027,36 @@ impl<A: StatefulActor> StatefulActorRunner<A> {
 // ============================================================================
 // Direct Data-Plane Client for StatefulActor
 // ============================================================================
+
+/// Approximate point-in-time queue statistics for an [`ActorClient`]'s bounded mailbox channel.
+///
+/// Returned synchronously by [`ActorClient::queue_stats`] based on the currently cached channel
+/// sender (`current_sender()`). Because values are read lock-free without contacting the supervisor
+/// or triggering channel rebinding:
+///
+/// - `queued` and `available` are approximate point-in-time snapshots under concurrent sends/receives.
+/// - Immediately after an actor crash or restart (and *before* the next `call` / `cast` rebinds the
+///   client), `queue_stats()` still inspects the previous instance's dead mailbox, reporting
+///   `is_closed == true`.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueueStats {
+    /// Total bounded capacity configured for this mailbox (`StatefulActorBuilder::channel_capacity`).
+    pub max_capacity: usize,
+    /// Approximate remaining free slots currently available before backpressure.
+    pub available: usize,
+    /// Approximate number of queued messages or reserved permits (`max_capacity.saturating_sub(available)`).
+    pub queued: usize,
+    /// `true` if the currently cached mailbox channel is closed.
+    pub is_closed: bool,
+}
+
+impl QueueStats {
+    /// Returns `true` if no free slots are currently available in the cached mailbox (`available == 0`).
+    pub fn is_full(&self) -> bool {
+        self.available == 0
+    }
+}
 
 /// High-performance, self-healing 1-hop Data Plane client for a [`StatefulActor`].
 pub struct ActorClient<A: StatefulActor> {
@@ -808,6 +1128,24 @@ impl<A: StatefulActor> ActorClient<A> {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    /// Returns an approximate point-in-time snapshot of this client's bounded mailbox queue.
+    ///
+    /// Reads only the locally cached sender (`current_sender()`) without contacting the supervisor
+    /// or waiting on locks/channels. As a result, concurrent senders/receivers may shift counts
+    /// immediately after return, and after an actor crash (before the next `call`/`cast` triggers
+    /// rebinding) this reflects the closed mailbox of the exited instance (`is_closed == true`).
+    pub fn queue_stats(&self) -> QueueStats {
+        let tx = self.current_sender();
+        let max_capacity = tx.max_capacity();
+        let available = tx.capacity().min(max_capacity);
+        QueueStats {
+            max_capacity,
+            available,
+            queued: max_capacity.saturating_sub(available),
+            is_closed: tx.is_closed(),
+        }
     }
 
     /// Reactively waits on the [`SlotState`] watch channel until a replacement actor instance is running,
