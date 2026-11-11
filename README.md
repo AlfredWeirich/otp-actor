@@ -1155,6 +1155,10 @@ Because children are owned by their supervisor, a supervisor crash also replaces
 ```rust
 // Observe transitions without polling:
 let mut watcher = supervisor.watch_child_status("worker").await?;
+let status = watcher.wait_for(|s| s.is_running()).await?;
+println!("{} ready: {status:?}", watcher.child_name());
+// Or react to every transition: `while watcher.changed().await.is_ok() { println!("{:?}", watcher.current()); }`
+
 let snap = supervisor.snapshot().await?;
 if !snap.any_failed() && snap.all_running() {
     // Check flapping per child:
@@ -1169,6 +1173,13 @@ if let Some(sub) = tree.find(&["ingestion-pipeline"]) {
     println!("{} running children", sub.snapshot.running_count());
 }
 println!("deep healthy: {}, unreachable subtrees: {}", tree.all_running_deep(), tree.unavailable_count());
+
+// Approximate mailbox depth without contacting the supervisor:
+let stats = worker_client.queue_stats();
+println!(
+    "queued={}/{} (full={}, closed={})",
+    stats.queued, stats.max_capacity, stats.is_full(), stats.is_closed
+);
 
 // Cache health without a mailbox hop (never exposes the value):
 match tokens.cache_state() {
