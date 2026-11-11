@@ -238,10 +238,10 @@ To use the crate from another project in the same workspace or from crates.io, a
 
 ```toml
 [dependencies]
-otp-actor = "0.3.0"
+otp-actor = "0.3.1"
 # Optional features:
-# otp-actor = { version = "0.3.0", features = ["remote"] }
-# otp-actor = { version = "0.3.0", features = ["chaos_test"] }
+# otp-actor = { version = "0.3.1", features = ["remote"] }
+# otp-actor = { version = "0.3.1", features = ["chaos_test"] }
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -728,7 +728,7 @@ When built with `--features remote`, the crate enables distributed actor communi
 
 ```toml
 [dependencies]
-otp-actor = { version = "0.3.0", features = ["remote"] }
+otp-actor = { version = "0.3.1", features = ["remote"] }
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 ```
