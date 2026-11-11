@@ -10,10 +10,12 @@
 //! - [`ShutdownPolicy::Timeout`], [`ShutdownPolicy::BrutalKill`], and [`ShutdownPolicy::Infinity`]
 //! - Rate-limited exponential backoff ([`RestartPolicy`], [`RestartTracker`]) and optional failure escalation (`escalate_on_failure`)
 //! - Lock-free, zero-polling data-plane rebinding via per-child [`tokio::sync::watch`] channels ([`SlotState`])
-//! - Runtime introspection snapshots with built-in timeouts ([`SupervisorHandle::snapshot`], [`SupervisorHandle::snapshot_timeout`]) and read-only status observation ([`SupervisorHandle::watch_child_status`]).
+//! - Runtime introspection snapshots with built-in timeouts ([`SupervisorHandle::snapshot`], [`SupervisorHandle::snapshot_timeout`]), whole-hierarchy snapshots under one shared deadline ([`SupervisorHandle::snapshot_tree`], [`SupervisorHandle::snapshot_tree_timeout`]), and read-only status observation ([`SupervisorHandle::watch_child_status`]).
 
 use std::any::Any;
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::{
@@ -150,6 +152,10 @@ pub struct ChildSnapshot {
     pub restart_type: RestartType,
     /// Number of recent restarts currently inside the child's [`RestartPolicy::time_window`].
     pub restarts_in_window: usize,
+    /// `true` if this child is a nested [`Supervisor`] (registered via [`SupervisorBuilder`]),
+    /// `false` for leaf actors. Supervisor children can be descended into with
+    /// [`SupervisorHandle::snapshot_tree`].
+    pub is_supervisor: bool,
 }
 
 /// Point-in-time introspection snapshot of a [`Supervisor`] and its registered children.
@@ -220,6 +226,98 @@ impl SupervisorSnapshot {
             .iter()
             .filter(|c| c.status.is_failed())
             .count()
+    }
+}
+
+/// Point-in-time introspection snapshot of an entire supervision (sub)tree, returned by
+/// [`SupervisorHandle::snapshot_tree`] and [`SupervisorHandle::snapshot_tree_timeout`].
+///
+/// Composes the flat per-level [`SupervisorSnapshot`] with one [`SubtreeSnapshot`] entry for every
+/// child that is itself a [`Supervisor`] (`ChildSnapshot::is_supervisor`), recursively. Because the
+/// tree is collected level by level from independent supervisors, it is **not** an atomic snapshot
+/// across levels: a child may restart between the moment its parent and the child itself are queried.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SupervisorTreeSnapshot {
+    /// Flat snapshot of this supervisor and its direct children.
+    pub snapshot: SupervisorSnapshot,
+    /// One entry per direct child supervisor, in registration order.
+    pub subtrees: Vec<SubtreeSnapshot>,
+}
+
+/// Outcome of descending into one child [`Supervisor`] while collecting a [`SupervisorTreeSnapshot`].
+///
+/// A failing or slow subtree never discards the rest of the tree: its error is recorded in
+/// [`Self::result`] while sibling subtrees and ancestors are still reported.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubtreeSnapshot {
+    /// Registered name of the child supervisor inside its parent.
+    pub child_name: String,
+    /// The child's own tree, or the reason it could not be inspected:
+    /// - [`SupervisorError::Timeout`] if it did not answer before the overall deadline,
+    /// - [`SupervisorError::SupervisorUnavailable`] if it is currently restarting or terminated meanwhile,
+    /// - [`SupervisorError::ChildNotFound`] if it was stopped, or the permanent failure reason if it failed.
+    pub result: Result<SupervisorTreeSnapshot, SupervisorError>,
+}
+
+impl SupervisorTreeSnapshot {
+    /// Looks up the [`SubtreeSnapshot`] entry for the direct child supervisor `child_name`.
+    pub fn subtree(&self, child_name: &str) -> Option<&SubtreeSnapshot> {
+        self.subtrees.iter().find(|s| s.child_name == child_name)
+    }
+
+    /// Navigates down a path of nested supervisor names and returns the reachable tree found there.
+    ///
+    /// An empty `path` returns `self`. Returns `None` if a name is unknown or its subtree could
+    /// not be inspected (see [`SubtreeSnapshot::result`]).
+    pub fn find(&self, path: &[&str]) -> Option<&SupervisorTreeSnapshot> {
+        let mut current = self;
+        for name in path {
+            current = current.subtree(name)?.result.as_ref().ok()?;
+        }
+        Some(current)
+    }
+
+    /// Returns `true` if every child on every level is [`ChildStatus::Running`] **and** every
+    /// child supervisor could be inspected.
+    ///
+    /// Like [`SupervisorSnapshot::all_running`], this is `true` for a tree without any children.
+    pub fn all_running_deep(&self) -> bool {
+        self.snapshot.all_running()
+            && self
+                .subtrees
+                .iter()
+                .all(|s| s.result.as_ref().is_ok_and(Self::all_running_deep))
+    }
+
+    /// Returns `true` if at least one inspected level contains a [`ChildStatus::Failed`] child.
+    pub fn any_failed_deep(&self) -> bool {
+        self.snapshot.any_failed()
+            || self
+                .subtrees
+                .iter()
+                .any(|s| s.result.as_ref().is_ok_and(Self::any_failed_deep))
+    }
+
+    /// Returns `true` if at least one inspected level contains a [`ChildStatus::Restarting`] child.
+    pub fn any_restarting_deep(&self) -> bool {
+        self.snapshot.any_restarting()
+            || self
+                .subtrees
+                .iter()
+                .any(|s| s.result.as_ref().is_ok_and(Self::any_restarting_deep))
+    }
+
+    /// Returns the number of child supervisors, on every inspected level, that could not be inspected.
+    pub fn unavailable_count(&self) -> usize {
+        self.subtrees
+            .iter()
+            .map(|s| match &s.result {
+                Ok(tree) => tree.unavailable_count(),
+                Err(_) => 1,
+            })
+            .sum()
     }
 }
 
@@ -295,6 +393,8 @@ pub struct ChildSpec {
     pub(crate) shutdown_signal: Option<ShutdownSignalFn>,
     #[cfg(any(test, feature = "chaos_test"))]
     pub(crate) crash_signal: Option<ShutdownSignalFn>,
+    /// `true` if this spec describes a nested [`Supervisor`] rather than a leaf actor.
+    pub(crate) is_supervisor: bool,
 }
 
 impl ChildSpec {
@@ -313,7 +413,15 @@ impl ChildSpec {
             shutdown_signal: None,
             #[cfg(any(test, feature = "chaos_test"))]
             crash_signal: None,
+            is_supervisor: false,
         }
+    }
+
+    /// Marks this specification as describing a nested [`Supervisor`] (used by tree introspection).
+    #[must_use]
+    pub(crate) fn mark_supervisor(mut self) -> Self {
+        self.is_supervisor = true;
+        self
     }
 
     /// Returns the registered child name in this specification.
@@ -493,7 +601,8 @@ impl SupervisorBuilder {
         let mut spec = ChildSpec::new(name, factory, restart_policy)
             .restart_type(restart_type)
             .shutdown_policy(shutdown_policy)
-            .with_shutdown_signal(shutdown_signal);
+            .with_shutdown_signal(shutdown_signal)
+            .mark_supervisor();
 
         #[cfg(any(test, feature = "chaos_test"))]
         {
@@ -656,6 +765,7 @@ struct ActiveChild {
     shutdown_signal: Option<ShutdownSignalFn>,
     #[cfg(any(test, feature = "chaos_test"))]
     crash_signal: Option<ShutdownSignalFn>,
+    is_supervisor: bool,
     instance_id: usize,
     spawn_id: u64,
     restart_ticket: u64,
@@ -883,6 +993,7 @@ impl Supervisor {
                 shutdown_signal: spec.shutdown_signal,
                 #[cfg(any(test, feature = "chaos_test"))]
                 crash_signal: spec.crash_signal,
+                is_supervisor: spec.is_supervisor,
                 instance_id: inst_id,
                 spawn_id,
                 restart_ticket: ticket,
@@ -1150,6 +1261,7 @@ impl Supervisor {
                         shutdown_signal: spec.shutdown_signal,
                         #[cfg(any(test, feature = "chaos_test"))]
                         crash_signal: spec.crash_signal,
+                        is_supervisor: spec.is_supervisor,
                         instance_id: 1,
                         spawn_id: 0,
                         restart_ticket: ticket,
@@ -1255,6 +1367,7 @@ impl Supervisor {
                     instance_id: child.instance_id,
                     restart_type: child.restart_type,
                     restarts_in_window: child.restart_tracker.restarts_in_window(),
+                    is_supervisor: child.is_supervisor,
                 })
             })
             .collect();
@@ -1546,6 +1659,7 @@ impl Supervisor {
                             shutdown_signal: entry.shutdown_signal.clone(),
                             #[cfg(any(test, feature = "chaos_test"))]
                             crash_signal: entry.crash_signal.clone(),
+                            is_supervisor: entry.is_supervisor,
                         });
                     }
                 }
@@ -2453,20 +2567,138 @@ impl SupervisorHandle {
         &self,
         timeout: Duration,
     ) -> Result<SupervisorSnapshot, SupervisorError> {
-        let fut = async {
-            let cmd_sender = self.get_sender().await?;
-            let (tx, rx) = oneshot::channel();
-            cmd_sender
-                .send(SupervisorCommand::Snapshot { respond_to: tx })
-                .await
-                .map_err(|_| SupervisorError::SupervisorUnavailable)?;
-
-            rx.await.map_err(|_| SupervisorError::SupervisorUnavailable)
-        };
-
-        tokio::time::timeout(timeout, fut)
+        tokio::time::timeout(timeout, self.snapshot_untimed())
             .await
             .map_err(|_| SupervisorError::Timeout(timeout))?
+    }
+
+    /// Requests a [`SupervisorSnapshot`] from this supervisor without any deadline of its own.
+    async fn snapshot_untimed(&self) -> Result<SupervisorSnapshot, SupervisorError> {
+        let cmd_sender = self.get_sender().await?;
+        let (tx, rx) = oneshot::channel();
+        cmd_sender
+            .send(SupervisorCommand::Snapshot { respond_to: tx })
+            .await
+            .map_err(|_| SupervisorError::SupervisorUnavailable)?;
+
+        rx.await.map_err(|_| SupervisorError::SupervisorUnavailable)
+    }
+
+    /// Captures a point-in-time [`SupervisorTreeSnapshot`] of this supervisor and all nested child
+    /// supervisors with the default [`DEFAULT_SNAPSHOT_TIMEOUT`].
+    ///
+    /// See [`Self::snapshot_tree_timeout`] for semantics and failure behavior.
+    pub async fn snapshot_tree(&self) -> Result<SupervisorTreeSnapshot, SupervisorError> {
+        self.snapshot_tree_timeout(DEFAULT_SNAPSHOT_TIMEOUT).await
+    }
+
+    /// Captures a point-in-time [`SupervisorTreeSnapshot`] of this supervisor and all nested child
+    /// supervisors, bounded by a single overall `timeout`.
+    ///
+    /// - The `timeout` is one shared deadline for the **whole** tree, not a per-level budget.
+    /// - Child supervisors are queried **concurrently**, so one stalled subtree cannot starve its siblings.
+    /// - Fails with [`SupervisorError::Timeout`] only if *this* supervisor cannot be inspected in time.
+    ///   A child supervisor that is restarting, stopped, failed, or too slow is reported as an
+    ///   `Err` in its [`SubtreeSnapshot::result`] while the rest of the tree is still returned.
+    /// - Descends only through children registered as [`Supervisor`]s (`ChildSnapshot::is_supervisor`).
+    /// - The recursion runs on the caller side, never inside a supervisor's event loop, so a
+    ///   supervisor is never blocked waiting on its own children.
+    pub async fn snapshot_tree_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<SupervisorTreeSnapshot, SupervisorError> {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(timeout)
+            .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(86400 * 365));
+        self.collect_tree(deadline, timeout).await
+    }
+
+    /// Recursively collects the tree below this supervisor, honoring the shared `deadline`.
+    fn collect_tree(
+        &self,
+        deadline: tokio::time::Instant,
+        timeout: Duration,
+    ) -> Pin<Box<dyn Future<Output = Result<SupervisorTreeSnapshot, SupervisorError>> + Send + '_>>
+    {
+        Box::pin(async move {
+            let snapshot = tokio::time::timeout_at(deadline, self.snapshot_untimed())
+                .await
+                .map_err(|_| SupervisorError::Timeout(timeout))??;
+
+            let supervisor_children: Vec<&ChildSnapshot> = snapshot
+                .children
+                .iter()
+                .filter(|c| c.is_supervisor)
+                .collect();
+            let mut slots: Vec<Option<SubtreeSnapshot>> =
+                (0..supervisor_children.len()).map(|_| None).collect();
+            let mut pending: JoinSet<(usize, SubtreeSnapshot)> = JoinSet::new();
+
+            for (idx, child) in supervisor_children.iter().enumerate() {
+                let child_name = child.name.clone();
+                match &child.status {
+                    ChildStatus::Running { .. } => {
+                        let parent = self.clone();
+                        pending.spawn(async move {
+                            let result = tokio::time::timeout_at(
+                                deadline,
+                                Self::collect_child_tree(&parent, &child_name, deadline, timeout),
+                            )
+                            .await
+                            .unwrap_or(Err(SupervisorError::Timeout(timeout)));
+                            (idx, SubtreeSnapshot { child_name, result })
+                        });
+                    }
+                    other => {
+                        let reason = match other {
+                            ChildStatus::Failed(err) => err.clone(),
+                            ChildStatus::Stopped => {
+                                SupervisorError::ChildNotFound(child_name.clone())
+                            }
+                            _ => SupervisorError::SupervisorUnavailable,
+                        };
+                        if let Some(slot) = slots.get_mut(idx) {
+                            *slot = Some(SubtreeSnapshot {
+                                child_name,
+                                result: Err(reason),
+                            });
+                        }
+                    }
+                }
+            }
+
+            while let Some(joined) = pending.join_next().await {
+                if let Ok((idx, subtree)) = joined
+                    && let Some(slot) = slots.get_mut(idx)
+                {
+                    *slot = Some(subtree);
+                }
+            }
+
+            let subtrees = supervisor_children
+                .iter()
+                .zip(slots)
+                .map(|(child, slot)| {
+                    slot.unwrap_or_else(|| SubtreeSnapshot {
+                        child_name: child.name.clone(),
+                        result: Err(SupervisorError::SupervisorUnavailable),
+                    })
+                })
+                .collect();
+
+            Ok(SupervisorTreeSnapshot { snapshot, subtrees })
+        })
+    }
+
+    /// Resolves the child supervisor `child_name` below `parent` and collects its subtree.
+    async fn collect_child_tree(
+        parent: &SupervisorHandle,
+        child_name: &str,
+        deadline: tokio::time::Instant,
+        timeout: Duration,
+    ) -> Result<SupervisorTreeSnapshot, SupervisorError> {
+        let child = parent.get_supervisor(child_name).await?;
+        child.collect_tree(deadline, timeout).await
     }
 
     /// Returns a read-only [`ChildStatusWatcher`] for `child_name` backed by the supervisor's

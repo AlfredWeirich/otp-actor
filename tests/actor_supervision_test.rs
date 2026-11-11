@@ -4,10 +4,11 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use otp_actor::actor::{
-    ActorContext, ActorError, ActorScope, CallMessage, ChildSpec, ChildStatus, QueueStats,
-    ResourceActor, ResourceError, RestartPolicy, RestartTracker, RestartType, ShutdownPolicy,
-    StatefulActor, StatefulActorBuilder, SupervisionStrategy, Supervisor, SupervisorError,
-    SupervisorSnapshot, TimedResource, Worker, WorkerContext,
+    ActorContext, ActorError, ActorScope, CacheState, CallMessage, ChildSpec, ChildStatus,
+    QueueStats, ResourceActor, ResourceError, RestartPolicy, RestartTracker, RestartType,
+    ShutdownPolicy, StatefulActor, StatefulActorBuilder, SupervisionStrategy, Supervisor,
+    SupervisorError, SupervisorSnapshot, SupervisorTreeSnapshot, TimedResource, Worker,
+    WorkerContext,
 };
 
 #[tokio::test]
@@ -5112,6 +5113,398 @@ async fn test_actor_client_queue_stats_backpressure_and_post_crash_pre_rebind_ca
     assert_eq!(post_rebind.max_capacity, 2);
     assert_eq!(post_rebind.available, 2);
     assert_eq!(post_rebind.queued, 0);
+
+    root.shutdown().await.unwrap();
+}
+
+// ============================================================================
+// Phase-2 Introspection: snapshot_tree()
+// ============================================================================
+
+#[tokio::test]
+async fn test_supervisor_snapshot_tree_nested_hierarchy_helpers_find_and_restarting_subtree() {
+    let root = Supervisor::new("tree-root");
+
+    let _edge = StatefulActorBuilder::from_default::<StreamActor>("edge")
+        .spawn(&root)
+        .await
+        .unwrap();
+
+    let mid = Supervisor::builder("mid")
+        .strategy(SupervisionStrategy::OneForAll)
+        .spawn(&root)
+        .await
+        .unwrap();
+    let _mid_worker = StatefulActorBuilder::from_default::<StreamActor>("mid-worker")
+        .spawn(&mid)
+        .await
+        .unwrap();
+
+    // `deep` restarts with a long backoff so the `Restarting` window is easy to observe.
+    let deep = Supervisor::builder("deep")
+        .restart_type(RestartType::Permanent)
+        .restart_policy(
+            RestartPolicy::new(5, Duration::from_secs(60)).initial_backoff(Duration::from_secs(5)),
+        )
+        .spawn(&mid)
+        .await
+        .unwrap();
+    let _deep_worker = StatefulActorBuilder::from_default::<StreamActor>("deep-worker")
+        .spawn(&deep)
+        .await
+        .unwrap();
+
+    let _side = Supervisor::builder("side").spawn(&root).await.unwrap();
+
+    // 1. Healthy tree: flat level is untouched, supervisor children are flagged and descended into
+    let tree: SupervisorTreeSnapshot = root.snapshot_tree().await.unwrap();
+    assert_eq!(tree.snapshot.name, "tree-root");
+    assert!(tree.snapshot.all_running());
+    assert!(!tree.snapshot.child("edge").unwrap().is_supervisor);
+    assert!(tree.snapshot.child("mid").unwrap().is_supervisor);
+    assert!(tree.snapshot.child("side").unwrap().is_supervisor);
+
+    let subtree_names: Vec<&str> = tree
+        .subtrees
+        .iter()
+        .map(|s| s.child_name.as_str())
+        .collect();
+    assert_eq!(subtree_names, vec!["mid", "side"]);
+
+    let mid_tree = tree.find(&["mid"]).unwrap();
+    assert_eq!(mid_tree.snapshot.strategy, SupervisionStrategy::OneForAll);
+    let mid_children: Vec<&str> = mid_tree
+        .snapshot
+        .children
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
+    assert_eq!(mid_children, vec!["mid-worker", "deep"]);
+
+    let deep_tree = tree.find(&["mid", "deep"]).unwrap();
+    assert_eq!(deep_tree.snapshot.name, "deep");
+    assert!(deep_tree.snapshot.child("deep-worker").is_some());
+    assert!(deep_tree.subtrees.is_empty());
+
+    assert!(std::ptr::eq(tree.find(&[]).unwrap(), &tree));
+    assert!(tree.find(&["mid", "missing"]).is_none());
+    assert!(tree.find(&["edge"]).is_none());
+    assert!(tree.subtree("edge").is_none());
+
+    assert!(tree.all_running_deep());
+    assert!(!tree.any_failed_deep());
+    assert!(!tree.any_restarting_deep());
+    assert_eq!(tree.unavailable_count(), 0);
+
+    // 2. `deep` crashes into a 5s backoff: the rest of the tree is still reported, only that
+    //    subtree degrades to Err(SupervisorUnavailable) and the flat level shows Restarting
+    let mut deep_watch = mid.watch_child_status("deep").await.unwrap();
+    deep.simulate_crash().await.unwrap();
+    deep_watch.wait_for(|s| s.is_restarting()).await.unwrap();
+
+    let started = Instant::now();
+    let degraded = root
+        .snapshot_tree_timeout(Duration::from_millis(500))
+        .await
+        .unwrap();
+    assert!(
+        started.elapsed() < Duration::from_millis(400),
+        "snapshot_tree stalled on a restarting subtree: {:?}",
+        started.elapsed()
+    );
+
+    let mid_degraded = degraded.find(&["mid"]).unwrap();
+    assert!(mid_degraded.snapshot.any_restarting());
+    assert_eq!(
+        mid_degraded.subtree("deep").unwrap().result,
+        Err(SupervisorError::SupervisorUnavailable)
+    );
+    assert!(degraded.find(&["mid", "deep"]).is_none());
+    assert!(degraded.find(&["side"]).is_some());
+    assert!(!degraded.all_running_deep());
+    assert!(degraded.any_restarting_deep());
+    assert!(!degraded.any_failed_deep());
+    assert_eq!(degraded.unavailable_count(), 1);
+
+    root.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_supervisor_snapshot_tree_timeout_isolates_stuck_subtree_and_reports_stopped_and_failed()
+ {
+    let root = Supervisor::new("tree-timeout-root");
+
+    let stopped_sup = Supervisor::builder("stopped-sup")
+        .spawn(&root)
+        .await
+        .unwrap();
+    let _stopped_worker = StatefulActorBuilder::from_default::<StreamActor>("stopped-worker")
+        .spawn(&stopped_sup)
+        .await
+        .unwrap();
+    root.stop_child("stopped-sup").await.unwrap();
+
+    let healthy_sup = Supervisor::builder("healthy-sup")
+        .spawn(&root)
+        .await
+        .unwrap();
+    let _healthy_worker = StatefulActorBuilder::from_default::<StreamActor>("healthy-worker")
+        .spawn(&healthy_sup)
+        .await
+        .unwrap();
+
+    // `stuck-sup` is blocked inside a slow child's ShutdownPolicy and no longer answers commands
+    let stuck_sup = Supervisor::builder("stuck-sup").spawn(&root).await.unwrap();
+    let holder = StatefulActorBuilder::from_default::<StreamActor>("holder")
+        .shutdown_timeout(Duration::from_secs(5))
+        .spawn(&stuck_sup)
+        .await
+        .unwrap();
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    holder
+        .cast(StreamMsg::Hold(entered_tx, release_rx))
+        .await
+        .unwrap();
+    entered_rx.await.unwrap();
+    let stuck_for_shutdown = stuck_sup.clone();
+    let shutdown_task = tokio::spawn(async move { stuck_for_shutdown.shutdown().await });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    // `failed-sup` exhausts its restart budget and ends up permanently Failed
+    let failed_sup = Supervisor::builder("failed-sup")
+        .restart_type(RestartType::Permanent)
+        .restart_policy(
+            RestartPolicy::new(1, Duration::from_secs(10))
+                .initial_backoff(Duration::from_millis(5))
+                .max_backoff(Duration::from_millis(5)),
+        )
+        .spawn(&root)
+        .await
+        .unwrap();
+    let mut failed_watch = root.watch_child_status("failed-sup").await.unwrap();
+    failed_sup.simulate_crash().await.unwrap();
+    failed_watch
+        .wait_for(|s| matches!(s, ChildStatus::Running { instance_id: 2 }))
+        .await
+        .unwrap();
+    failed_sup.simulate_crash().await.unwrap();
+    failed_watch.wait_for(|s| s.is_failed()).await.unwrap();
+
+    let deadline = Duration::from_millis(100);
+    let started = Instant::now();
+    let tree = root.snapshot_tree_timeout(deadline).await.unwrap();
+    assert!(
+        started.elapsed() < Duration::from_millis(400),
+        "snapshot_tree_timeout exceeded its shared deadline: {:?}",
+        started.elapsed()
+    );
+
+    // Registration order is preserved and every supervisor child gets an entry
+    let names: Vec<&str> = tree
+        .subtrees
+        .iter()
+        .map(|s| s.child_name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["stopped-sup", "healthy-sup", "stuck-sup", "failed-sup"]
+    );
+
+    // The healthy sibling is reported in full even though another subtree timed out
+    let healthy = tree.find(&["healthy-sup"]).unwrap();
+    assert!(healthy.snapshot.child("healthy-worker").is_some());
+    assert!(healthy.snapshot.all_running());
+
+    assert_eq!(
+        tree.subtree("stuck-sup").unwrap().result,
+        Err(SupervisorError::Timeout(deadline))
+    );
+    assert_eq!(
+        tree.subtree("stopped-sup").unwrap().result,
+        Err(SupervisorError::ChildNotFound("stopped-sup".to_string()))
+    );
+    assert!(matches!(
+        tree.subtree("failed-sup").unwrap().result,
+        Err(SupervisorError::MaxRestartsExceeded(ref name, 1, _)) if name == "failed-sup"
+    ));
+    assert!(tree.snapshot.any_failed());
+    assert_eq!(tree.unavailable_count(), 3);
+    assert!(!tree.all_running_deep());
+
+    // A stuck *root* of the query still fails the whole call with Timeout
+    let stuck_root_res = stuck_sup.snapshot_tree_timeout(deadline).await;
+    assert!(
+        matches!(
+            stuck_root_res,
+            Err(SupervisorError::Timeout(d)) if d == deadline
+        ) || matches!(stuck_root_res, Err(SupervisorError::SupervisorUnavailable)),
+        "Expected Timeout or SupervisorUnavailable for a blocked root, got {stuck_root_res:?}"
+    );
+
+    let _ = release_tx.send(());
+    shutdown_task.await.unwrap().unwrap();
+    root.shutdown().await.unwrap();
+}
+
+// ============================================================================
+// Phase-2 Introspection: ResourceClient::cache_state()
+// ============================================================================
+
+/// Asserts that `actual` is within 100ms of `expected` (the paused test clock is exact, but this
+/// keeps the assertions robust against scheduler-induced drift).
+fn assert_near(actual: Duration, expected: Duration) {
+    let diff = actual.abs_diff(expected);
+    assert!(
+        diff <= Duration::from_millis(100),
+        "expected ~{expected:?}, got {actual:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_resource_client_cache_state_lifecycle_fresh_refresh_due_stale_and_expired() {
+    let root = Supervisor::new("cache-state-root");
+
+    let fetches = Arc::new(AtomicUsize::new(0));
+    let fetches_for_worker = fetches.clone();
+    let worker = move |_ctx: WorkerContext| {
+        let fetches = fetches_for_worker.clone();
+        async move {
+            fetches.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, String>(TimedResource::with_ttl(
+                "secret-token".to_string(),
+                Duration::from_secs(10),
+            ))
+        }
+    };
+
+    let client = ResourceActor::builder("token")
+        .worker(worker)
+        .expiry_buffer(Duration::from_secs(2))
+        .stale_while_error(Duration::from_secs(5))
+        .proactive_refresh(false)
+        .spawn(&root)
+        .await
+        .unwrap();
+
+    // 1. Cold start: nothing cached yet, and observing the state must not trigger the worker
+    assert_eq!(client.cache_state(), CacheState::Empty);
+    assert!(!client.cache_state().has_usable_value());
+    assert_eq!(fetches.load(Ordering::SeqCst), 0);
+
+    // 2. First get() populates the cache: Fresh with the full TTL remaining
+    assert_eq!(client.get().await.unwrap(), "secret-token");
+    let CacheState::Fresh {
+        expires_in: Some(remaining),
+    } = client.cache_state()
+    else {
+        panic!("expected Fresh, got {:?}", client.cache_state());
+    };
+    assert_near(remaining, Duration::from_secs(10));
+    assert!(client.cache_state().is_fresh());
+    assert!(client.cache_state().has_usable_value());
+
+    // 3. Still outside the 2s pre-expiration buffer (3s left)
+    tokio::time::advance(Duration::from_secs(7)).await;
+    let CacheState::Fresh {
+        expires_in: Some(remaining),
+    } = client.cache_state()
+    else {
+        panic!("expected Fresh, got {:?}", client.cache_state());
+    };
+    assert_near(remaining, Duration::from_secs(3));
+
+    // 4. Inside the buffer (1.5s left): valid, but the next get() is a 1-hop refresh
+    tokio::time::advance(Duration::from_millis(1500)).await;
+    let CacheState::RefreshDue {
+        expires_in: Some(remaining),
+    } = client.cache_state()
+    else {
+        panic!("expected RefreshDue, got {:?}", client.cache_state());
+    };
+    assert_near(remaining, Duration::from_millis(1500));
+    assert!(!client.cache_state().is_fresh());
+    assert!(client.cache_state().has_usable_value());
+
+    // 5. Expired by 0.5s, but inside the 5s stale-while-error window
+    tokio::time::advance(Duration::from_secs(2)).await;
+    let CacheState::StaleUsable { expired_for } = client.cache_state() else {
+        panic!("expected StaleUsable, got {:?}", client.cache_state());
+    };
+    assert_near(expired_for, Duration::from_millis(500));
+    assert!(client.cache_state().has_usable_value());
+
+    // 6. Expired beyond the stale-while-error window (5.5s)
+    tokio::time::advance(Duration::from_secs(5)).await;
+    let CacheState::Expired { expired_for } = client.cache_state() else {
+        panic!("expected Expired, got {:?}", client.cache_state());
+    };
+    assert_near(expired_for, Duration::from_millis(5500));
+    assert!(!client.cache_state().has_usable_value());
+
+    // Observing the cache never touched the worker; only the single explicit get() did
+    assert_eq!(fetches.load(Ordering::SeqCst), 1);
+
+    // The state is metadata only and never leaks the cached value
+    assert!(!format!("{:?}", client.cache_state()).contains("secret-token"));
+
+    root.shutdown().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_resource_client_cache_state_perpetual_no_stale_window_and_invalidation() {
+    let root = Supervisor::new("cache-state-edge-root");
+
+    // 1. Perpetual resources never expire and report no remaining TTL
+    let perpetual = ResourceActor::builder("perpetual")
+        .worker(|_| async { Ok::<_, String>(TimedResource::perpetual("forever".to_string())) })
+        .spawn(&root)
+        .await
+        .unwrap();
+    assert_eq!(perpetual.cache_state(), CacheState::Empty);
+    assert_eq!(perpetual.get().await.unwrap(), "forever");
+    assert_eq!(
+        perpetual.cache_state(),
+        CacheState::Fresh { expires_in: None }
+    );
+    tokio::time::advance(Duration::from_secs(3600)).await;
+    assert_eq!(
+        perpetual.cache_state(),
+        CacheState::Fresh { expires_in: None }
+    );
+
+    // 2. Without a stale-while-error window an expired entry is Expired, never StaleUsable
+    let short = ResourceActor::builder("short")
+        .worker(|_| async {
+            Ok::<_, String>(TimedResource::with_ttl(
+                "short-lived".to_string(),
+                Duration::from_secs(1),
+            ))
+        })
+        .proactive_refresh(false)
+        .spawn(&root)
+        .await
+        .unwrap();
+    assert_eq!(short.get().await.unwrap(), "short-lived");
+    tokio::time::advance(Duration::from_secs(2)).await;
+    let CacheState::Expired { expired_for } = short.cache_state() else {
+        panic!("expected Expired, got {:?}", short.cache_state());
+    };
+    assert_near(expired_for, Duration::from_secs(1));
+
+    // 3. Crash: the cached endpoint reports Invalidated until the next call rebinds the client
+    perpetual.simulate_crash().await.unwrap();
+    assert_eq!(perpetual.cache_state(), CacheState::Invalidated);
+    assert!(!perpetual.cache_state().has_usable_value());
+    assert_eq!(perpetual.get().await.unwrap(), "forever");
+    assert_eq!(
+        perpetual.cache_state(),
+        CacheState::Fresh { expires_in: None }
+    );
+
+    // 4. Explicit shutdown invalidates the cache as well
+    short.shutdown().await.unwrap();
+    assert_eq!(short.cache_state(), CacheState::Invalidated);
 
     root.shutdown().await.unwrap();
 }

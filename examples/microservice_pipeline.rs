@@ -2,7 +2,8 @@
 //!
 //! Combines `otp-actor`'s core production building blocks in a realistic service topology:
 //! - **`ResourceActor` (`db-auth-token`)**: 0-hop `watch` cache reads, proactive background refresh,
-//!   and `stale_while_error` resilience during simulated upstream auth-provider outages.
+//!   and `stale_while_error` resilience during simulated upstream auth-provider outages, observed
+//!   non-intrusively via [`CacheState`] (`auth_client.cache_state()`).
 //! - **Bounded Mailbox Backpressure & Queue Metrics (`storage-sink`)**: `StatefulActor` with explicit
 //!   `channel_capacity`, deterministic load shedding (`ActorError::MailboxFull` via `try_cast`), and
 //!   [`QueueStats`] observation (`sink_client.queue_stats()`).
@@ -10,8 +11,9 @@
 //!   for external channel ingestion, `ctx.send_interval_with(...)` for lifecycle-bound heartbeats
 //!   on a non-`Clone` message enum, and automatic 0-ms `watch<SlotState>` rebinding after a crash.
 //! - **Runtime Introspection (`pipeline`)**: Non-invasive [`ChildStatusWatcher`] observation
-//!   (`watch_child_status`) and bounded supervisor health snapshots (`pipeline.snapshot()`),
-//!   including flapping detection (`restarts_in_window`).
+//!   (`watch_child_status`), bounded supervisor health snapshots (`pipeline.snapshot()`), and a
+//!   whole-hierarchy view (`root.snapshot_tree()`), including flapping detection
+//!   (`restarts_in_window`).
 //!
 //! Run with:
 //! ```bash
@@ -23,9 +25,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use otp_actor::{
-    ActorClient, ActorContext, ActorError, ChildStatus, QueueStats, ResourceActor, ResourceClient,
-    RestartPolicy, RestartType, StatefulActor, StatefulActorBuilder, SupervisionStrategy,
-    Supervisor, TimedResource, WorkerContext,
+    ActorClient, ActorContext, ActorError, CacheState, ChildStatus, QueueStats, ResourceActor,
+    ResourceClient, RestartPolicy, RestartType, StatefulActor, StatefulActorBuilder,
+    SupervisionStrategy, Supervisor, TimedResource, WorkerContext,
 };
 use tokio::sync::{Notify, mpsc, oneshot};
 
@@ -418,8 +420,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Phase 3: Stale-while-error during transient upstream outage
     // ------------------------------------------------------------------------
     println!("--- Phase 3: Upstream Auth Outage + Stale-While-Error ---");
+    println!(
+        "  Auth cache before outage (no mailbox hop): {:?}",
+        auth_client.cache_state()
+    );
     upstream_healthy.store(false, Ordering::SeqCst);
     tokio::time::sleep(Duration::from_millis(160)).await;
+
+    // The cached token has expired, but is still inside the 2s stale-while-error window.
+    // `cache_state()` reports this without contacting the actor and never exposes the token value.
+    let outage_state = auth_client.cache_state();
+    println!("  Auth cache during outage: {outage_state:?}");
+    assert!(matches!(outage_state, CacheState::StaleUsable { .. }));
 
     let stale_token = auth_client.get().await?;
     println!("  Upstream is DOWN, yet ResourceActor served stale token: {stale_token}");
@@ -428,7 +440,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     auth_client.force_refresh().await?;
     tokio::time::sleep(Duration::from_millis(30)).await;
     let recovered_token = auth_client.get().await?;
-    println!("  Upstream is UP again -> fresh token acquired: {recovered_token}\n");
+    println!("  Upstream is UP again -> fresh token acquired: {recovered_token}");
+    println!(
+        "  Auth cache after recovery: {:?}\n",
+        auth_client.cache_state()
+    );
+    assert!(auth_client.cache_state().has_usable_value());
     assert_ne!(stale_token, recovered_token);
 
     // ------------------------------------------------------------------------
@@ -482,6 +499,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(
         snap.child("ingestion-worker").map(|c| c.restarts_in_window),
         Some(1)
+    );
+
+    // Whole-hierarchy view from the root: descends into every child supervisor under one shared
+    // deadline, and degrades per subtree instead of failing the whole probe.
+    let tree = root.snapshot_tree().await?;
+    println!(
+        "  Tree from '{}': all_running_deep={}, any_failed_deep={}, unavailable_subtrees={}",
+        tree.snapshot.name,
+        tree.all_running_deep(),
+        tree.any_failed_deep(),
+        tree.unavailable_count()
+    );
+    if let Some(pipeline_tree) = tree.find(&["ingestion-pipeline"]) {
+        println!(
+            "    - subtree '{}': {} children running",
+            pipeline_tree.snapshot.name,
+            pipeline_tree.snapshot.running_count()
+        );
+    }
+    assert!(tree.all_running_deep());
+    assert_eq!(
+        tree.find(&["ingestion-pipeline"])
+            .map(|t| t.snapshot.children.len()),
+        Some(3)
     );
     println!();
 
