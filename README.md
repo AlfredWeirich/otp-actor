@@ -1,5 +1,7 @@
 # otp-actor — Fault-Tolerant OTP Actors, 0-ms Self-Healing & gRPC Remoting for Tokio
 
+> **Latest Release:** `v0.3.3` — see [Release_note_0.3.3.md](Release_note_0.3.3.md) for what's new and upgrade notes.
+>
 > **Note:** This crate is based on code developed in a large production system since 2024 and is now being extracted step by step into a standalone crate.
 
 **Stop writing brittle reconnect loops, guarding unbounded mailboxes against OOM, or wrapping actors in proc-macro boilerplate.**
@@ -1459,6 +1461,7 @@ The integration suite in [`tests/actor_supervision_test.rs`](tests/actor_supervi
 .
 ├── Cargo.toml
 ├── README.md
+├── Release_note_0.3.*.md               # release notes per version (latest: Release_note_0.3.3.md)
 ├── build.rs                            # compiles actor_node.proto when `--features remote` is active
 ├── proto
 │   └── actor_node.proto                # universal Protobuf wire contract (otp_actor.remote.v1)
