@@ -11,6 +11,15 @@ service ActorNode {
   rpc Cast (CastRequest) returns (CastResponse);
 }
 
+// Separate control-plane service for node health and operational telemetry (non-breaking addition).
+service ActorNodeAdmin {
+  // Fast liveness check returning node uptime and availability without mailbox hops.
+  rpc Health (HealthRequest) returns (HealthResponse);
+
+  // Bounded operational status snapshot encoded as postcard (`NodeStatus`).
+  rpc Status (StatusRequest) returns (StatusResponse);
+}
+
 // Universal call envelope carrying an arbitrary serialized payload.
 message CallRequest {
   // The service supervisor domain name (e.g., "auth-service").
@@ -70,5 +79,35 @@ message RemoteError {
   }
   Kind kind = 1;
   string message = 2;
+}
+
+// Fast liveness probe request.
+message HealthRequest {
+  uint32 protocol_version = 1;
+}
+
+// Fast liveness probe response.
+message HealthResponse {
+  bool alive = 1;
+  uint64 uptime_seconds = 2;
+  // "ok" | "degraded" | "draining" | "unavailable"
+  string state = 3;
+  optional RemoteError framework_error = 4;
+}
+
+// Operational status snapshot request.
+message StatusRequest {
+  uint32 protocol_version = 1;
+  optional uint64 timeout_ms = 2;
+  bool include_tree = 3;
+  bool include_child_details = 4;
+}
+
+// Operational status snapshot response carrying a postcard-serialized `NodeStatus`.
+message StatusResponse {
+  oneof result {
+    bytes status_payload = 1;
+    RemoteError framework_error = 2;
+  }
 }
 

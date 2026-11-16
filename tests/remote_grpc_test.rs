@@ -766,3 +766,223 @@ async fn test_service_authorizer_label_sanitization_and_timeout_clamping() {
 
     root.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn test_admin_service_health_status_authorizer_and_registry_only_mode() {
+    use otp_actor::actor::{HealthState, NodeStatus, StatusOptions};
+    use otp_actor::remote::proto::remote_error::Kind;
+    use otp_actor::remote::proto::status_response::Result as StatusResult;
+    use otp_actor::remote::proto::{ActorNodeAdmin, HealthRequest, StatusRequest};
+    use otp_actor::remote::{ActorNodeAdminService, REMOTE_PROTOCOL_VERSION};
+
+    let root = Supervisor::new("admin-unit-root");
+    let svc = Supervisor::builder("admin-svc").spawn(&root).await.unwrap();
+    let calc = StatefulActorBuilder::from_default::<CalculatorActor>("calc")
+        .channel_capacity(12)
+        .spawn(&svc)
+        .await
+        .unwrap();
+
+    let registry = ActorNodeRegistry::new();
+    assert!(registry.is_empty());
+    registry.register("admin-svc", "calc", calc);
+    assert_eq!(registry.len(), 1);
+
+    let admin_svc = ActorNodeAdminService::new(registry.clone(), None)
+        .with_started_at(std::time::Instant::now() - Duration::from_secs(30))
+        .with_authorizer(Arc::new(|metadata, _ext, svc_name, actor_name| {
+            assert_eq!(svc_name, "__admin");
+            assert!(actor_name == "health" || actor_name == "status");
+            match metadata.get("authorization") {
+                Some(v) if v == "Bearer admin-token" => Ok(()),
+                _ => Err(tonic::Status::permission_denied("admin auth required")),
+            }
+        }));
+
+    // 1. Unauthorized Health and Status are rejected
+    let unauth_health = admin_svc
+        .health(tonic::Request::new(HealthRequest {
+            protocol_version: REMOTE_PROTOCOL_VERSION,
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(unauth_health.code(), tonic::Code::PermissionDenied);
+
+    let unauth_status = admin_svc
+        .status(tonic::Request::new(StatusRequest {
+            protocol_version: REMOTE_PROTOCOL_VERSION,
+            timeout_ms: None,
+            include_tree: true,
+            include_child_details: true,
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(unauth_status.code(), tonic::Code::PermissionDenied);
+
+    // 2. Incompatible protocol version returns IncompatibleProtocol
+    let mut bad_ver_req = tonic::Request::new(StatusRequest {
+        protocol_version: REMOTE_PROTOCOL_VERSION + 1,
+        timeout_ms: None,
+        include_tree: true,
+        include_child_details: true,
+    });
+    bad_ver_req
+        .metadata_mut()
+        .insert("authorization", "Bearer admin-token".parse().unwrap());
+    let bad_ver_resp = admin_svc.status(bad_ver_req).await.unwrap().into_inner();
+    match bad_ver_resp.result {
+        Some(StatusResult::FrameworkError(err)) => {
+            assert_eq!(err.kind, Kind::IncompatibleProtocol as i32);
+        }
+        other => panic!("Expected IncompatibleProtocol, got {other:?}"),
+    }
+
+    // 3. Authorized Health and Status without attached SupervisorHandle still report endpoints & uptime
+    let mut health_req = tonic::Request::new(HealthRequest {
+        protocol_version: REMOTE_PROTOCOL_VERSION,
+    });
+    health_req
+        .metadata_mut()
+        .insert("authorization", "Bearer admin-token".parse().unwrap());
+    let health_resp = admin_svc.health(health_req).await.unwrap().into_inner();
+    assert!(health_resp.alive);
+    assert_eq!(health_resp.state, "ok");
+    assert!(health_resp.uptime_seconds >= 30);
+
+    let mut status_req = tonic::Request::new(StatusRequest {
+        protocol_version: REMOTE_PROTOCOL_VERSION,
+        timeout_ms: Some(1000),
+        include_tree: true,
+        include_child_details: true,
+    });
+    status_req
+        .metadata_mut()
+        .insert("authorization", "Bearer admin-token".parse().unwrap());
+    let status_resp = admin_svc.status(status_req).await.unwrap().into_inner();
+    let StatusResult::StatusPayload(bytes) = status_resp.result.unwrap() else {
+        panic!("Expected StatusPayload");
+    };
+    let decoded: NodeStatus = postcard::from_bytes(&bytes).unwrap();
+    assert_eq!(decoded.health.state, HealthState::Healthy);
+    assert!(decoded.supervision_tree.is_none());
+    assert_eq!(decoded.registered_endpoints.len(), 1);
+    assert_eq!(decoded.registered_endpoints[0].service_name, "admin-svc");
+    assert_eq!(decoded.registered_endpoints[0].actor_name, "calc");
+    assert_eq!(
+        decoded.registered_endpoints[0].queue.unwrap().max_capacity,
+        12
+    );
+
+    // Ensure StatusOptions::default() stays aligned
+    assert!(StatusOptions::default().include_tree);
+
+    root.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_remote_node_monitor_and_any_node_monitor_end_to_end()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use otp_actor::actor::{HealthState, StatusOptions};
+    use otp_actor::remote::{AnyNodeMonitor, RemoteNodeMonitor};
+
+    let root = Supervisor::new("e2e-admin-root");
+    let svc = Supervisor::builder("calc-svc").spawn(&root).await?;
+    let calc = StatefulActorBuilder::from_default::<CalculatorActor>("calc")
+        .channel_capacity(16)
+        .spawn(&svc)
+        .await?;
+
+    let registry = ActorNodeRegistry::new();
+    registry.register_client(calc);
+
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let node = ActorNodeHandle::builder(bind_addr, registry)
+        .supervisor(root.clone())
+        .started_at(std::time::Instant::now() - Duration::from_secs(15))
+        .authorizer(Arc::new(|metadata, _ext, _svc, _actor| {
+            match metadata.get("authorization") {
+                Some(val) if val == "Bearer valid" => Ok(()),
+                _ => Err(tonic::Status::unauthenticated("missing token")),
+            }
+        }))
+        .start()
+        .await?;
+    let endpoint_url = format!("http://{}", node.local_addr());
+
+    // 1. Drive some remote Call, Cast, and ActorNotFound traffic
+    let remote_client =
+        RemoteActorClient::<CalculatorActor>::connect(&endpoint_url, "calc-svc", "calc")
+            .await?
+            .with_request_metadata(|m| {
+                m.insert("authorization", "Bearer valid".parse().unwrap());
+            });
+    assert_eq!(remote_client.call(CalcMsg::Add(7)).await?, 7);
+    remote_client.cast(CalcMsg::Add(3)).await?;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert_eq!(remote_client.call(CalcMsg::Get).await?, 10);
+
+    let missing_client =
+        RemoteActorClient::<CalculatorActor>::connect(&endpoint_url, "calc-svc", "missing")
+            .await?
+            .with_request_metadata(|m| {
+                m.insert("authorization", "Bearer valid".parse().unwrap());
+            });
+    assert!(matches!(
+        missing_client.call(CalcMsg::Get).await,
+        Err(RemoteActorError::ActorNotFound(_))
+    ));
+
+    // 2. Query remote monitor via AnyNodeMonitor::Remote
+    let remote_monitor = RemoteNodeMonitor::connect(&endpoint_url)
+        .await?
+        .with_request_metadata(|m| {
+            m.insert("authorization", "Bearer valid".parse().unwrap());
+        });
+    let any_remote = AnyNodeMonitor::from_remote(remote_monitor);
+    let any_local = AnyNodeMonitor::local(root.clone());
+
+    let remote_health = any_remote.health().await?;
+    let local_health = any_local.health().await?;
+    assert!(remote_health.alive);
+    assert!(local_health.alive);
+    assert_eq!(remote_health.state, HealthState::Healthy);
+    assert!(remote_health.uptime_seconds >= 15);
+
+    let remote_status = any_remote.status_default().await?;
+    let local_status = any_local.status_default().await?;
+
+    assert_eq!(remote_status.summary.total_supervisors, 2);
+    assert_eq!(remote_status.summary.total_actors, 1);
+    assert_eq!(remote_status.summary.total_calls, 2);
+    assert_eq!(remote_status.summary.total_casts, 1);
+    assert_eq!(
+        remote_status.summary.total_calls,
+        local_status.summary.total_calls
+    );
+
+    let remote_counters = remote_status.remote.expect("remote counters must be present");
+    assert_eq!(remote_counters.registered_endpoints, 1);
+    assert_eq!(remote_counters.grpc_calls_total, 3); // 2 valid + 1 missing
+    assert_eq!(remote_counters.grpc_casts_total, 1);
+    assert_eq!(remote_counters.actor_not_found_total, 1);
+    assert_eq!(remote_counters.grpc_in_flight, 0);
+    assert_eq!(remote_status.registered_endpoints.len(), 1);
+    assert_eq!(
+        remote_status.registered_endpoints[0].queue.unwrap().max_capacity,
+        16
+    );
+
+    // 3. Prometheus output includes both actor-level and remote transport metrics
+    let prom = any_remote
+        .prometheus_metrics(StatusOptions::default())
+        .await?;
+    assert!(prom.contains("otp_actor_remote_grpc_calls_total 3\n"));
+    assert!(prom.contains("otp_actor_remote_not_found_total{kind=\"actor\"} 1\n"));
+    assert!(prom.contains("otp_actor_calls_total{supervisor=\"e2e-admin-root/calc-svc\",child=\"calc\"} 2\n"));
+
+    // 4. Local handle counters match
+    assert_eq!(node.remote_metrics().grpc_calls_total, 3);
+
+    node.shutdown().await?;
+    Ok(())
+}

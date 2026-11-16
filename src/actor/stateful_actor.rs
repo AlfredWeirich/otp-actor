@@ -27,8 +27,10 @@ use tokio::time::{Instant, MissedTickBehavior, interval_at};
 
 use super::model::{RestartPolicy, RestartType, ShutdownPolicy, SupervisorError, TaskResult};
 use super::supervisor::{
-    ChildSpec, ShutdownSignalFn, SlotState, SpawnContext, SupervisorHandle, UntypedActorFactory,
+    ChildSpec, QueueProbeFn, ShutdownSignalFn, SlotState, SpawnContext, SupervisorHandle,
+    UntypedActorFactory,
 };
+use super::telemetry::{ActorMetrics, RunnerPanicGuard};
 
 /// Control directive set by a [`StatefulActor`] through its [`ActorContext`] during message handling.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -641,12 +643,16 @@ where
         let shutdown_policy = config.shutdown_policy;
         let name = config.name.clone();
 
+        let metrics = ActorMetrics::new();
+        let metrics_for_factory = metrics.clone();
+
         let factory: UntypedActorFactory = Arc::new(move |spawn_ctx: SpawnContext| {
             let (tx, rx) = mpsc::channel::<ActorEnvelope<A>>(channel_capacity);
             let weak_tx = tx.downgrade();
             let sender_arc = Arc::new(tx);
             let factory = actor_factory.clone();
             let cfg = config.clone();
+            let runner_metrics = metrics_for_factory.clone();
             let task_handle = tokio::spawn(async move {
                 let actor = (factory)(spawn_ctx.instance_id);
                 let runner = StatefulActorRunner::new(
@@ -657,6 +663,7 @@ where
                     spawn_ctx.shutdown_rx,
                     spawn_ctx.supervisor,
                     spawn_ctx.instance_id,
+                    runner_metrics,
                 );
                 runner.run().await
             });
@@ -669,11 +676,19 @@ where
             }
         });
 
+        let queue_probe: QueueProbeFn = Arc::new(|untyped| {
+            untyped
+                .downcast_ref::<Sender<ActorEnvelope<A>>>()
+                .map(queue_stats_from_sender)
+        });
+
         #[allow(unused_mut)]
         let mut spec = ChildSpec::new(name, factory, restart_policy)
             .restart_type(restart_type)
             .shutdown_policy(shutdown_policy)
-            .with_shutdown_signal(shutdown_signal);
+            .with_shutdown_signal(shutdown_signal)
+            .with_actor_metrics(metrics)
+            .with_queue_probe(queue_probe);
 
         #[cfg(any(test, feature = "chaos_test"))]
         {
@@ -723,6 +738,7 @@ pub(crate) struct StatefulActorRunner<A: StatefulActor> {
     shutdown_rx: watch::Receiver<bool>,
     supervisor: SupervisorHandle,
     instance_id: usize,
+    metrics: ActorMetrics,
 }
 
 /// Drop guard broadcasting `true` on the instance lifecycle channel whenever the actor task returns or unwinds.
@@ -741,6 +757,7 @@ impl Drop for InstanceCancelGuard {
 }
 
 impl<A: StatefulActor> StatefulActorRunner<A> {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         config: StatefulActorConfig,
         actor: A,
@@ -749,6 +766,7 @@ impl<A: StatefulActor> StatefulActorRunner<A> {
         shutdown_rx: watch::Receiver<bool>,
         supervisor: SupervisorHandle,
         instance_id: usize,
+        metrics: ActorMetrics,
     ) -> Self {
         Self {
             config,
@@ -758,6 +776,7 @@ impl<A: StatefulActor> StatefulActorRunner<A> {
             shutdown_rx,
             supervisor,
             instance_id,
+            metrics,
         }
     }
 
@@ -767,7 +786,10 @@ impl<A: StatefulActor> StatefulActorRunner<A> {
         msg: A::Message,
         ctx: &mut ActorContext<A>,
     ) -> Result<A::Response, ActorError<A::Error>> {
-        if let Some(timeout) = self.config.handler_timeout {
+        let _in_flight = self.metrics.enter_in_flight();
+        let started = std::time::Instant::now();
+
+        let result = if let Some(timeout) = self.config.handler_timeout {
             match tokio::time::timeout(timeout, self.actor.handle(msg, ctx)).await {
                 Ok(Ok(resp)) => Ok(resp),
                 Ok(Err(err)) => Err(ActorError::HandlerFailed(err)),
@@ -786,7 +808,14 @@ impl<A: StatefulActor> StatefulActorRunner<A> {
                 .handle(msg, ctx)
                 .await
                 .map_err(ActorError::HandlerFailed)
-        }
+        };
+
+        self.metrics.record_call(
+            started.elapsed(),
+            matches!(result, Err(ActorError::HandlerFailed(_))),
+            matches!(result, Err(ActorError::Timeout(_))),
+        );
+        result
     }
 
     /// Executes a fire-and-forget (`cast`) message through `actor.handle_cast` with optional timeout.
@@ -795,7 +824,10 @@ impl<A: StatefulActor> StatefulActorRunner<A> {
         msg: A::Message,
         ctx: &mut ActorContext<A>,
     ) -> Result<(), ActorError<A::Error>> {
-        if let Some(timeout) = self.config.handler_timeout {
+        let _in_flight = self.metrics.enter_in_flight();
+        let started = std::time::Instant::now();
+
+        let result = if let Some(timeout) = self.config.handler_timeout {
             match tokio::time::timeout(timeout, self.actor.handle_cast(msg, ctx)).await {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(err)) => Err(ActorError::HandlerFailed(err)),
@@ -812,7 +844,14 @@ impl<A: StatefulActor> StatefulActorRunner<A> {
                 .handle_cast(msg, ctx)
                 .await
                 .map_err(ActorError::HandlerFailed)
-        }
+        };
+
+        self.metrics.record_cast(
+            started.elapsed(),
+            matches!(result, Err(ActorError::HandlerFailed(_))),
+            matches!(result, Err(ActorError::Timeout(_))),
+        );
+        result
     }
 
     /// Drains remaining queued messages in the mailbox and runs `on_stop` before exiting cleanly.
@@ -871,6 +910,7 @@ impl<A: StatefulActor> StatefulActorRunner<A> {
 
     /// Runs the actor lifecycle (`on_start` -> message loop -> `on_stop`).
     pub(crate) async fn run(mut self) -> TaskResult {
+        let _panic_guard = RunnerPanicGuard::new(self.metrics.clone());
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let cancel_guard = InstanceCancelGuard(cancel_tx);
 
@@ -1040,6 +1080,7 @@ impl<A: StatefulActor> StatefulActorRunner<A> {
 ///   `is_closed == true`.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "remote", derive(serde::Serialize, serde::Deserialize))]
 pub struct QueueStats {
     /// Total bounded capacity configured for this mailbox (`StatefulActorBuilder::channel_capacity`).
     pub max_capacity: usize,
@@ -1055,6 +1096,18 @@ impl QueueStats {
     /// Returns `true` if no free slots are currently available in the cached mailbox (`available == 0`).
     pub fn is_full(&self) -> bool {
         self.available == 0
+    }
+}
+
+/// Computes point-in-time [`QueueStats`] from any bounded `tokio::sync::mpsc::Sender`.
+pub(crate) fn queue_stats_from_sender<T>(tx: &Sender<T>) -> QueueStats {
+    let max_capacity = tx.max_capacity();
+    let available = tx.capacity().min(max_capacity);
+    QueueStats {
+        max_capacity,
+        available,
+        queued: max_capacity.saturating_sub(available),
+        is_closed: tx.is_closed(),
     }
 }
 
@@ -1138,14 +1191,7 @@ impl<A: StatefulActor> ActorClient<A> {
     /// rebinding) this reflects the closed mailbox of the exited instance (`is_closed == true`).
     pub fn queue_stats(&self) -> QueueStats {
         let tx = self.current_sender();
-        let max_capacity = tx.max_capacity();
-        let available = tx.capacity().min(max_capacity);
-        QueueStats {
-            max_capacity,
-            available,
-            queued: max_capacity.saturating_sub(available),
-            is_closed: tx.is_closed(),
-        }
+        queue_stats_from_sender(&tx)
     }
 
     /// Reactively waits on the [`SlotState`] watch channel until a replacement actor instance is running,

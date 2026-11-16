@@ -1,6 +1,6 @@
 [package]
 name = "otp-actor"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2024"
 rust-version = "1.88"
 description = "OTP Actor framework for Tokio with supervision tree and resilient resource actor inclusive gRPC remoting inspired by Erlang/OTP"
@@ -65,6 +65,11 @@ required-features = ["remote"]
 [[example]]
 name = "remote_client"
 path = "examples/remote/client.rs"
+required-features = ["remote"]
+
+[[example]]
+name = "remote_monitor"
+path = "examples/remote/monitor.rs"
 required-features = ["remote"]
 
 [profile.release]

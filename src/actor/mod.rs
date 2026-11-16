@@ -98,6 +98,7 @@ pub mod generic_actor;
 pub mod model;
 pub mod stateful_actor;
 pub mod supervisor;
+pub mod telemetry;
 
 // Re-export primary types for a convenient public API
 pub use generic_actor::{
@@ -117,4 +118,10 @@ pub use supervisor::{
     ChildSnapshot, ChildSpec, ChildStatus, ChildStatusWatcher, ShutdownSignalFn, SlotState,
     SpawnContext, SubtreeSnapshot, Supervisor, SupervisorBuilder, SupervisorHandle,
     SupervisorSnapshot, SupervisorTreeSnapshot, UntypedActorFactory, UntypedSender,
+};
+pub use telemetry::{
+    ActorMetrics, ActorMetricsSnapshot, ChildKind, ChildLifecycle, ChildStatusEntry, HealthState,
+    LocalNodeMonitor, NodeHealth, NodeStatus, NodeSummary, RegisteredEndpointStatus,
+    RemoteMetricsSnapshot, StatusOptions, SubtreeStatusEntry, SupervisorStatusNode,
+    format_prometheus_metrics,
 };

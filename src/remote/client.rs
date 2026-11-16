@@ -17,7 +17,7 @@ type MetadataInjector = Arc<dyn Fn(&mut tonic::metadata::MetadataMap) + Send + S
 
 /// Safely converts a [`Duration`] into non-overflowing milliseconds, clamping sub-millisecond
 /// non-zero durations to `1ms` so they do not truncate to `0ms` on the wire.
-fn duration_to_wire_ms(d: Duration) -> u64 {
+pub(crate) fn duration_to_wire_ms(d: Duration) -> u64 {
     if d.is_zero() {
         0
     } else {

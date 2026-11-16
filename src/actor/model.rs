@@ -33,6 +33,7 @@ pub type TaskResult = Result<(), String>;
 /// (modeled after Erlang/OTP child specification restart rules).
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "remote", derive(serde::Serialize, serde::Deserialize))]
 pub enum RestartType {
     /// The child is restarted only if it terminates abnormally (`Err` or panic).
     /// If it terminates normally (`Ok(())`), it is not restarted.
@@ -74,6 +75,7 @@ impl Default for ShutdownPolicy {
 /// Supervision restart strategy governing how sibling children are treated when one child crashes.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "remote", derive(serde::Serialize, serde::Deserialize))]
 pub enum SupervisionStrategy {
     /// Only the crashed child is restarted. Sibling children remain completely unaffected.
     /// Best for independent, shared-nothing actors or sub-supervisors.

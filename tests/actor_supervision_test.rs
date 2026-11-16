@@ -4,11 +4,12 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use otp_actor::actor::{
-    ActorContext, ActorError, ActorScope, CacheState, CallMessage, ChildSpec, ChildStatus,
-    QueueStats, ResourceActor, ResourceError, RestartPolicy, RestartTracker, RestartType,
-    ShutdownPolicy, StatefulActor, StatefulActorBuilder, SupervisionStrategy, Supervisor,
-    SupervisorError, SupervisorSnapshot, SupervisorTreeSnapshot, TimedResource, Worker,
-    WorkerContext,
+    ActorContext, ActorError, ActorScope, CacheState, CallMessage, ChildKind, ChildLifecycle,
+    ChildSpec, ChildStatus, HealthState, LocalNodeMonitor, QueueStats, ResourceActor,
+    ResourceError, RestartPolicy, RestartTracker, RestartType, ShutdownPolicy, StatefulActor,
+    StatefulActorBuilder, StatusOptions, SupervisionStrategy, Supervisor, SupervisorError,
+    SupervisorSnapshot, SupervisorTreeSnapshot, TimedResource, Worker, WorkerContext,
+    format_prometheus_metrics,
 };
 
 #[tokio::test]
@@ -5505,6 +5506,277 @@ async fn test_resource_client_cache_state_perpetual_no_stale_window_and_invalida
     // 4. Explicit shutdown invalidates the cache as well
     short.shutdown().await.unwrap();
     assert_eq!(short.cache_state(), CacheState::Invalidated);
+
+    root.shutdown().await.unwrap();
+}
+
+// ============================================================================
+// Local Operational Telemetry & Prometheus Exposition Tests
+// ============================================================================
+
+#[derive(Clone, Default)]
+struct TelemetryTestActor;
+
+enum TelemetryTestMsg {
+    Ok,
+    DomainErr,
+    Slow(Duration),
+    Panic,
+}
+
+impl StatefulActor for TelemetryTestActor {
+    type Message = TelemetryTestMsg;
+    type Response = &'static str;
+    type Error = &'static str;
+
+    async fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut ActorContext<Self>,
+    ) -> Result<Self::Response, Self::Error> {
+        match msg {
+            TelemetryTestMsg::Ok => Ok("ok"),
+            TelemetryTestMsg::DomainErr => Err("boom"),
+            TelemetryTestMsg::Slow(d) => {
+                tokio::time::sleep(d).await;
+                Ok("slow-ok")
+            }
+            TelemetryTestMsg::Panic => panic!("intentional telemetry test panic"),
+        }
+    }
+
+    async fn handle_cast(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut ActorContext<Self>,
+    ) -> Result<(), Self::Error> {
+        match msg {
+            TelemetryTestMsg::Ok => Ok(()),
+            TelemetryTestMsg::DomainErr => Err("cast-boom"),
+            TelemetryTestMsg::Slow(d) => {
+                tokio::time::sleep(d).await;
+                Ok(())
+            }
+            TelemetryTestMsg::Panic => panic!("intentional telemetry cast panic"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_local_node_monitor_health_and_degraded_recovery() {
+    let root = Supervisor::new("telemetry-health-root");
+    let app_start = std::time::Instant::now() - Duration::from_secs(42);
+    let monitor = LocalNodeMonitor::new(root.clone()).with_started_at(app_start);
+
+    let sync_health = monitor.health();
+    assert!(sync_health.alive);
+    assert_eq!(sync_health.state, HealthState::Healthy);
+    assert!(sync_health.uptime_seconds >= 42);
+
+    let policy = RestartPolicy::new(1, Duration::from_secs(10))
+        .initial_backoff(Duration::from_millis(5))
+        .max_backoff(Duration::from_millis(5));
+    let worker = StatefulActorBuilder::from_default::<TelemetryTestActor>("worker")
+        .restart_type(RestartType::Permanent)
+        .restart_policy(policy)
+        .spawn(&root)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        monitor.health_checked(Duration::from_secs(1)).await.state,
+        HealthState::Healthy
+    );
+
+    // Exhaust worker's restart budget (1 restart allowed -> 2nd panic transitions to Failed)
+    let mut watcher = root.watch_child_status("worker").await.unwrap();
+    let _ = worker.call(TelemetryTestMsg::Panic).await;
+    watcher
+        .wait_for(|s| matches!(s, ChildStatus::Running { instance_id: 2 }))
+        .await
+        .unwrap();
+    let _ = worker.call(TelemetryTestMsg::Panic).await;
+    watcher.wait_for(|s| s.is_failed()).await.unwrap();
+
+    let degraded = monitor.health_checked(Duration::from_secs(1)).await;
+    assert!(degraded.alive);
+    assert_eq!(degraded.state, HealthState::Degraded);
+
+    // Manual recovery restores Healthy
+    root.restart_child("worker").await.unwrap();
+    assert_eq!(
+        monitor.health_checked(Duration::from_secs(1)).await.state,
+        HealthState::Healthy
+    );
+
+    root.shutdown().await.unwrap();
+    let after_shutdown = monitor.health();
+    assert!(!after_shutdown.alive);
+    assert_eq!(after_shutdown.state, HealthState::Unavailable);
+    assert_eq!(
+        monitor.health_checked(Duration::from_millis(200)).await.state,
+        HealthState::Unavailable
+    );
+}
+
+#[tokio::test]
+async fn test_local_node_monitor_status_metrics_queue_cache_and_restarts() {
+    let root = Supervisor::new("telemetry-status-root");
+    let sub = Supervisor::builder("pipeline")
+        .spawn(&root)
+        .await
+        .unwrap();
+
+    let worker = StatefulActorBuilder::from_default::<TelemetryTestActor>("processor")
+        .channel_capacity(16)
+        .handler_timeout(Duration::from_millis(40))
+        .restart_type(RestartType::Permanent)
+        .restart_policy(
+            RestartPolicy::new(5, Duration::from_secs(10))
+                .initial_backoff(Duration::from_millis(5))
+                .max_backoff(Duration::from_millis(5)),
+        )
+        .spawn(&sub)
+        .await
+        .unwrap();
+
+    let token = ResourceActor::builder("api-token")
+        .worker(|_| async {
+            Ok::<_, String>(TimedResource::with_ttl(
+                "secret-value".to_string(),
+                Duration::from_secs(60),
+            ))
+        })
+        .eager_prewarm(true)
+        .spawn(&sub)
+        .await
+        .unwrap();
+    let _ = token.get().await.unwrap();
+
+    // 1. Exercise ok calls, domain error calls, casts, timeout, and panic
+    assert_eq!(worker.call(TelemetryTestMsg::Ok).await.unwrap(), "ok");
+    assert_eq!(
+        worker.call(TelemetryTestMsg::DomainErr).await.unwrap_err(),
+        ActorError::HandlerFailed("boom")
+    );
+    worker.cast(TelemetryTestMsg::Ok).await.unwrap();
+    worker.cast(TelemetryTestMsg::DomainErr).await.unwrap();
+
+    // Sync via a call after casts
+    assert_eq!(worker.call(TelemetryTestMsg::Ok).await.unwrap(), "ok");
+
+    // Timeout triggers restart #1 (instance 1 -> 2)
+    let mut watcher = sub.watch_child_status("processor").await.unwrap();
+    assert!(matches!(
+        worker
+            .call(TelemetryTestMsg::Slow(Duration::from_millis(120)))
+            .await,
+        Err(ActorError::Timeout(_))
+    ));
+    watcher
+        .wait_for(|s| matches!(s, ChildStatus::Running { instance_id: 2 }))
+        .await
+        .unwrap();
+
+    // Panic triggers restart #2 (instance 2 -> 3)
+    let _ = worker.call(TelemetryTestMsg::Panic).await;
+    watcher
+        .wait_for(|s| matches!(s, ChildStatus::Running { instance_id: 3 }))
+        .await
+        .unwrap();
+
+    assert_eq!(worker.call(TelemetryTestMsg::Ok).await.unwrap(), "ok");
+
+    let monitor = LocalNodeMonitor::new(root.clone());
+    let status = monitor.status_default().await.unwrap();
+
+    assert!(status.health.alive);
+    assert_eq!(status.health.state, HealthState::Healthy);
+    assert_eq!(status.summary.total_supervisors, 2);
+    assert_eq!(status.summary.total_actors, 2);
+    assert_eq!(status.summary.running_children, 3); // pipeline + processor + api-token
+    assert_eq!(status.summary.total_restarts, 2);
+    assert_eq!(status.summary.total_calls, 5);
+    assert_eq!(status.summary.total_casts, 2);
+    assert_eq!(status.summary.total_handler_errors, 2);
+    assert_eq!(status.summary.total_timeouts, 1);
+    assert_eq!(status.summary.total_panics, 1);
+    assert_eq!(status.summary.in_flight_calls, 0);
+
+    let tree = status.supervision_tree.as_ref().unwrap();
+    assert_eq!(tree.children.len(), 1);
+    assert_eq!(tree.children[0].kind, ChildKind::Supervisor);
+    let sub_node = tree.subtrees[0].result.as_ref().unwrap();
+
+    let proc_entry = sub_node
+        .children
+        .iter()
+        .find(|c| c.name == "processor")
+        .unwrap();
+    assert_eq!(proc_entry.status, ChildLifecycle::Running);
+    assert_eq!(proc_entry.instance_id, 3);
+    assert_eq!(proc_entry.restarts_total, 2);
+    assert_eq!(proc_entry.queue.unwrap().max_capacity, 16);
+    assert!(proc_entry.metrics.unwrap().ema_latency_us > 0);
+
+    let token_entry = sub_node
+        .children
+        .iter()
+        .find(|c| c.name == "api-token")
+        .unwrap();
+    assert!(matches!(
+        token_entry.cache_state,
+        Some(CacheState::Fresh { .. })
+    ));
+
+    // Compact mode (`include_tree = false`) still keeps summary populated
+    let compact = monitor
+        .status(StatusOptions::new().include_tree(false))
+        .await
+        .unwrap();
+    assert!(compact.supervision_tree.is_none());
+    assert_eq!(compact.summary, status.summary);
+
+    root.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_format_prometheus_metrics_exposition_and_label_escaping() {
+    let root = Supervisor::new("prom\"root\\line\n");
+    let worker = StatefulActorBuilder::from_default::<TelemetryTestActor>("actor\"name")
+        .channel_capacity(8)
+        .spawn(&root)
+        .await
+        .unwrap();
+    let _token = ResourceActor::builder("cache-res")
+        .worker(|_| async { Ok::<_, String>(TimedResource::perpetual("v".to_string())) })
+        .eager_prewarm(true)
+        .spawn(&root)
+        .await
+        .unwrap();
+
+    assert_eq!(worker.call(TelemetryTestMsg::Ok).await.unwrap(), "ok");
+
+    let monitor = LocalNodeMonitor::new(root.clone());
+    let prom = monitor
+        .prometheus_metrics(StatusOptions::default())
+        .await
+        .unwrap();
+
+    assert!(prom.contains("# TYPE otp_actor_node_alive gauge\notp_actor_node_alive 1\n"));
+    assert!(prom.contains("# TYPE otp_actor_summary_restarts_total counter\n"));
+    assert!(prom.contains("otp_actor_calls_total{supervisor=\"prom\\\"root\\\\line\\n\",child=\"actor\\\"name\"} 1\n"));
+    assert!(prom.contains("otp_actor_mailbox_capacity{supervisor=\"prom\\\"root\\\\line\\n\",child=\"actor\\\"name\"} 8\n"));
+    assert!(prom.contains("otp_actor_resource_cache_state{supervisor=\"prom\\\"root\\\\line\\n\",child=\"cache-res\"} 1\n"));
+
+    // Verify `format_prometheus_metrics` also works directly on a compact status without tree
+    let compact = monitor
+        .status(StatusOptions::new().include_tree(false))
+        .await
+        .unwrap();
+    let compact_prom = format_prometheus_metrics(&compact);
+    assert!(compact_prom.contains("otp_actor_node_alive 1\n"));
+    assert!(!compact_prom.contains("otp_actor_child_status"));
 
     root.shutdown().await.unwrap();
 }

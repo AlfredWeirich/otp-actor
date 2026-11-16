@@ -4,7 +4,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-use crate::actor::{ActorClient, StatefulActor};
+use crate::actor::{ActorClient, QueueStats, StatefulActor};
 use crate::remote::proto::call_response::Result as CallResult;
 use crate::remote::proto::remote_error::Kind;
 use crate::remote::proto::{CallResponse, CastResponse, RemoteError};
@@ -117,6 +117,11 @@ pub trait ByteEndpoint: Send + Sync + 'static {
         payload: &'a [u8],
         timeout: Option<Duration>,
     ) -> Pin<Box<dyn Future<Output = CastResponse> + Send + 'a>>;
+
+    /// Returns approximate point-in-time bounded mailbox queue statistics, if available.
+    fn queue_stats(&self) -> Option<QueueStats> {
+        None
+    }
 }
 
 impl<A> ByteEndpoint for ActorClient<A>
@@ -229,6 +234,10 @@ where
                 }
             }
         })
+    }
+
+    fn queue_stats(&self) -> Option<QueueStats> {
+        Some(ActorClient::queue_stats(self))
     }
 }
 

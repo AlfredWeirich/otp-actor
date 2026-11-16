@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, PoisonError, RwLock};
 
-use crate::actor::{ActorClient, StatefulActor};
+use crate::actor::{ActorClient, RegisteredEndpointStatus, StatefulActor};
 use crate::remote::endpoint::ByteEndpoint;
 use crate::remote::proto::RemoteError;
 use crate::remote::proto::remote_error::Kind;
@@ -112,6 +112,52 @@ impl ActorNodeRegistry {
         map.get(service_name)
             .and_then(|actors| actors.get(actor_name))
             .cloned()
+    }
+
+    /// Returns the total number of registered `(service_name, actor_name)` endpoints.
+    pub fn len(&self) -> usize {
+        let map = self
+            .endpoints
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        map.values().map(HashMap::len).sum()
+    }
+
+    /// Returns `true` if no endpoints are currently registered.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Captures point-in-time queue statistics for all registered endpoints, sorted deterministically.
+    pub fn snapshot_endpoints(&self) -> Vec<RegisteredEndpointStatus> {
+        let items: Vec<(String, String, Arc<dyn ByteEndpoint>)> = {
+            let map = self
+                .endpoints
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
+            let mut entries = Vec::new();
+            for (service_name, actors) in map.iter() {
+                for (actor_name, endpoint) in actors.iter() {
+                    entries.push((service_name.clone(), actor_name.clone(), endpoint.clone()));
+                }
+            }
+            entries
+        };
+
+        let mut out: Vec<RegisteredEndpointStatus> = items
+            .into_iter()
+            .map(|(service_name, actor_name, endpoint)| RegisteredEndpointStatus {
+                service_name,
+                actor_name,
+                queue: endpoint.queue_stats(),
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            a.service_name
+                .cmp(&b.service_name)
+                .then_with(|| a.actor_name.cmp(&b.actor_name))
+        });
+        out
     }
 
     /// Resolves the actor endpoint without heap allocations on the hot path,

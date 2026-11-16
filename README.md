@@ -10,7 +10,8 @@
 - **Zero-Cost Pure Traits (Native `impl Future`)**: [`StatefulActor`](src/actor/stateful_actor.rs) and [`Worker`](src/actor/generic_actor.rs) use native RPITIT `impl Future` (Rust `edition = "2024"`)—zero `#[async_trait]`, zero `Box::pin` per message, and zero heavy derive macros.
 - **Bounded Mailboxes & Explicit Backpressure**: Bounded `mpsc` channels (`try_cast()` → `ActorError::MailboxFull`) and bounded single-flight waiter queues (`ResourceError::Overloaded`) prevent runaway memory growth under load.
 - **N-Level OTP Supervision Trees**: Unified recursive [`Supervisor`](src/actor/supervisor.rs) supporting `OneForOne`, `OneForAll`, and `RestForOne` at every depth, sliding-window `RestartPolicy` budgets with exponential backoff, `RestartType`, `ShutdownPolicy`, and parent escalation (`escalate_on_failure`).
-- **Point-to-Point gRPC Remoting (`--features remote`)**: Location-transparent HTTP/2 gRPC ([`RemoteActorClient`](src/remote/client.rs), [`AnyActorClient`](src/remote/client.rs)) with a universal Protobuf envelope ([`proto/actor_node.proto`](proto/actor_node.proto)), bounded 4 MiB `postcard` serialization, and 2-phase `GOAWAY` shutdown—without running a Raft or Gossip cluster.
+- **Point-to-Point gRPC Remoting (`--features remote`)**: Location-transparent HTTP/2 gRPC ([`RemoteActorClient`](src/remote/client.rs), [`AnyActorClient`](src/remote/client.rs)) with a universal Protobuf envelope ([`proto/actor_node.proto`](proto/actor_node.proto)), bounded 4 MiB `postcard` serialization, a separate `ActorNodeAdmin` control-plane service ([`RemoteNodeMonitor`](src/remote/monitor.rs), [`AnyNodeMonitor`](src/remote/monitor.rs)), and 2-phase `GOAWAY` shutdown—without running a Raft or Gossip cluster.
+- **Zero-JSON Operational Telemetry & Prometheus Exposition**: Lock-free per-actor throughput/error/EMA-latency counters ([`ActorMetrics`](src/actor/telemetry.rs)), fast zero-hop health checks & bounded `NodeStatus` snapshots ([`LocalNodeMonitor`](src/actor/telemetry.rs)), and pure OpenMetrics/Prometheus text rendering (`format_prometheus_metrics`) with no HTTP or JSON dependencies.
 
 ---
 
@@ -85,7 +86,7 @@
 | **Restart types** | `RestartType::Transient`, `RestartType::Permanent`, `RestartType::Temporary` |
 | **Graceful shutdown** | `ShutdownPolicy::Timeout(d)`, `BrutalKill`, `Infinity` with mailbox draining & in-flight completion (`supervisor.shutdown()`, `stop_child()`, `delete_child()`) |
 | **Stateful actors** | `StatefulActor` trait (`handle` / `handle_cast`, `CallMessage<A>` / `ask`, `on_start` / `on_stop` hooks, `ActorContext<Self>` with `client()`, `supervisor()`, `send_after()`, `send_interval()` / `send_interval_with()`, `spawn_scoped()` / `ActorScope`, `forward_receiver()`) running alongside `ResourceActor` under the same `Supervisor`s |
-| **Runtime introspection** | Bounded supervisor health snapshots (`snapshot()`, `snapshot_timeout()`, ordered `SupervisorSnapshot` with `ChildStatus`, `RestartType`, `restarts_in_window`, `all_running()` / `any_failed()` helpers), whole-hierarchy views with per-subtree failure isolation (`snapshot_tree()`, `snapshot_tree_timeout()`, `SupervisorTreeSnapshot`), read-only `watch_child_status()` (`ChildStatusWatcher`), non-blocking `ActorClient::queue_stats()`, and 0-hop `ResourceClient::cache_state()` (`CacheState`) |
+| **Runtime introspection & telemetry** | Bounded supervisor snapshots (`snapshot()`, `snapshot_timeout()`, `snapshot_tree()`, `snapshot_tree_timeout()`) with `uptime`, `instance_uptime`, `restarts_total`, `consecutive_failures`, `queue_stats`, `actor_metrics`, and `cache_state`; read-only `watch_child_status()` (`ChildStatusWatcher`); lock-free `ActorMetrics`, `LocalNodeMonitor` (`health()`, `health_checked()`, `status()`), and pure Prometheus text exposition (`format_prometheus_metrics()`, zero HTTP/JSON dependencies) |
 | **Escalation & Recovery** | OTP-grade crash escalation (`escalate_on_failure`), manual recovery API (`restart_child`) |
 | **Crash-loop protection** | `#[non_exhaustive]` `RestartPolicy` builder, `RestartTracker` with capped exponential backoff, permanent-failure `SlotState::Failed` with fast-fail errors |
 | **Zero-hop cache reads** | `ResourceClient::get()` reads fresh values in 0 hops directly from a `tokio::sync::watch` snapshot without crossing the actor mailbox |
@@ -95,7 +96,7 @@
 | **Caching & Resilience** | Per-actor TTL cache, expiry buffer, single-flight coalescing, proactive background refresh with jitter, eager pre-warming, stale-while-error, failure cooldown, generation guards |
 | **Timeouts** | Worker-side (`worker_timeout`, default 30s), handler (`handler_timeout`), and client-side (`get_timeout`, `call_timeout`, `call_retry_timeout`, `cast_timeout`) |
 | **Fault & panic isolation** | Controlled error exits (`TaskResult::Err`, `max_consecutive_failures`, `ctx.fail()`) and panics are caught, escalated, and recovered by the supervisor |
-| **Remote actors (gRPC)** | HTTP/2 actor distribution (`--features remote`), universal Protobuf wire envelope (`actor_node.proto` with `Call`/`Cast` `timeout_ms` & `MAX_RESTARTS_EXCEEDED`), Location Transparency (`RemoteActorClient`, `AnyActorClient`), 4 MiB allocation-bomb defense, coordinated 2-phase shutdown |
+| **Remote actors (gRPC)** | HTTP/2 actor distribution (`--features remote`), universal Protobuf wire envelope (`actor_node.proto` with `ActorNode` `Call`/`Cast` and separate non-breaking `ActorNodeAdmin` `Health`/`Status`), Location Transparency (`RemoteActorClient`, `AnyActorClient`, `RemoteNodeMonitor`, `AnyNodeMonitor`), 4 MiB allocation-bomb defense, coordinated 2-phase shutdown |
 | **Logging** | Structured logging via `tracing` with contextual fields across the entire actor hierarchy |
 | **Chaos testing** | Built-in `simulate_crash()` and `trigger_child_crash()`, feature-gated behind `chaos_test` (auto-enabled in `[dev-dependencies]` for examples & tests) |
 
@@ -153,10 +154,12 @@ flowchart TD
 | --- | --- | --- |
 | `Supervisor`, `SupervisorBuilder`, `SupervisorHandle`, `SupervisorSnapshot`, `SupervisorTreeSnapshot`, `SubtreeSnapshot`, `ChildSnapshot`, `ChildStatus`, `ChildStatusWatcher`, `ChildSpec`, `SpawnContext`, `SlotState` | [`src/actor/supervisor.rs`](src/actor/supervisor.rs) | Unified recursive supervisor (leaf actors and child supervisors to arbitrary depth). Applies `SupervisionStrategy`, tracks restart intensity & wave tickets, publishes reactive `watch::Receiver<SlotState>` slots, exposes bounded introspection snapshots (`snapshot`, `snapshot_timeout`, `snapshot_tree`, `snapshot_tree_timeout`) & read-only status watchers (`watch_child_status`), and provides typed accessors (`get_resource_client`, `get_actor_client`, `get_supervisor`). |
 | `ResourceActor`, `ResourceActorBuilder`, `ResourceActorConfig`, `ResourceClient`, `CacheState`, `Worker`, `TimedResource`, `WorkerContext`, `ResourceError` | [`src/actor/generic_actor.rs`](src/actor/generic_actor.rs) | Caching/refreshing resource actor with 0-hop `watch` cache reads, fluent builder, worker abstraction, non-intrusive cache health (`cache_state`), and self-healing `ResourceClient`. |
-| `StatefulActor`, `StatefulActorBuilder`, `StatefulActorConfig`, `CallMessage`, `ActorClient`, `ActorContext`, `ActorScope`, `ActorControl`, `QueueStats`, `ActorError` | [`src/actor/stateful_actor.rs`](src/actor/stateful_actor.rs) | Zero-cost general-purpose stateful actor (`gen_server` style) with `handle` / `handle_cast` / `ask`, `ActorContext<Self>` timers & scoped stream forwarding (`send_after`, `send_interval`, `send_interval_with`, `spawn_scoped`, `forward_receiver`), backpressure (`try_cast`, `queue_stats`), and self-healing `ActorClient`. |
-| `RemoteActorClient`, `AnyActorClient`, `ActorNodeHandle`, `ActorNodeService`, `ActorNodeRegistry`, `ByteEndpoint`, `RemoteActorError`, `RemoteNodeError` | [`src/remote/mod.rs`](src/remote/mod.rs) | gRPC remote actors (`--features remote`): bounded `postcard` endpoint bridge, typed remote client, location transparency, coordinated 2-phase shutdown. |
-| Protobuf Schema & Build Script | [`proto/actor_node.proto`](proto/actor_node.proto) & [`build.rs`](build.rs) | Compact universal gRPC actor wire contract (`Call`, `Cast`, `RemoteError`), compiled automatically via `tonic-prost-build`. |
+| `StatefulActor`, `StatefulActorBuilder`, `StatefulActorConfig`, `CallMessage`, `ActorClient`, `ActorContext`, `ActorScope`, `ActorControl`, `QueueStats`, `ActorError` | [`src/actor/stateful_actor.rs`](src/actor/stateful_actor.rs) | Zero-cost general-purpose stateful actor (`gen_server` style) with `handle` / `handle_cast` / `ask`, `ActorContext<Self>` timers & scoped stream forwarding (`send_after`, `send_interval`, `send_interval_with`, `spawn_scoped`, `forward_receiver`), backpressure (`try_cast`, `queue_stats`), lock-free `ActorMetrics` instrumentation, and self-healing `ActorClient`. |
+| `LocalNodeMonitor`, `ActorMetrics`, `ActorMetricsSnapshot`, `NodeHealth`, `HealthState`, `NodeStatus`, `NodeSummary`, `StatusOptions`, `RemoteMetricsSnapshot`, `RegisteredEndpointStatus`, `format_prometheus_metrics` | [`src/actor/telemetry.rs`](src/actor/telemetry.rs) | Lock-free actor counters (`in_flight`, `calls_total`, `casts_total`, errors, timeouts, panics, EMA latency), fast `health()` & bounded `status()` aggregation, and pure Prometheus/OpenMetrics text exposition (zero HTTP/JSON dependencies). |
+| `RemoteActorClient`, `AnyActorClient`, `ActorNodeHandle`, `ActorNodeBuilder`, `ActorNodeService`, `ActorNodeAdminService`, `ActorNodeRegistry`, `RemoteNodeMonitor`, `AnyNodeMonitor`, `RemoteMonitorError`, `Authorizer`, `ByteEndpoint`, `RemoteActorError`, `RemoteNodeError` | [`src/remote/mod.rs`](src/remote/mod.rs) | gRPC remote actors (`--features remote`): bounded `postcard` endpoint bridge, typed remote client, location transparency (`AnyActorClient`, `AnyNodeMonitor`), `ActorNodeAdmin` (`Health`/`Status`) control plane, `Authorizer`, and coordinated 2-phase shutdown. |
+| Protobuf Schema & Build Script | [`proto/actor_node.proto`](proto/actor_node.proto) & [`build.rs`](build.rs) | Compact universal gRPC actor wire contract (`ActorNode` `Call`/`Cast` + separate `ActorNodeAdmin` `Health`/`Status`), compiled automatically via `tonic-prost-build`. |
 | `SupervisionStrategy`, `RestartPolicy`, `RestartTracker`, `RestartType`, `ShutdownPolicy`, `SupervisorError`, `TaskResult`, `EXPIRY_BUFFER`, `DEFAULT_SHUTDOWN_TIMEOUT`, `DEFAULT_SNAPSHOT_TIMEOUT` | [`src/actor/model.rs`](src/actor/model.rs) | Shared domain model: strategies, `#[non_exhaustive]` policies & errors, restart types, shutdown policies, sliding-window crash tracking (`restarts_in_window`) & backoff, task exit results. |
+| Local Telemetry Showcase | [`examples/telemetry.rs`](examples/telemetry.rs) | Core-only (`default = []`) telemetry walkthrough: `LocalNodeMonitor` (`health()`, `health_checked()`, `status_default()`), crash-loop `Degraded` -> `Healthy` recovery, `CacheState`, and Prometheus output. |
 | Quickstart (Crash & 0-ms Rebind) | [`examples/quickstart.rs`](examples/quickstart.rs) | 35-line copy-paste showcase: real actor panic isolation and automatic `watch<SlotState>` rebinding. |
 | Microservice Pipeline | [`examples/microservice_pipeline.rs`](examples/microservice_pipeline.rs) | Ingestion worker (`ctx.forward_receiver`, `ctx.send_interval_with`, `ctx.spawn_scoped` / `ActorScope`) + 0-hop `ResourceActor` auth cache (`stale_while_error`, `cache_state()`) + bounded `try_cast`/`queue_stats()` + `ChildStatusWatcher`/`SupervisorSnapshot`/`snapshot_tree()`. |
 | `RestForOne` Pipeline | [`examples/rest_for_one_pipeline.rs`](examples/rest_for_one_pipeline.rs) | 3-stage pipeline isolating panics and restarting only downstream stages (supports `--interactive`). |
@@ -168,8 +171,9 @@ flowchart TD
 | Remote All-in-One Showcase | [`examples/remote/all_in_one.rs`](examples/remote/all_in_one.rs) | Full remote lifecycle: hosting, gRPC client calls, crash self-healing, client-initiated `ctx.stop()`, and 2-phase shutdown. |
 | Remote Server Node (Rechner B) | [`examples/remote/server.rs`](examples/remote/server.rs) | Standalone daemon hosting actors under OTP supervision over network gRPC (default: `http://127.0.0.1:50051`, override via `REMOTE_ADDR`). |
 | Remote Client (Rechner A) | [`examples/remote/client.rs`](examples/remote/client.rs) | Lightweight client invoking remote actors with location transparency and testing crash recovery. |
-| Integration tests | [`tests/actor_supervision_test.rs`](tests/actor_supervision_test.rs) | 86 tests covering recursive supervision, 0-hop caching, stateful actors, timers & stream forwarding, `ActorScope`, runtime introspection (`snapshot`, `snapshot_tree`, `watch_child_status`, `queue_stats`, `cache_state`), restart types, graceful shutdown, timeouts, backpressure, and factory panic isolation. |
-| Remote gRPC tests | [`tests/remote_grpc_test.rs`](tests/remote_grpc_test.rs) | 9 tests covering TCP/HTTP2 transport, location transparency, crash recovery, protocol versioning, request authorization, label sanitization, timeouts, and 2-phase drainage. |
+| Remote Telemetry Monitor | [`examples/remote/monitor.rs`](examples/remote/monitor.rs) | Shows `ActorNodeAdmin` (`Health`/`Status`), Bearer-token `Authorizer`, `AnyNodeMonitor` (`Local` vs. `Remote`), `RemoteMetricsSnapshot`, and remote Prometheus output (`--example remote_monitor`). |
+| Integration tests | [`tests/actor_supervision_test.rs`](tests/actor_supervision_test.rs) | 89 tests covering recursive supervision, 0-hop caching, stateful actors, timers & stream forwarding, `ActorScope`, runtime introspection (`snapshot`, `snapshot_tree`, `watch_child_status`, `queue_stats`, `cache_state`), local telemetry (`LocalNodeMonitor`, `format_prometheus_metrics`), restart types, graceful shutdown, timeouts, backpressure, and factory panic isolation. |
+| Remote gRPC tests | [`tests/remote_grpc_test.rs`](tests/remote_grpc_test.rs) | 11 tests covering TCP/HTTP2 transport, location transparency (`AnyActorClient`, `AnyNodeMonitor`), `ActorNodeAdmin` (`Health`/`Status`), crash recovery, protocol versioning, request authorization, label sanitization, timeouts, and 2-phase drainage. |
 
 ---
 
@@ -200,6 +204,9 @@ cargo run --example minimum
 # Run the microservice ingestion pipeline blueprint (forward_receiver + interval + spawn_scoped + queue_stats + cache_state + snapshot_tree)
 cargo run --example microservice_pipeline
 
+# Run the local operational telemetry & Prometheus exposition example
+cargo run --example telemetry
+
 # Run the RestForOne pipeline demo (or add `-- --interactive` to inject panics manually)
 cargo run --example rest_for_one_pipeline
 
@@ -224,7 +231,10 @@ cargo run --example remote_server --features remote
 # Terminal 2 (Rechner A / Client):
 cargo run --example remote_client --features remote
 
-# Run all 96 core & remote tests (+ 4 doc-tests = 100 total)
+# Run the remote telemetry & AnyNodeMonitor showcase
+cargo run --example remote_monitor --features remote
+
+# Run all 101 core & remote tests (+ 4 doc-tests = 105 total)
 cargo test --all-features
 
 # Optimized build
@@ -238,10 +248,10 @@ To use the crate from another project in the same workspace or from crates.io, a
 
 ```toml
 [dependencies]
-otp-actor = "0.3.2"
+otp-actor = "0.3.3"
 # Optional features:
-# otp-actor = { version = "0.3.2", features = ["remote"] }
-# otp-actor = { version = "0.3.2", features = ["chaos_test"] }
+# otp-actor = { version = "0.3.3", features = ["remote"] }
+# otp-actor = { version = "0.3.3", features = ["chaos_test"] }
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -730,7 +740,7 @@ When built with `--features remote`, the crate enables distributed actor communi
 
 ```toml
 [dependencies]
-otp-actor = { version = "0.3.2", features = ["remote"] }
+otp-actor = { version = "0.3.3", features = ["remote"] }
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 ```
@@ -774,11 +784,12 @@ tokio = { version = "1", features = ["full"] }
  └─────────────────────────────────────────────────────────────────┘
 ```
 
-The remote subsystem is built around four core principles:
+The remote subsystem is built around five core principles:
 1. **Universal Protobuf Wire Contract ([`proto/actor_node.proto`](proto/actor_node.proto))**: A single schema-agnostic `ActorNode` service (`Call` and `Cast` RPCs, both supporting optional `timeout_ms`) transports arbitrary typed messages without modifying or recompiling `.proto` files per actor type.
-2. **Type-Erased Byte Bridging & DoS Defense (`ByteEndpoint`)**: `ByteEndpoint` is implemented directly for `ActorClient<A>`, decoding `postcard` payloads via `postcard::take_from_bytes` with a strict **4 MiB** limit (`MAX_REMOTE_PAYLOAD_BYTES`) and trailing-byte rejection, and forwarding them directly to the actor mailbox. Both `Ok(A::Response)` and domain errors `Err(A::Error)` are serialized symmetrically across the wire.
-3. **Location Transparency (`AnyActorClient<A>`)**: Enum unifier (`AnyActorClient::Local(ActorClient<A>)` | `AnyActorClient::Remote(RemoteActorClient<A>)`) exposing `.call()`, `.call_timeout()`, `.cast()`, and `.cast_timeout()`, mapping local `ActorError<A::Error>` variants (including `MailboxFull` and `MaxRestartsExceeded`) symmetrically into `RemoteActorError<A::Error>`.
-4. **Coordinated 2-Phase Graceful Shutdown**: `ActorNodeHandle::shutdown()` returns `Result<(), RemoteNodeError>`, emits HTTP/2 `GOAWAY`, awaits `serve_with_incoming_shutdown` until active in-flight RPCs drain (bounded by `with_drain_timeout(...)`, default `DEFAULT_DRAIN_TIMEOUT = 10s`), and then calls `SupervisorHandle::shutdown()` so child supervisors and actors stop recursively in reverse registration order according to each `ShutdownPolicy`.
+2. **Non-Breaking Control-Plane Monitoring (`ActorNodeAdmin`)**: A separate `ActorNodeAdmin` service (`Health` and `Status` RPCs) shares the same gRPC port, `Authorizer`, and `ActorNodeHandle` drain state (`HealthState::Draining`) without changing the existing `ActorNode` trait or wire contract, alongside [`RemoteNodeMonitor`](src/remote/monitor.rs) and [`AnyNodeMonitor`](src/remote/monitor.rs).
+3. **Type-Erased Byte Bridging & DoS Defense (`ByteEndpoint`)**: `ByteEndpoint` is implemented directly for `ActorClient<A>`, decoding `postcard` payloads via `postcard::take_from_bytes` with a strict **4 MiB** limit (`MAX_REMOTE_PAYLOAD_BYTES`) and trailing-byte rejection, and forwarding them directly to the actor mailbox. Both `Ok(A::Response)` and domain errors `Err(A::Error)` are serialized symmetrically across the wire.
+4. **Location Transparency (`AnyActorClient<A>` & `AnyNodeMonitor`)**: Enum unifiers (`AnyActorClient::Local` | `AnyActorClient::Remote`, and `AnyNodeMonitor::Local` | `AnyNodeMonitor::Remote`) exposing uniform `.call()`/`.cast()` and `.health()`/`.status()`/`.prometheus_metrics()` APIs, mapping local `ActorError<A::Error>` and `SupervisorError` variants symmetrically into `RemoteActorError`.
+5. **Coordinated 2-Phase Graceful Shutdown**: `ActorNodeHandle::shutdown()` returns `Result<(), RemoteNodeError>`, immediately marks admin health as `HealthState::Draining`, emits HTTP/2 `GOAWAY`, awaits `serve_with_incoming_shutdown` until active in-flight RPCs drain (bounded by `with_drain_timeout(...)`, default `DEFAULT_DRAIN_TIMEOUT = 10s`), and then calls `SupervisorHandle::shutdown()` so child supervisors and actors stop recursively in reverse registration order according to each `ShutdownPolicy`.
 
 ### The Protobuf Contract
 
@@ -796,6 +807,15 @@ service ActorNode {
 
   // Fire-and-forget notification (cast).
   rpc Cast (CastRequest) returns (CastResponse);
+}
+
+// Separate control-plane service for node health and operational telemetry (non-breaking addition).
+service ActorNodeAdmin {
+  // Fast liveness check returning node uptime and availability without mailbox hops.
+  rpc Health (HealthRequest) returns (HealthResponse);
+
+  // Bounded operational status snapshot encoded as postcard (`NodeStatus`).
+  rpc Status (StatusRequest) returns (StatusResponse);
 }
 
 // Universal call envelope carrying an arbitrary serialized payload.
@@ -848,6 +868,36 @@ message RemoteError {
   Kind kind = 1;
   string message = 2;
 }
+
+// Fast liveness probe request.
+message HealthRequest {
+  uint32 protocol_version = 1;
+}
+
+// Fast liveness probe response.
+message HealthResponse {
+  bool alive = 1;
+  uint64 uptime_seconds = 2;
+  // "ok" | "degraded" | "draining" | "unavailable"
+  string state = 3;
+  optional RemoteError framework_error = 4;
+}
+
+// Operational status snapshot request.
+message StatusRequest {
+  uint32 protocol_version = 1;
+  optional uint64 timeout_ms = 2;
+  bool include_tree = 3;
+  bool include_child_details = 4;
+}
+
+// Operational status snapshot response carrying a postcard-serialized `NodeStatus`.
+message StatusResponse {
+  oneof result {
+    bytes status_payload = 1;
+    RemoteError framework_error = 2;
+  }
+}
 ```
 
 ### Running Multi-Process Examples
@@ -875,6 +925,13 @@ Connects to `http://127.0.0.1:50051` (override via `REMOTE_ENDPOINT`), executes 
 To run both server and client together in a single automated showcase:
 ```bash
 cargo run --example remote_all_in_one --features remote
+```
+
+#### Scenario C: Remote Operational Telemetry & `AnyNodeMonitor`
+
+To exercise `ActorNodeAdmin` (`Health` & `Status` RPCs), Bearer-token authorization, remote gRPC counters, and Prometheus exposition:
+```bash
+cargo run --example remote_monitor --features remote
 ```
 
 ### Code Example: Building a Remote Node
@@ -1141,8 +1198,10 @@ Because children are owned by their supervisor, a supervisor crash also replaces
 `otp-actor` provides non-invasive, zero-hot-path-overhead primitives for health endpoints, flapping detection, and lifecycle observation:
 
 - **Bounded supervisor snapshots (`snapshot()` / `snapshot_timeout(d)`):**
-  Returns `SupervisorSnapshot` containing the supervisor's `name`, `instance_id`, `strategy`, and ordered `children: Vec<ChildSnapshot>` (`name`, `status: ChildStatus`, `instance_id`, `restart_type`, `restarts_in_window`). Queries are bounded by `DEFAULT_SNAPSHOT_TIMEOUT` (2 s) or a custom duration (`SupervisorError::Timeout`), ensuring health probes never hang indefinitely if a supervisor is stalled in shutdown or heavy restarts.
-  `SupervisorSnapshot` offers raw inspection helpers (`child(name)`, `all_running()`, `any_failed()`, `any_restarting()`, `running_count()`, `restarting_count()`, `stopped_count()`, `failed_count()`) rather than an opinionated `is_healthy()`, leaving readiness policies (e.g., whether a `Restarting` child in backoff counts as `200 OK` vs `503`) to your service. Snapshot types intentionally omit `serde` because `ChildStatus::Failed(SupervisorError)` and `Instant`-backed restart tracking belong strictly in-process.
+  Returns `SupervisorSnapshot` containing the supervisor's `name`, `instance_id`, `uptime`, `strategy`, and ordered `children: Vec<ChildSnapshot>` (`name`, `status: ChildStatus`, `instance_id`, `instance_uptime`, `restart_type`, `restarts_in_window`, `consecutive_failures`, `restarts_total`, plus optional `queue_stats`, lock-free `actor_metrics`, and `cache_state`). Queries are bounded by `DEFAULT_SNAPSHOT_TIMEOUT` (2 s) or a custom duration (`SupervisorError::Timeout`), ensuring health probes never hang indefinitely if a supervisor is stalled in shutdown or heavy restarts.
+  `SupervisorSnapshot` offers raw inspection helpers (`child(name)`, `all_running()`, `any_failed()`, `any_restarting()`, `running_count()`, `restarting_count()`, `stopped_count()`, `failed_count()`) rather than an opinionated `is_healthy()`, leaving readiness policies (e.g., whether a `Restarting` child in backoff counts as `200 OK` vs `503`) to your service. In-process `SupervisorSnapshot` / `SupervisorTreeSnapshot` types intentionally omit `serde` because `ChildStatus::Failed(SupervisorError)` and `Instant`-backed restart tracking stay in-process, while the dedicated telemetry DTOs (`NodeHealth`, `NodeStatus`) provide portable status snapshots without JSON dependencies.
+- **Node-level operational telemetry & Prometheus exposition (`LocalNodeMonitor`, `ActorMetrics`, `format_prometheus_metrics`):**
+  Every `StatefulActor` automatically records lock-free counters (`in_flight`, `calls_total`, `casts_total`, `handler_errors_total`, `timeouts_total`, `panics_total`, `last_latency_us`, `ema_latency_us`) across restarts. [`LocalNodeMonitor`](src/actor/telemetry.rs) aggregates them with `SupervisorHandle::snapshot_tree_timeout` into `NodeStatus` (`health`, `summary: NodeSummary`, optional `supervision_tree`) and exposes `health()` (zero-hop synchronous liveness), `health_checked(timeout)`, `status(opts)`, and `prometheus_metrics(opts)` (`format_prometheus_metrics`). Override the start timestamp via `.with_started_at(app_start)` to report host-application uptime, and use [`AnyNodeMonitor`](src/remote/monitor.rs) (`--features remote`) to run the exact same calls against remote `ActorNodeAdmin` gRPC endpoints (see [`examples/telemetry.rs`](examples/telemetry.rs) and [`examples/remote/monitor.rs`](examples/remote/monitor.rs)).
 - **Whole-hierarchy snapshots (`snapshot_tree()` / `snapshot_tree_timeout(d)`):**
   Returns a `SupervisorTreeSnapshot { snapshot, subtrees }` that composes the flat per-level `SupervisorSnapshot` with one `SubtreeSnapshot { child_name, result }` per child supervisor (`ChildSnapshot::is_supervisor`), recursively. The `Duration` is **one shared deadline for the whole tree**, child supervisors are queried concurrently, and the recursion runs on the caller side (never inside a supervisor's event loop). Only an unreachable *root* fails the call; a child supervisor that is restarting (`SupervisorUnavailable`), stopped (`ChildNotFound`), permanently failed (its failure reason), or too slow (`Timeout`) is reported as an `Err` in its `SubtreeSnapshot::result` while the rest of the tree is still returned. Helpers: `find(&["mid", "deep"])`, `subtree(name)`, `all_running_deep()`, `any_failed_deep()`, `any_restarting_deep()`, `unavailable_count()`. The tree is collected level by level, so it is not an atomic snapshot across levels.
 - **Zero-channel-duplication status watcher (`watch_child_status(name)`):**
@@ -1187,6 +1246,13 @@ match tokens.cache_state() {
     CacheState::StaleUsable { expired_for } => println!("serving stale for {expired_for:?}"),
     other => println!("not ready: {other:?}"),
 }
+
+// Node-level health, aggregated status & Prometheus text (without HTTP/JSON dependencies):
+let monitor = LocalNodeMonitor::new(root.clone());
+let liveness = monitor.health(); // synchronous zero-hop check
+let status = monitor.status_default().await?;
+println!("calls={}, panics={}", status.summary.total_calls, status.summary.total_panics);
+let prom_text = format_prometheus_metrics(&status);
 ```
 
 ---
@@ -1220,7 +1286,7 @@ match tokens.cache_state() {
 | `resolve_child_channel::<S>(name)` / `resolve_child_channel_untyped(name)` | Low-level endpoint lookup. |
 | `trigger_child_crash(name)` | Chaos *(requires `chaos_test` or test cfg)*: terminates a supervised child with a crash error (`TaskResult::Err`). |
 | `simulate_crash()` | Chaos *(requires `chaos_test` or test cfg)*: terminates this supervisor with a crash error (`TaskResult::Err`). |
-| `name()` | The supervisor's name. |
+| `name()` / `started_at()` / `uptime()` / `is_alive()` | Supervisor name, creation timestamp, elapsed uptime, and zero-hop liveness (`!command_sender.is_closed()`). |
 
 `ResourceClient<T, E>` (cloneable, share it freely across tasks):
 
@@ -1355,8 +1421,8 @@ The output is intentionally verbose (emoji-tagged log lines such as `🔥 Eager 
 ## Testing
 
 ```bash
-cargo test                                            # core suite + doc-tests (86 + 4 = 90)
-cargo test --all-features                             # core, remote gRPC, codec unit & doc-tests (86 + 9 + 1 + 4 = 100)
+cargo test                                            # core suite + doc-tests (89 + 4 = 93)
+cargo test --all-features                             # core, remote gRPC, codec unit & doc-tests (89 + 11 + 1 + 4 = 105)
 cargo test --test actor_supervision_test              # core integration suite only
 cargo test --test remote_grpc_test --features remote  # remote gRPC suite only
 cargo test test_strategy_rest_for_one -- --nocapture  # a single test with logs
@@ -1364,9 +1430,9 @@ cargo test test_strategy_rest_for_one -- --nocapture  # a single test with logs
 
 *(Note: `[dev-dependencies]` enables `otp-actor = { path = ".", features = ["chaos_test"] }`, so integration tests, doc-tests, and examples can call chaos hooks out of the box without exposing them in default production builds.)*
 
-> **Remote test suite ([`tests/remote_grpc_test.rs`](tests/remote_grpc_test.rs)):** 9 tests (7 end-to-end TCP/HTTP2 integration tests + 2 in-process gRPC service unit tests) covering request/response `call`, `cast`, `cast_timeout`, domain error round-tripping, location transparency (`AnyActorClient`), crash recovery over an active channel, wire protocol version checks, request authorization hooks, untrusted label sanitization, timeout clamping, trailing-byte rejection, and coordinated 2-phase graceful shutdown.
+> **Remote test suite ([`tests/remote_grpc_test.rs`](tests/remote_grpc_test.rs)):** 11 tests (8 end-to-end TCP/HTTP2 integration tests + 3 in-process gRPC service unit tests) covering request/response `call`, `cast`, `cast_timeout`, domain error round-tripping, location transparency (`AnyActorClient`, `AnyNodeMonitor`), `ActorNodeAdmin` (`Health` & `Status` RPCs), crash recovery over an active channel, wire protocol version checks, request authorization hooks, untrusted label sanitization, timeout clamping, trailing-byte rejection, and coordinated 2-phase graceful shutdown.
 
-The integration suite in [`tests/actor_supervision_test.rs`](tests/actor_supervision_test.rs) covers 86 deterministic tests:
+The integration suite in [`tests/actor_supervision_test.rs`](tests/actor_supervision_test.rs) covers 89 deterministic tests:
 
 | Topic | Tests |
 | --- | --- |
@@ -1375,7 +1441,7 @@ The integration suite in [`tests/actor_supervision_test.rs`](tests/actor_supervi
 | Restart types & graceful shutdown | `test_restart_type_permanent_restarts_on_normal_exit`, `test_restart_type_transient_stops_on_normal_exit_but_restarts_on_crash`, `test_restart_type_temporary_never_restarts_even_on_crash`, `test_stop_child_completes_in_flight_worker_gracefully`, `test_stop_child_prevents_overlapping_start_child_while_on_stop_running`, `test_shutdown_policy_timeout_aborts_hung_actor`, `test_root_supervisor_graceful_shutdown_cascade`, `test_sequential_graceful_shutdown_in_reverse_registration_order`, `test_stopped_and_deleted_children_do_not_resurrect_on_supervisor_restart`, `test_root_supervisor_drop_aborts_services_even_with_active_handles`, `test_request_shutdown_from_actor_handler_does_not_deadlock` |
 | Stateful actors (`StatefulActor`) | `test_stateful_actor_call_and_cast_with_crash_recovery`, `test_handle_cast_call_message_ask_and_send_after`, `test_try_cast_mailbox_full_and_cast_timeout`, `test_stateful_actor_lifecycle_hooks_on_start_and_on_stop`, `test_mixed_supervision_resource_actor_and_stateful_actor_one_for_all`, `test_stateful_actor_ctx_stop_drains_all_queued_messages`, `test_stateful_actor_graceful_shutdown_drains_messages_queued_after_shutdown_envelope`, `test_stateful_actor_handler_timeout_fails_fast_and_restarts_cleanly`, `test_stateful_actor_non_clone_message_rebind_and_call_retry_mid_handler`, `test_stateful_actor_on_start_failure_triggers_supervisor_recovery` |
 | Timers, streams & scoped tasks | `test_actor_context_send_interval_ticks_abort_and_lifecycle_cancel`, `test_actor_context_send_interval_with_non_clone_and_skips_missed_ticks_under_backpressure`, `test_actor_context_send_interval_cancels_on_panic_and_ignores_zero_or_max_duration`, `test_actor_context_forward_receiver_no_permit_starvation_backpressure_and_cleanup`, `test_actor_context_spawn_scoped_panic_isolation_and_no_cross_instance_leak` |
-| Runtime introspection | `test_restart_tracker_restarts_in_window_ages_out_without_new_crash`, `test_supervisor_snapshot_ordered_children_helpers_and_flapping`, `test_supervisor_snapshot_timeout_during_backoff_and_fast_fail_on_shutdown`, `test_supervisor_watch_child_status_allows_stopped_and_failed_and_observes_transitions`, `test_actor_client_queue_stats_backpressure_and_post_crash_pre_rebind_caveat`, `test_supervisor_snapshot_tree_nested_hierarchy_helpers_find_and_restarting_subtree`, `test_supervisor_snapshot_tree_timeout_isolates_stuck_subtree_and_reports_stopped_and_failed`, `test_resource_client_cache_state_lifecycle_fresh_refresh_due_stale_and_expired`, `test_resource_client_cache_state_perpetual_no_stale_window_and_invalidation` |
+| Runtime introspection & telemetry | `test_restart_tracker_restarts_in_window_ages_out_without_new_crash`, `test_supervisor_snapshot_ordered_children_helpers_and_flapping`, `test_supervisor_snapshot_timeout_during_backoff_and_fast_fail_on_shutdown`, `test_supervisor_watch_child_status_allows_stopped_and_failed_and_observes_transitions`, `test_actor_client_queue_stats_backpressure_and_post_crash_pre_rebind_caveat`, `test_supervisor_snapshot_tree_nested_hierarchy_helpers_find_and_restarting_subtree`, `test_supervisor_snapshot_tree_timeout_isolates_stuck_subtree_and_reports_stopped_and_failed`, `test_resource_client_cache_state_lifecycle_fresh_refresh_due_stale_and_expired`, `test_resource_client_cache_state_perpetual_no_stale_window_and_invalidation`, `test_local_node_monitor_health_and_degraded_recovery`, `test_local_node_monitor_status_metrics_queue_cache_and_restarts`, `test_format_prometheus_metrics_exposition_and_label_escaping` |
 | Crash-loop & backoff | `test_crash_loop_protection`, `test_root_supervisor_crash_loop_protection`, `test_backoff_overflow_prevention`, `test_backoff_decays_after_stability`, `test_supervisor_nonblocking_backoff`, `test_retry_storm_exponential_backoff`, `test_restart_tracker_enforces_max_restarts_when_backoff_exceeds_time_window_and_delete_service`, `test_one_for_all_max_restarts_preserves_stopped_and_removes_temporary_siblings` |
 | Recovery & manual intervention | `test_worker_panic_auto_recovery`, `test_max_consecutive_failures_escalates_without_panic`, `test_one_for_all_survives_and_heals_after_supervisor_crash`, `test_client_channel_rebind_during_slow_backoff`, `test_client_control_commands_rebind_after_crash`, `test_restart_child_recovers_failed_actor`, `test_restart_service_recovers_failed_supervisor`, `test_root_restart_service_honors_shutdown_policy_without_overlap`, `test_delete_and_start_child_during_backoff_ignores_stale_timer`, `test_escalate_on_failure_triggers_root_supervisor_restart`, `test_factory_panic_returns_factory_panicked_and_allows_recovery`, `test_factory_panic_during_auto_recovery_retries_and_escalates` |
 | Child specs | `test_child_spec_builder_pattern`, `test_dynamic_start_child`, `test_child_spec_with_custom_struct_worker`, `test_child_spec_with_closure_capturing_env`, `test_zero_channel_capacity_and_spec_poisoning_protection` |
@@ -1405,16 +1471,19 @@ The integration suite in [`tests/actor_supervision_test.rs`](tests/actor_supervi
 │   │   ├── generic_actor.rs            # Worker trait, ResourceActorBuilder, ResourceActorConfig, ResourceActor, ResourceClient, CacheState
 │   │   ├── stateful_actor.rs           # StatefulActor trait, CallMessage, ActorContext, ActorScope, QueueStats, StatefulActorBuilder, ActorClient
 │   │   ├── model.rs                    # SupervisionStrategy, RestartType, ShutdownPolicy, RestartPolicy, RestartTracker, SupervisorError
-│   │   └── supervisor.rs               # Unified recursive Supervisor, SupervisorHandle, SupervisorSnapshot, SupervisorTreeSnapshot, ChildStatus, ChildStatusWatcher, ChildSpec, SlotState
+│   │   ├── supervisor.rs               # Unified recursive Supervisor, SupervisorHandle, SupervisorSnapshot, SupervisorTreeSnapshot, ChildStatus, ChildStatusWatcher, ChildSpec, SlotState
+│   │   └── telemetry.rs                # ActorMetrics, LocalNodeMonitor, NodeHealth, NodeStatus, NodeSummary, StatusOptions, format_prometheus_metrics
 │   └── remote                          # optional (`--features remote`) distributed gRPC subsystem
 │       ├── mod.rs                      # module docs + public re-exports
 │       ├── client.rs                   # RemoteActorClient, AnyActorClient
 │       ├── endpoint.rs                 # ByteEndpoint trait + bounded postcard codec (MAX_REMOTE_PAYLOAD_BYTES)
 │       ├── error.rs                    # RemoteActorError, RemoteNodeError + gRPC status mapping
-│       ├── proto.rs                    # generated tonic/prost bindings
-│       ├── registry.rs                 # ActorNodeRegistry
-│       └── server.rs                   # ActorNodeService + ActorNodeHandle (2-phase shutdown)
+│       ├── monitor.rs                  # RemoteNodeMonitor, AnyNodeMonitor, RemoteMonitorError
+│       ├── proto.rs                    # generated tonic/prost bindings (`ActorNode` + `ActorNodeAdmin`)
+│       ├── registry.rs                 # ActorNodeRegistry (`snapshot_endpoints`, `len`, `is_empty`)
+│       └── server.rs                   # ActorNodeService, ActorNodeAdminService, ActorNodeBuilder, ActorNodeHandle
 ├── examples
+│   ├── telemetry.rs                    # local telemetry, ActorMetrics, health_checked & Prometheus output
 │   ├── quickstart.rs                   # 35-line panic isolation & 0-ms watch<SlotState> rebind showcase
 │   ├── microservice_pipeline.rs        # ingestion worker (forward_receiver, send_interval_with, spawn_scoped) + auth cache (cache_state) + queue_stats + snapshot/snapshot_tree/watcher
 │   ├── rest_for_one_pipeline.rs        # 3-stage RestForOne panic recovery (automated & --interactive)
@@ -1427,10 +1496,11 @@ The integration suite in [`tests/actor_supervision_test.rs`](tests/actor_supervi
 │       ├── all_in_one.rs               # combined gRPC remote actor showcase
 │       ├── common.rs                   # shared domain actor & messages for remote examples
 │       ├── server.rs                   # standalone gRPC server node
-│       └── client.rs                   # standalone gRPC client
+│       ├── client.rs                   # standalone gRPC client
+│       └── monitor.rs                  # remote telemetry & AnyNodeMonitor showcase (`--example remote_monitor`)
 └── tests
-    ├── actor_supervision_test.rs       # 86 core integration tests
-    └── remote_grpc_test.rs             # 9 gRPC remote tests (`--features remote`)
+    ├── actor_supervision_test.rs       # 89 core integration tests
+    └── remote_grpc_test.rs             # 11 gRPC remote tests (`--features remote`)
 ```
 
 The public API is re-exported from the crate root and `otp_actor::actor`:
@@ -1451,14 +1521,20 @@ use otp_actor::{
     ChildSnapshot, ChildSpec, ChildStatus, ChildStatusWatcher, ShutdownSignalFn, SlotState,
     SpawnContext, SubtreeSnapshot, Supervisor, SupervisorBuilder, SupervisorHandle,
     SupervisorSnapshot, SupervisorTreeSnapshot, UntypedActorFactory, UntypedSender,
+    // operational telemetry & Prometheus exposition
+    ActorMetrics, ActorMetricsSnapshot, ChildKind, ChildLifecycle, ChildStatusEntry, HealthState,
+    LocalNodeMonitor, NodeHealth, NodeStatus, NodeSummary, RegisteredEndpointStatus,
+    RemoteMetricsSnapshot, StatusOptions, SubtreeStatusEntry, SupervisorStatusNode,
+    format_prometheus_metrics,
 };
 
 // With `--features remote`:
 use otp_actor::remote::{
-    ActorNodeBuilder, ActorNodeClient, ActorNodeHandle, ActorNodeRegistry, ActorNodeServer,
-    ActorNodeService, AnyActorClient, Authorizer, ByteEndpoint, DEFAULT_DRAIN_TIMEOUT,
+    ActorNodeAdminClient, ActorNodeAdminServer, ActorNodeAdminService, ActorNodeBuilder,
+    ActorNodeClient, ActorNodeHandle, ActorNodeRegistry, ActorNodeServer, ActorNodeService,
+    AnyActorClient, AnyNodeMonitor, Authorizer, ByteEndpoint, DEFAULT_DRAIN_TIMEOUT,
     DEFAULT_REMOTE_CALL_TIMEOUT, MAX_REMOTE_REQUEST_TIMEOUT, REMOTE_PROTOCOL_VERSION,
-    RemoteActorClient, RemoteActorError, RemoteNodeError,
+    RemoteActorClient, RemoteActorError, RemoteMonitorError, RemoteNodeError, RemoteNodeMonitor,
 };
 ```
 

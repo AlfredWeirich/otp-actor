@@ -17,19 +17,20 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{
     mpsc::{self, Receiver, Sender, WeakSender},
     oneshot, watch,
 };
 use tokio::task::{JoinError, JoinHandle, JoinSet};
 
-use super::generic_actor::{ResourceClient, ResourceEndpoint};
+use super::generic_actor::{CacheState, ResourceClient, ResourceEndpoint};
 use super::model::{
     DEFAULT_SNAPSHOT_TIMEOUT, RestartPolicy, RestartTracker, RestartType, ShutdownPolicy,
     SupervisionStrategy, SupervisorError, TaskResult,
 };
-use super::stateful_actor::{ActorClient, ActorEnvelope, StatefulActor};
+use super::stateful_actor::{ActorClient, ActorEnvelope, QueueStats, StatefulActor};
+use super::telemetry::{ActorMetrics, ActorMetricsSnapshot};
 
 /// Type-erased endpoint handle stored by the supervisor for dynamic client resolution.
 pub type UntypedSender = Arc<dyn Any + Send + Sync>;
@@ -51,6 +52,14 @@ pub type UntypedActorFactory =
 
 /// Optional callback invoked by the supervisor to signal a graceful shutdown or crash to a child.
 pub type ShutdownSignalFn = Arc<dyn Fn(&UntypedSender) + Send + Sync + 'static>;
+
+/// Optional probe invoked during snapshots to read bounded mailbox [`QueueStats`] from an endpoint.
+pub(crate) type QueueProbeFn =
+    Arc<dyn Fn(&UntypedSender) -> Option<QueueStats> + Send + Sync + 'static>;
+
+/// Optional probe invoked during snapshots to read [`CacheState`] from a `ResourceEndpoint`.
+pub(crate) type CacheProbeFn =
+    Arc<dyn Fn(&UntypedSender) -> Option<CacheState> + Send + Sync + 'static>;
 
 /// Reactive lifecycle state published by a [`Supervisor`] for each supervised child slot.
 ///
@@ -156,6 +165,18 @@ pub struct ChildSnapshot {
     /// `false` for leaf actors. Supervisor children can be descended into with
     /// [`SupervisorHandle::snapshot_tree`].
     pub is_supervisor: bool,
+    /// Elapsed uptime of the current child incarnation (`instance_id`).
+    pub instance_uptime: Duration,
+    /// Cumulative number of supervisor restarts executed for this child slot.
+    pub restarts_total: u64,
+    /// Current number of consecutive failures recorded in the child's [`RestartTracker`].
+    pub consecutive_failures: usize,
+    /// Approximate point-in-time bounded mailbox telemetry, if this child exposes one.
+    pub queue_stats: Option<QueueStats>,
+    /// Lock-free actor throughput, error, and latency counters, if this child is a [`StatefulActor`].
+    pub actor_metrics: Option<ActorMetricsSnapshot>,
+    /// Non-intrusive cache classification, if this child is a [`super::generic_actor::ResourceActor`].
+    pub cache_state: Option<CacheState>,
 }
 
 /// Point-in-time introspection snapshot of a [`Supervisor`] and its registered children.
@@ -166,6 +187,8 @@ pub struct SupervisorSnapshot {
     pub name: String,
     /// Current instance ID of this supervisor (`1` initially; increments on restart).
     pub instance_id: usize,
+    /// Elapsed uptime since this supervisor instance started.
+    pub uptime: Duration,
     /// Supervision restart strategy applied by this supervisor.
     pub strategy: SupervisionStrategy,
     /// Supervised children in startup / registration order.
@@ -395,6 +418,9 @@ pub struct ChildSpec {
     pub(crate) crash_signal: Option<ShutdownSignalFn>,
     /// `true` if this spec describes a nested [`Supervisor`] rather than a leaf actor.
     pub(crate) is_supervisor: bool,
+    pub(crate) actor_metrics: Option<ActorMetrics>,
+    pub(crate) queue_probe: Option<QueueProbeFn>,
+    pub(crate) cache_probe: Option<CacheProbeFn>,
 }
 
 impl ChildSpec {
@@ -414,6 +440,9 @@ impl ChildSpec {
             #[cfg(any(test, feature = "chaos_test"))]
             crash_signal: None,
             is_supervisor: false,
+            actor_metrics: None,
+            queue_probe: None,
+            cache_probe: None,
         }
     }
 
@@ -462,6 +491,27 @@ impl ChildSpec {
     #[must_use]
     pub(crate) fn with_crash_signal(mut self, signal: ShutdownSignalFn) -> Self {
         self.crash_signal = Some(signal);
+        self
+    }
+
+    /// Attaches lock-free actor execution metrics to this child specification.
+    #[must_use]
+    pub(crate) fn with_actor_metrics(mut self, metrics: ActorMetrics) -> Self {
+        self.actor_metrics = Some(metrics);
+        self
+    }
+
+    /// Attaches a bounded mailbox queue probe to this child specification.
+    #[must_use]
+    pub(crate) fn with_queue_probe(mut self, probe: QueueProbeFn) -> Self {
+        self.queue_probe = Some(probe);
+        self
+    }
+
+    /// Attaches a cache-state probe to this child specification.
+    #[must_use]
+    pub(crate) fn with_cache_probe(mut self, probe: CacheProbeFn) -> Self {
+        self.cache_probe = Some(probe);
         self
     }
 }
@@ -766,7 +816,12 @@ struct ActiveChild {
     #[cfg(any(test, feature = "chaos_test"))]
     crash_signal: Option<ShutdownSignalFn>,
     is_supervisor: bool,
+    actor_metrics: Option<ActorMetrics>,
+    queue_probe: Option<QueueProbeFn>,
+    cache_probe: Option<CacheProbeFn>,
     instance_id: usize,
+    instance_started_at: Instant,
+    restarts_total: u64,
     spawn_id: u64,
     restart_ticket: u64,
     restart_tracker: RestartTracker,
@@ -796,6 +851,7 @@ impl Drop for TermSignalGuard {
 pub struct Supervisor {
     name: String,
     instance_id: usize,
+    started_at: Instant,
     strategy: SupervisionStrategy,
     child_specs: Arc<RwLock<Vec<ChildSpec>>>,
     escalate_on_failure: bool,
@@ -871,6 +927,7 @@ impl Supervisor {
         Self {
             name,
             instance_id,
+            started_at: Instant::now(),
             strategy,
             child_specs,
             escalate_on_failure,
@@ -971,12 +1028,12 @@ impl Supervisor {
             instance_id: inst_id,
             endpoint: sender.clone(),
         };
-        let slot_tx = if let Some(existing) = self.children.remove(&name) {
+        let (slot_tx, prev_restarts_total) = if let Some(existing) = self.children.remove(&name) {
             existing.slot_tx.send_replace(initial_state);
-            existing.slot_tx.clone()
+            (existing.slot_tx.clone(), existing.restarts_total)
         } else {
             let (tx, _rx) = watch::channel(initial_state);
-            tx
+            (tx, 0)
         };
 
         self.children.insert(
@@ -994,7 +1051,12 @@ impl Supervisor {
                 #[cfg(any(test, feature = "chaos_test"))]
                 crash_signal: spec.crash_signal,
                 is_supervisor: spec.is_supervisor,
+                actor_metrics: spec.actor_metrics,
+                queue_probe: spec.queue_probe,
+                cache_probe: spec.cache_probe,
                 instance_id: inst_id,
+                instance_started_at: Instant::now(),
+                restarts_total: prev_restarts_total,
                 spawn_id,
                 restart_ticket: ticket,
                 restart_tracker: RestartTracker::new(spec.restart_policy),
@@ -1262,7 +1324,12 @@ impl Supervisor {
                         #[cfg(any(test, feature = "chaos_test"))]
                         crash_signal: spec.crash_signal,
                         is_supervisor: spec.is_supervisor,
+                        actor_metrics: spec.actor_metrics,
+                        queue_probe: spec.queue_probe,
+                        cache_probe: spec.cache_probe,
                         instance_id: 1,
+                        instance_started_at: Instant::now(),
+                        restarts_total: 0,
                         spawn_id: 0,
                         restart_ticket: ticket,
                         restart_tracker: RestartTracker::new(spec.restart_policy),
@@ -1368,6 +1435,18 @@ impl Supervisor {
                     restart_type: child.restart_type,
                     restarts_in_window: child.restart_tracker.restarts_in_window(),
                     is_supervisor: child.is_supervisor,
+                    instance_uptime: child.instance_started_at.elapsed(),
+                    restarts_total: child.restarts_total,
+                    consecutive_failures: child.restart_tracker.consecutive_failures(),
+                    queue_stats: child
+                        .queue_probe
+                        .as_ref()
+                        .and_then(|probe| probe(&child.sender)),
+                    actor_metrics: child.actor_metrics.as_ref().map(ActorMetrics::snapshot),
+                    cache_state: child
+                        .cache_probe
+                        .as_ref()
+                        .and_then(|probe| probe(&child.sender)),
                 })
             })
             .collect();
@@ -1375,6 +1454,7 @@ impl Supervisor {
         SupervisorSnapshot {
             name: self.name.clone(),
             instance_id: self.instance_id,
+            uptime: self.started_at.elapsed(),
             strategy: self.strategy,
             children,
         }
@@ -1660,6 +1740,9 @@ impl Supervisor {
                             #[cfg(any(test, feature = "chaos_test"))]
                             crash_signal: entry.crash_signal.clone(),
                             is_supervisor: entry.is_supervisor,
+                            actor_metrics: entry.actor_metrics.clone(),
+                            queue_probe: entry.queue_probe.clone(),
+                            cache_probe: entry.cache_probe.clone(),
                         });
                     }
                 }
@@ -2088,6 +2171,8 @@ impl Supervisor {
                     handle.abort();
                 }
                 entry.instance_id += 1;
+                entry.restarts_total = entry.restarts_total.saturating_add(1);
+                entry.instance_started_at = Instant::now();
                 let new_inst = entry.instance_id;
                 entry.spawn_id = new_spawn_id;
                 entry.phase = ChildPhase::Running;
@@ -2205,6 +2290,7 @@ pub struct SupervisorHandle {
     name: String,
     channel: SupervisorChannel,
     parent: Option<Arc<SupervisorHandle>>,
+    started_at: Instant,
 }
 
 impl std::fmt::Debug for SupervisorHandle {
@@ -2227,6 +2313,7 @@ impl SupervisorHandle {
                 slot_rx: None,
             },
             parent: None,
+            started_at: Instant::now(),
         }
     }
 
@@ -2243,6 +2330,7 @@ impl SupervisorHandle {
                 slot_rx: Some(Arc::new(RwLock::new(slot_rx))),
             },
             parent: Some(Arc::new(parent)),
+            started_at: Instant::now(),
         }
     }
 
@@ -2257,6 +2345,7 @@ impl SupervisorHandle {
                 sender: Arc::new(RwLock::new(sender.clone())),
             },
             parent: parent.map(|p| Arc::new(p.downgrade())),
+            started_at: Instant::now(),
         }
     }
 
@@ -2274,6 +2363,7 @@ impl SupervisorHandle {
                         sender: Arc::new(RwLock::new(weak)),
                     },
                     parent: self.parent.as_ref().map(|p| Arc::new(p.downgrade())),
+                    started_at: self.started_at,
                 }
             }
             SupervisorChannel::Weak { .. } => self.clone(),
@@ -2283,6 +2373,21 @@ impl SupervisorHandle {
     /// Returns the registered name of this [`Supervisor`].
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Returns the [`Instant`] at which this handle's supervisor was created.
+    pub fn started_at(&self) -> Instant {
+        self.started_at
+    }
+
+    /// Returns the elapsed uptime since this handle's supervisor was created.
+    pub fn uptime(&self) -> Duration {
+        self.started_at.elapsed()
+    }
+
+    /// Returns `true` if the supervisor's command channel is still open (zero-hop liveness check).
+    pub fn is_alive(&self) -> bool {
+        self.current_command_sender().is_some()
     }
 
     /// Obtains an active command sender to this supervisor.

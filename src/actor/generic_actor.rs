@@ -34,8 +34,10 @@ use tokio::time::Instant;
 use super::model::{
     EXPIRY_BUFFER, RestartPolicy, RestartType, ShutdownPolicy, SupervisorError, TaskResult,
 };
+use super::stateful_actor::queue_stats_from_sender;
 use super::supervisor::{
-    ChildSpec, ShutdownSignalFn, SlotState, SpawnContext, SupervisorHandle, UntypedActorFactory,
+    CacheProbeFn, ChildSpec, QueueProbeFn, ShutdownSignalFn, SlotState, SpawnContext,
+    SupervisorHandle, UntypedActorFactory,
 };
 
 /// Default execution timeout on asynchronous worker tasks (30 seconds).
@@ -216,6 +218,7 @@ impl<T, E> ResourceEndpoint<T, E> {
 /// state is always safe to log or export as a health metric.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "remote", derive(serde::Serialize, serde::Deserialize))]
 pub enum CacheState {
     /// No resource has been cached yet (cold start, before the first successful worker run).
     Empty,
@@ -564,11 +567,25 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
             }
         });
 
+        let queue_probe: QueueProbeFn = Arc::new(|untyped| {
+            untyped
+                .downcast_ref::<ResourceEndpoint<T, E>>()
+                .map(|ep| queue_stats_from_sender(&ep.sender))
+        });
+
+        let cache_probe: CacheProbeFn = Arc::new(|untyped| {
+            untyped
+                .downcast_ref::<ResourceEndpoint<T, E>>()
+                .map(ResourceEndpoint::cache_state)
+        });
+
         #[allow(unused_mut)]
         let mut spec = ChildSpec::new(name, factory, restart_policy)
             .restart_type(restart_type)
             .shutdown_policy(shutdown_policy)
-            .with_shutdown_signal(shutdown_signal);
+            .with_shutdown_signal(shutdown_signal)
+            .with_queue_probe(queue_probe)
+            .with_cache_probe(cache_probe);
 
         #[cfg(any(test, feature = "chaos_test"))]
         {

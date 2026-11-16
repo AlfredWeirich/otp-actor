@@ -2,17 +2,24 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::oneshot;
 use tonic::{Request, Response, Status};
 
-use crate::actor::SupervisorHandle;
-use crate::remote::endpoint::{MAX_GRPC_FRAME_BYTES, REMOTE_PROTOCOL_VERSION};
+use crate::actor::{
+    DEFAULT_SNAPSHOT_TIMEOUT, HealthState, LocalNodeMonitor, NodeHealth, NodeStatus, NodeSummary,
+    RemoteMetricsSnapshot, StatusOptions, SupervisorError, SupervisorHandle,
+};
+use crate::remote::endpoint::{MAX_GRPC_FRAME_BYTES, REMOTE_PROTOCOL_VERSION, encode_payload};
 use crate::remote::error::RemoteNodeError;
 use crate::remote::proto::call_response::Result as CallResult;
 use crate::remote::proto::remote_error::Kind;
+use crate::remote::proto::status_response::Result as StatusResult;
 use crate::remote::proto::{
-    ActorNode, ActorNodeServer, CallRequest, CallResponse, CastRequest, CastResponse, RemoteError,
+    ActorNode, ActorNodeAdmin, ActorNodeAdminServer, ActorNodeServer, CallRequest, CallResponse,
+    CastRequest, CastResponse, HealthRequest, HealthResponse, RemoteError, StatusRequest,
+    StatusResponse,
 };
 use crate::remote::registry::{ActorNodeRegistry, sanitize_label};
 
@@ -33,6 +40,107 @@ pub type Authorizer = Arc<
         + Sync,
 >;
 
+#[derive(Debug, Default)]
+struct RemoteNodeMetricsInner {
+    grpc_in_flight: AtomicUsize,
+    grpc_calls_total: AtomicU64,
+    grpc_casts_total: AtomicU64,
+    auth_rejected_total: AtomicU64,
+    service_not_found_total: AtomicU64,
+    actor_not_found_total: AtomicU64,
+    incompatible_protocol_total: AtomicU64,
+    framework_errors_total: AtomicU64,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct RemoteNodeMetrics {
+    inner: Arc<RemoteNodeMetricsInner>,
+}
+
+struct GrpcInFlightGuard<'a> {
+    inner: &'a RemoteNodeMetricsInner,
+}
+
+impl Drop for GrpcInFlightGuard<'_> {
+    fn drop(&mut self) {
+        self.inner.grpc_in_flight.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+impl RemoteNodeMetrics {
+    fn enter_in_flight(&self) -> GrpcInFlightGuard<'_> {
+        self.inner.grpc_in_flight.fetch_add(1, Ordering::Relaxed);
+        GrpcInFlightGuard { inner: &self.inner }
+    }
+
+    fn record_call(&self) {
+        self.inner.grpc_calls_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_cast(&self) {
+        self.inner.grpc_casts_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_auth_rejected(&self) {
+        self.inner
+            .auth_rejected_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_remote_error(&self, err: &RemoteError) {
+        self.inner
+            .framework_errors_total
+            .fetch_add(1, Ordering::Relaxed);
+        match Kind::try_from(err.kind) {
+            Ok(Kind::ServiceNotFound) => {
+                self.inner
+                    .service_not_found_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(Kind::ActorNotFound) => {
+                self.inner
+                    .actor_not_found_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(Kind::IncompatibleProtocol) => {
+                self.inner
+                    .incompatible_protocol_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+    }
+
+    pub(crate) fn snapshot(&self, registered_endpoints: usize) -> RemoteMetricsSnapshot {
+        RemoteMetricsSnapshot {
+            registered_endpoints,
+            grpc_in_flight: self.inner.grpc_in_flight.load(Ordering::Relaxed),
+            grpc_calls_total: self.inner.grpc_calls_total.load(Ordering::Relaxed),
+            grpc_casts_total: self.inner.grpc_casts_total.load(Ordering::Relaxed),
+            auth_rejected_total: self.inner.auth_rejected_total.load(Ordering::Relaxed),
+            service_not_found_total: self.inner.service_not_found_total.load(Ordering::Relaxed),
+            actor_not_found_total: self.inner.actor_not_found_total.load(Ordering::Relaxed),
+            incompatible_protocol_total: self
+                .inner
+                .incompatible_protocol_total
+                .load(Ordering::Relaxed),
+            framework_errors_total: self.inner.framework_errors_total.load(Ordering::Relaxed),
+        }
+    }
+}
+
+fn clamp_timeout(
+    client_timeout_ms: Option<u64>,
+    fallback: Option<Duration>,
+    max_request_timeout: Option<Duration>,
+) -> Option<Duration> {
+    let raw = client_timeout_ms.map(Duration::from_millis).or(fallback);
+    match (raw, max_request_timeout) {
+        (Some(d), Some(max)) => Some(d.min(max)),
+        (other, _) => other,
+    }
+}
+
 /// Implementation of the generated `ActorNode` gRPC service.
 #[derive(Clone)]
 pub struct ActorNodeService {
@@ -40,6 +148,7 @@ pub struct ActorNodeService {
     default_call_timeout: Option<Duration>,
     max_request_timeout: Option<Duration>,
     authorizer: Option<Authorizer>,
+    metrics: RemoteNodeMetrics,
 }
 
 impl ActorNodeService {
@@ -51,6 +160,7 @@ impl ActorNodeService {
             default_call_timeout: Some(DEFAULT_REMOTE_CALL_TIMEOUT),
             max_request_timeout: Some(MAX_REMOTE_REQUEST_TIMEOUT),
             authorizer: None,
+            metrics: RemoteNodeMetrics::default(),
         }
     }
 
@@ -75,16 +185,22 @@ impl ActorNodeService {
         self
     }
 
+    pub(crate) fn with_metrics(mut self, metrics: RemoteNodeMetrics) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    /// Returns a point-in-time snapshot of gRPC transport counters for this service.
+    pub fn metrics(&self) -> RemoteMetricsSnapshot {
+        self.metrics.snapshot(self.registry.len())
+    }
+
     fn effective_timeout(
         &self,
         client_timeout_ms: Option<u64>,
         fallback: Option<Duration>,
     ) -> Option<Duration> {
-        let raw = client_timeout_ms.map(Duration::from_millis).or(fallback);
-        match (raw, self.max_request_timeout) {
-            (Some(d), Some(max)) => Some(d.min(max)),
-            (other, _) => other,
-        }
+        clamp_timeout(client_timeout_ms, fallback, self.max_request_timeout)
     }
 }
 
@@ -99,24 +215,32 @@ impl ActorNode for ActorNodeService {
         )
     )]
     async fn call(&self, request: Request<CallRequest>) -> Result<Response<CallResponse>, Status> {
+        let _in_flight = self.metrics.enter_in_flight();
+        self.metrics.record_call();
+
         let (metadata, extensions, req) = request.into_parts();
         let span = tracing::Span::current();
         span.record("service", sanitize_label(&req.service_name).as_str());
         span.record("actor", sanitize_label(&req.actor_name).as_str());
 
-        if let Some(auth) = &self.authorizer {
-            auth(&metadata, &extensions, &req.service_name, &req.actor_name)?;
+        if let Some(auth) = &self.authorizer
+            && let Err(status) = auth(&metadata, &extensions, &req.service_name, &req.actor_name)
+        {
+            self.metrics.record_auth_rejected();
+            return Err(status);
         }
 
         if req.protocol_version != REMOTE_PROTOCOL_VERSION {
+            let remote_err = RemoteError {
+                kind: Kind::IncompatibleProtocol as i32,
+                message: format!(
+                    "Unsupported protocol version {} (expected {})",
+                    req.protocol_version, REMOTE_PROTOCOL_VERSION
+                ),
+            };
+            self.metrics.record_remote_error(&remote_err);
             return Ok(Response::new(CallResponse {
-                result: Some(CallResult::FrameworkError(RemoteError {
-                    kind: Kind::IncompatibleProtocol as i32,
-                    message: format!(
-                        "Unsupported protocol version {} (expected {})",
-                        req.protocol_version, REMOTE_PROTOCOL_VERSION
-                    ),
-                })),
+                result: Some(CallResult::FrameworkError(remote_err)),
             }));
         }
 
@@ -125,6 +249,7 @@ impl ActorNode for ActorNodeService {
         let endpoint = match self.registry.resolve(&req.service_name, &req.actor_name) {
             Ok(ep) => ep,
             Err(remote_err) => {
+                self.metrics.record_remote_error(&remote_err);
                 return Ok(Response::new(CallResponse {
                     result: Some(CallResult::FrameworkError(remote_err)),
                 }));
@@ -132,6 +257,9 @@ impl ActorNode for ActorNodeService {
         };
 
         let response = endpoint.call_bytes(&req.payload, timeout).await;
+        if let Some(CallResult::FrameworkError(ref err)) = response.result {
+            self.metrics.record_remote_error(err);
+        }
         Ok(Response::new(response))
     }
 
@@ -144,24 +272,32 @@ impl ActorNode for ActorNodeService {
         )
     )]
     async fn cast(&self, request: Request<CastRequest>) -> Result<Response<CastResponse>, Status> {
+        let _in_flight = self.metrics.enter_in_flight();
+        self.metrics.record_cast();
+
         let (metadata, extensions, req) = request.into_parts();
         let span = tracing::Span::current();
         span.record("service", sanitize_label(&req.service_name).as_str());
         span.record("actor", sanitize_label(&req.actor_name).as_str());
 
-        if let Some(auth) = &self.authorizer {
-            auth(&metadata, &extensions, &req.service_name, &req.actor_name)?;
+        if let Some(auth) = &self.authorizer
+            && let Err(status) = auth(&metadata, &extensions, &req.service_name, &req.actor_name)
+        {
+            self.metrics.record_auth_rejected();
+            return Err(status);
         }
 
         if req.protocol_version != REMOTE_PROTOCOL_VERSION {
+            let remote_err = RemoteError {
+                kind: Kind::IncompatibleProtocol as i32,
+                message: format!(
+                    "Unsupported protocol version {} (expected {})",
+                    req.protocol_version, REMOTE_PROTOCOL_VERSION
+                ),
+            };
+            self.metrics.record_remote_error(&remote_err);
             return Ok(Response::new(CastResponse {
-                framework_error: Some(RemoteError {
-                    kind: Kind::IncompatibleProtocol as i32,
-                    message: format!(
-                        "Unsupported protocol version {} (expected {})",
-                        req.protocol_version, REMOTE_PROTOCOL_VERSION
-                    ),
-                }),
+                framework_error: Some(remote_err),
             }));
         }
 
@@ -170,6 +306,7 @@ impl ActorNode for ActorNodeService {
         let endpoint = match self.registry.resolve(&req.service_name, &req.actor_name) {
             Ok(ep) => ep,
             Err(remote_err) => {
+                self.metrics.record_remote_error(&remote_err);
                 return Ok(Response::new(CastResponse {
                     framework_error: Some(remote_err),
                 }));
@@ -177,7 +314,249 @@ impl ActorNode for ActorNodeService {
         };
 
         let response = endpoint.cast_bytes(&req.payload, timeout).await;
+        if let Some(ref err) = response.framework_error {
+            self.metrics.record_remote_error(err);
+        }
         Ok(Response::new(response))
+    }
+}
+
+/// Implementation of the generated `ActorNodeAdmin` gRPC service for node health and operational status.
+#[derive(Clone)]
+pub struct ActorNodeAdminService {
+    registry: ActorNodeRegistry,
+    supervisor: Option<SupervisorHandle>,
+    started_at: Instant,
+    draining: Arc<AtomicBool>,
+    metrics: RemoteNodeMetrics,
+    max_request_timeout: Option<Duration>,
+    authorizer: Option<Authorizer>,
+}
+
+impl ActorNodeAdminService {
+    /// Creates an admin service inspecting `registry` and an optional [`SupervisorHandle`].
+    pub fn new(registry: ActorNodeRegistry, supervisor: Option<SupervisorHandle>) -> Self {
+        Self {
+            registry,
+            supervisor,
+            started_at: Instant::now(),
+            draining: Arc::new(AtomicBool::new(false)),
+            metrics: RemoteNodeMetrics::default(),
+            max_request_timeout: Some(MAX_REMOTE_REQUEST_TIMEOUT),
+            authorizer: None,
+        }
+    }
+
+    /// Overrides the reference start timestamp reported as `uptime_seconds`.
+    #[must_use]
+    pub fn with_started_at(mut self, started_at: Instant) -> Self {
+        self.started_at = started_at;
+        self
+    }
+
+    /// Sets the upper bound on `timeout_ms` accepted for `Status` requests.
+    #[must_use]
+    pub fn with_max_request_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.max_request_timeout = timeout;
+        self
+    }
+
+    /// Attaches the request-level [`Authorizer`] invoked with `("__admin", "health" | "status")`.
+    #[must_use]
+    pub fn with_authorizer(mut self, authorizer: Authorizer) -> Self {
+        self.authorizer = Some(authorizer);
+        self
+    }
+
+    pub(crate) fn with_draining(mut self, draining: Arc<AtomicBool>) -> Self {
+        self.draining = draining;
+        self
+    }
+
+    pub(crate) fn with_metrics(mut self, metrics: RemoteNodeMetrics) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    fn compute_fast_health(&self) -> NodeHealth {
+        let uptime_seconds = self.started_at.elapsed().as_secs();
+        if self.draining.load(Ordering::Acquire) {
+            return NodeHealth {
+                alive: false,
+                state: HealthState::Draining,
+                uptime_seconds,
+            };
+        }
+        if let Some(sup) = &self.supervisor
+            && !sup.is_alive()
+        {
+            return NodeHealth {
+                alive: false,
+                state: HealthState::Unavailable,
+                uptime_seconds,
+            };
+        }
+        NodeHealth {
+            alive: true,
+            state: HealthState::Healthy,
+            uptime_seconds,
+        }
+    }
+}
+
+#[tonic::async_trait]
+impl ActorNodeAdmin for ActorNodeAdminService {
+    #[tracing::instrument(name = "grpc_admin_health", skip(self, request))]
+    async fn health(
+        &self,
+        request: Request<HealthRequest>,
+    ) -> Result<Response<HealthResponse>, Status> {
+        let (metadata, extensions, req) = request.into_parts();
+        if let Some(auth) = &self.authorizer
+            && let Err(status) = auth(&metadata, &extensions, "__admin", "health")
+        {
+            self.metrics.record_auth_rejected();
+            return Err(status);
+        }
+
+        if req.protocol_version != REMOTE_PROTOCOL_VERSION {
+            let err = RemoteError {
+                kind: Kind::IncompatibleProtocol as i32,
+                message: format!(
+                    "Unsupported protocol version {} (expected {})",
+                    req.protocol_version, REMOTE_PROTOCOL_VERSION
+                ),
+            };
+            self.metrics.record_remote_error(&err);
+            return Ok(Response::new(HealthResponse {
+                alive: false,
+                uptime_seconds: self.started_at.elapsed().as_secs(),
+                state: HealthState::Unavailable.as_str().to_string(),
+                framework_error: Some(err),
+            }));
+        }
+
+        let health = self.compute_fast_health();
+        Ok(Response::new(HealthResponse {
+            alive: health.alive,
+            uptime_seconds: health.uptime_seconds,
+            state: health.state.as_str().to_string(),
+            framework_error: None,
+        }))
+    }
+
+    #[tracing::instrument(name = "grpc_admin_status", skip(self, request))]
+    async fn status(
+        &self,
+        request: Request<StatusRequest>,
+    ) -> Result<Response<StatusResponse>, Status> {
+        let (metadata, extensions, req) = request.into_parts();
+        if let Some(auth) = &self.authorizer
+            && let Err(status) = auth(&metadata, &extensions, "__admin", "status")
+        {
+            self.metrics.record_auth_rejected();
+            return Err(status);
+        }
+
+        if req.protocol_version != REMOTE_PROTOCOL_VERSION {
+            let err = RemoteError {
+                kind: Kind::IncompatibleProtocol as i32,
+                message: format!(
+                    "Unsupported protocol version {} (expected {})",
+                    req.protocol_version, REMOTE_PROTOCOL_VERSION
+                ),
+            };
+            self.metrics.record_remote_error(&err);
+            return Ok(Response::new(StatusResponse {
+                result: Some(StatusResult::FrameworkError(err)),
+            }));
+        }
+
+        let timeout = clamp_timeout(
+            req.timeout_ms,
+            Some(DEFAULT_SNAPSHOT_TIMEOUT),
+            self.max_request_timeout,
+        )
+        .unwrap_or(DEFAULT_SNAPSHOT_TIMEOUT);
+
+        let opts = StatusOptions::new()
+            .timeout(timeout)
+            .include_tree(req.include_tree)
+            .include_child_details(req.include_child_details);
+
+        let registered_endpoints = self.registry.snapshot_endpoints();
+        let remote_snapshot = self.metrics.snapshot(registered_endpoints.len());
+        let is_draining = self.draining.load(Ordering::Acquire);
+
+        let mut node_status = if let Some(sup) = &self.supervisor {
+            let monitor = LocalNodeMonitor::new(sup.clone()).with_started_at(self.started_at);
+            match monitor.status(opts).await {
+                Ok(status) => status,
+                Err(sup_err) => {
+                    let (kind, message) = match sup_err {
+                        SupervisorError::Timeout(_) => {
+                            (Kind::Timeout as i32, sup_err.to_string())
+                        }
+                        other => (Kind::ActorUnavailable as i32, other.to_string()),
+                    };
+                    let err = RemoteError { kind, message };
+                    self.metrics.record_remote_error(&err);
+                    return Ok(Response::new(StatusResponse {
+                        result: Some(StatusResult::FrameworkError(err)),
+                    }));
+                }
+            }
+        } else {
+            let mut summary = NodeSummary {
+                total_actors: registered_endpoints.len(),
+                ..Default::default()
+            };
+            for ep in &registered_endpoints {
+                if let Some(q) = &ep.queue {
+                    summary.total_queued_messages =
+                        summary.total_queued_messages.saturating_add(q.queued);
+                    if q.is_full() {
+                        summary.full_mailboxes += 1;
+                    }
+                }
+            }
+            NodeStatus {
+                health: self.compute_fast_health(),
+                timestamp_unix: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                summary,
+                supervision_tree: None,
+                remote: None,
+                registered_endpoints: Vec::new(),
+            }
+        };
+
+        if is_draining {
+            node_status.health.alive = false;
+            node_status.health.state = HealthState::Draining;
+        }
+        node_status.remote = Some(remote_snapshot);
+        if req.include_child_details {
+            node_status.registered_endpoints = registered_endpoints;
+        }
+
+        match encode_payload(&node_status) {
+            Ok(bytes) => Ok(Response::new(StatusResponse {
+                result: Some(StatusResult::StatusPayload(bytes)),
+            })),
+            Err(err) => {
+                let remote_err = RemoteError {
+                    kind: Kind::Serialization as i32,
+                    message: format!("Failed to serialize node status payload: {err}"),
+                };
+                self.metrics.record_remote_error(&remote_err);
+                Ok(Response::new(StatusResponse {
+                    result: Some(StatusResult::FrameworkError(remote_err)),
+                }))
+            }
+        }
     }
 }
 
@@ -195,6 +574,7 @@ pub struct ActorNodeBuilder {
     max_request_timeout: Option<Duration>,
     authorizer: Option<Authorizer>,
     drain_timeout: Option<Duration>,
+    started_at: Option<Instant>,
 }
 
 impl ActorNodeBuilder {
@@ -209,7 +589,15 @@ impl ActorNodeBuilder {
             max_request_timeout: Some(MAX_REMOTE_REQUEST_TIMEOUT),
             authorizer: None,
             drain_timeout: Some(DEFAULT_DRAIN_TIMEOUT),
+            started_at: None,
         }
+    }
+
+    /// Overrides the reference start timestamp reported by `ActorNodeAdmin` (`uptime_seconds`).
+    #[must_use]
+    pub fn started_at(mut self, started_at: Instant) -> Self {
+        self.started_at = Some(started_at);
+        self
     }
 
     /// Attaches a [`SupervisorHandle`] to be shut down during Phase 2 of [`ActorNodeHandle::shutdown`].
@@ -255,26 +643,52 @@ impl ActorNodeBuilder {
         self
     }
 
-    fn build_service(&self) -> ActorNodeServer<ActorNodeService> {
-        let mut service = ActorNodeService::new(self.registry.clone())
+    fn build_services(
+        &self,
+        metrics: RemoteNodeMetrics,
+        draining: Arc<AtomicBool>,
+        started_at: Instant,
+    ) -> (
+        ActorNodeServer<ActorNodeService>,
+        ActorNodeAdminServer<ActorNodeAdminService>,
+    ) {
+        let mut node_svc = ActorNodeService::new(self.registry.clone())
             .with_default_call_timeout(self.default_call_timeout)
+            .with_max_request_timeout(self.max_request_timeout)
+            .with_metrics(metrics.clone());
+        let mut admin_svc = ActorNodeAdminService::new(self.registry.clone(), self.supervisor.clone())
+            .with_started_at(started_at)
+            .with_draining(draining)
+            .with_metrics(metrics)
             .with_max_request_timeout(self.max_request_timeout);
+
         if let Some(auth) = &self.authorizer {
-            service = service.with_authorizer(auth.clone());
+            node_svc = node_svc.with_authorizer(auth.clone());
+            admin_svc = admin_svc.with_authorizer(auth.clone());
         }
-        ActorNodeServer::new(service)
-            .max_decoding_message_size(MAX_GRPC_FRAME_BYTES)
-            .max_encoding_message_size(MAX_GRPC_FRAME_BYTES)
+
+        (
+            ActorNodeServer::new(node_svc)
+                .max_decoding_message_size(MAX_GRPC_FRAME_BYTES)
+                .max_encoding_message_size(MAX_GRPC_FRAME_BYTES),
+            ActorNodeAdminServer::new(admin_svc)
+                .max_decoding_message_size(MAX_GRPC_FRAME_BYTES)
+                .max_encoding_message_size(MAX_GRPC_FRAME_BYTES),
+        )
     }
 
-    /// Binds the TCP listener and starts serving the gRPC node.
+    /// Binds the TCP listener and starts serving both `ActorNode` and `ActorNodeAdmin` gRPC services.
     pub async fn start(mut self) -> Result<ActorNodeHandle, RemoteNodeError> {
         let listener = tokio::net::TcpListener::bind(self.addr).await?;
         let local_addr = listener.local_addr()?;
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let started_at = self.started_at.unwrap_or_else(Instant::now);
+        let draining = Arc::new(AtomicBool::new(false));
+        let metrics = RemoteNodeMetrics::default();
 
-        let svc = self.build_service();
-        let router = self.server.add_service(svc);
+        let (node_svc, admin_svc) =
+            self.build_services(metrics.clone(), draining.clone(), started_at);
+        let router = self.server.add_service(node_svc).add_service(admin_svc);
 
         let server_task = tokio::spawn(async move {
             let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
@@ -290,6 +704,9 @@ impl ActorNodeBuilder {
             registry: self.registry,
             supervisor: self.supervisor,
             drain_timeout: self.drain_timeout,
+            started_at,
+            draining,
+            metrics,
             shutdown_tx: Some(shutdown_tx),
             server_task: Some(server_task),
         })
@@ -306,10 +723,17 @@ impl ActorNodeBuilder {
         let listener = tokio::net::TcpListener::bind(self.addr).await?;
         let local_addr = listener.local_addr()?;
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let started_at = self.started_at.unwrap_or_else(Instant::now);
+        let draining = Arc::new(AtomicBool::new(false));
+        let metrics = RemoteNodeMetrics::default();
 
-        let svc =
-            tonic::service::interceptor::InterceptedService::new(self.build_service(), interceptor);
-        let router = self.server.add_service(svc);
+        let (raw_node_svc, raw_admin_svc) =
+            self.build_services(metrics.clone(), draining.clone(), started_at);
+        let node_svc =
+            tonic::service::interceptor::InterceptedService::new(raw_node_svc, interceptor.clone());
+        let admin_svc =
+            tonic::service::interceptor::InterceptedService::new(raw_admin_svc, interceptor);
+        let router = self.server.add_service(node_svc).add_service(admin_svc);
 
         let server_task = tokio::spawn(async move {
             let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
@@ -325,6 +749,9 @@ impl ActorNodeBuilder {
             registry: self.registry,
             supervisor: self.supervisor,
             drain_timeout: self.drain_timeout,
+            started_at,
+            draining,
+            metrics,
             shutdown_tx: Some(shutdown_tx),
             server_task: Some(server_task),
         })
@@ -337,6 +764,9 @@ pub struct ActorNodeHandle {
     registry: ActorNodeRegistry,
     supervisor: Option<SupervisorHandle>,
     drain_timeout: Option<Duration>,
+    started_at: Instant,
+    draining: Arc<AtomicBool>,
+    metrics: RemoteNodeMetrics,
     shutdown_tx: Option<oneshot::Sender<()>>,
     server_task: Option<tokio::task::JoinHandle<Result<(), tonic::transport::Error>>>,
 }
@@ -398,10 +828,21 @@ impl ActorNodeHandle {
         &self.registry
     }
 
+    /// Returns the elapsed uptime of this running gRPC node.
+    pub fn uptime(&self) -> Duration {
+        self.started_at.elapsed()
+    }
+
+    /// Captures a point-in-time snapshot of gRPC transport counters for this node.
+    pub fn remote_metrics(&self) -> RemoteMetricsSnapshot {
+        self.metrics.snapshot(self.registry.len())
+    }
+
     /// Performs a coordinated two-phase graceful shutdown:
     /// 1. Closes the gRPC server (HTTP/2 GOAWAY) and drains active in-flight requests (bounded by `drain_timeout`).
     /// 2. If a `SupervisorHandle` was attached, initiates cascading actor subtree shutdown.
     pub async fn shutdown(mut self) -> Result<(), RemoteNodeError> {
+        self.draining.store(true, Ordering::Release);
         tracing::info!(addr = %self.addr, "Initiating Phase 1: gRPC server shutdown");
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
