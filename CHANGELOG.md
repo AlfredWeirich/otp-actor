@@ -1,0 +1,130 @@
+# Changelog
+
+All notable changes to `otp-actor` are documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+**Minimum Supported Rust Version (MSRV):** Rust 1.88 (`edition = "2024"`)
+
+---
+
+## [0.3.3] - 2026-11-16
+
+`otp-actor` **0.3.3** is a non-breaking observability and remote-telemetry release on top of `0.3.2`.
+
+### Added
+- **Lock-Free Actor Metrics (`src/actor/telemetry.rs`, `src/actor/stateful_actor.rs`, `src/actor/generic_actor.rs`):**
+  - `ActorMetrics` and `ActorMetricsSnapshot` automatically instantiated per `StatefulActorBuilder::build_child_spec` and shared across supervisor restarts.
+  - Tracks `in_flight`, `calls_total`, `casts_total`, `handler_errors_total`, `timeouts_total`, `panics_total`, `last_latency_us`, and lock-free `ema_latency_us` ($\alpha = 0.25$) via `Ordering::Relaxed` atomics, `InFlightGuard`, and `RunnerPanicGuard`.
+  - Wired `QueueProbeFn` on `StatefulActorBuilder` and `ResourceActorBuilder`, plus `CacheProbeFn` on `ResourceActorBuilder`.
+- **Supervisor & Child Uptimes (`src/actor/supervisor.rs`):**
+  - `SupervisorHandle::started_at()`, `SupervisorHandle::uptime()`, and `SupervisorHandle::is_alive()`.
+  - Extended `SupervisorSnapshot` with `uptime: Duration` and `ChildSnapshot` with `instance_uptime`, `restarts_total`, `consecutive_failures`, `queue_stats`, `actor_metrics`, and `cache_state`.
+- **Local Operational Monitoring & Prometheus Exposition (`src/actor/telemetry.rs`, `src/actor/mod.rs`):**
+  - `LocalNodeMonitor` (`new`, `with_started_at`, `health()`, `health_checked(timeout)`, `status(StatusOptions)`, `status_default()`, `prometheus_metrics(StatusOptions)`).
+  - Pure OpenMetrics/Prometheus text exposition via `format_prometheus_metrics(&NodeStatus) -> String` with proper label escaping and zero HTTP or JSON dependencies.
+  - `NodeHealth`, `NodeStatus`, `NodeSummary`, `StatusOptions`, and `SupervisorStatusNode` (supporting `default = []` without `serde`/`serde_json`, and `#[cfg_attr(feature = "remote", ...)]` `Serialize`/`Deserialize` for `postcard` transport).
+- **Non-Breaking Remote gRPC Control Plane (`proto/actor_node.proto`, `src/remote/`):**
+  - Added separate `ActorNodeAdmin` gRPC service (`Health` and `Status` RPCs) hosted alongside `ActorNode` in `ActorNodeBuilder::start` and `start_with_interceptor`.
+  - `ActorNodeAdminService` enforces the configured `Authorizer` (`("__admin", "health" | "status")`), reports `HealthState::Draining` once `ActorNodeHandle::shutdown()` begins Phase 1, and works with or without an attached `SupervisorHandle`.
+  - `RemoteMetricsSnapshot` and `ActorNodeRegistry::snapshot_endpoints()`, `len()`, `is_empty()`, plus `ByteEndpoint::queue_stats()` (defaulted to `{ None }`, implemented for `ActorClient<A>`).
+  - `ActorNodeBuilder::started_at(Instant)`, `ActorNodeHandle::uptime()`, and `ActorNodeHandle::remote_metrics()`.
+  - Location-transparent monitoring via `RemoteNodeMonitor` (`connect`, `connect_with`, `with_request_metadata`, `health`, `health_timeout`, `status`, `status_default`, `prometheus_metrics`), `RemoteMonitorError`, and `AnyNodeMonitor::Local` / `AnyNodeMonitor::Remote`.
+- **Examples & Tests:**
+  - Added [`examples/telemetry.rs`](examples/telemetry.rs) (core) and [`examples/remote/monitor.rs`](examples/remote/monitor.rs) (`remote_monitor`, `--features remote`).
+  - Added 5 new integration tests across [`tests/actor_supervision_test.rs`](tests/actor_supervision_test.rs) (89/89 passing) and [`tests/remote_grpc_test.rs`](tests/remote_grpc_test.rs) (11/11 passing).
+
+### Compatibility
+- 100% backwards-compatible with `0.3.2` (wire protocol `protocol_version = 1` and `ActorNode` trait unchanged; new snapshot/health types marked `#[non_exhaustive]`).
+
+---
+
+## [0.3.2] - 2026-11-11
+
+`otp-actor` **0.3.2** is a non-breaking patch release on top of `0.3.1` focused on examples, documentation, and crates.io publication alignment.
+
+### Changed
+- **Runnable `ctx.spawn_scoped` (`ActorScope`) Showcase ([`examples/microservice_pipeline.rs`](examples/microservice_pipeline.rs)):**
+  - Extended `IngestionWorker::on_start` to run `ctx.send_interval_with`, `ctx.forward_receiver`, and `ctx.spawn_scoped` side by side.
+  - Emits `IngestionMsg::ScopedProbe { from_instance }` asserting `from_instance == ctx.instance_id()` and deterministically verifies via `tokio::sync::watch` exit counts that scoped tasks cancel immediately on instance crash (Phase 4) and shutdown (Phase 5) without leaking onto a restarted replacement instance.
+- **Documentation & Package Metadata ([`Cargo.toml`](Cargo.toml), [`README.md`](README.md)):**
+  - Bumped crate version to `0.3.2` for crates.io publication.
+  - Cross-referenced `examples/microservice_pipeline.rs` under *Timers, streams & scoped background tasks* in `README.md` and updated dependency snippets, component descriptions, and project layout.
+
+### Compatibility
+- 100% backwards-compatible with `0.3.1` (no changes to `src/`).
+- *Note for crates.io users upgrading from `0.3.0`:* Because `0.3.1` was tagged on GitHub without a separate crates.io publish, upgrading from `0.3.0` to `0.3.2` also includes all `0.3.1` changes below.
+
+---
+
+## [0.3.1] - 2026-11-11
+
+`otp-actor` **0.3.1** is a non-breaking feature, observability, and documentation release on top of `0.3.0`.
+
+### Added
+- **Lifecycle-Bound Timers & Cancellation Guards (`src/actor/stateful_actor.rs`):**
+  - `ActorContext::send_interval(period, msg)` and `ActorContext::send_interval_with(period, make_msg)` with `MissedTickBehavior::Skip`, bounded mailbox permit reservation before payload construction, and safe handling of `Duration::ZERO` / overflow-prone durations.
+  - Per-instance `InstanceCancelGuard` (`watch::Sender<bool>`) in `StatefulActorRunner` that automatically cancels `send_after`, `send_interval`, and `send_interval_with` tasks on graceful stop, failure, or panic.
+- **Instance-Pinned Scoped Tasks & Stream Forwarding (`src/actor/stateful_actor.rs`):**
+  - `ActorContext::spawn_scoped(|mut scope: ActorScope<Self>| async move { ... })` providing `is_cancelled()`, `cancelled()`, `cast(msg)`, and `try_cast(msg)` pinned to `(name, instance_id)` so tasks terminate on exit/panic and never leak onto a restarted replacement instance.
+  - `ActorContext::forward_receiver(rx, map_msg)` forwarding external `mpsc::Receiver<T>` items via `cast`, awaiting `rx.recv()` before reserving a mailbox permit.
+- **Runtime Introspection, Tree Snapshots & Health Observation (`src/actor/model.rs`, `src/actor/supervisor.rs`, `src/actor/stateful_actor.rs`, `src/actor/generic_actor.rs`):**
+  - `RestartTracker::restarts_in_window()` with dynamic sliding-window filtering against `RestartPolicy::time_window`.
+  - Bounded `SupervisorHandle::snapshot()` and `snapshot_timeout(Duration)` (`DEFAULT_SNAPSHOT_TIMEOUT = 2s`, returning `SupervisorError::Timeout(Duration)`), plus `SupervisorSnapshot`, `ChildSnapshot` (with `is_supervisor`), and `ChildStatus` (`Running`, `Restarting`, `Stopped`, `Failed`).
+  - Concurrent recursive `SupervisorHandle::snapshot_tree()` and `snapshot_tree_timeout(Duration)` returning `SupervisorTreeSnapshot` and `SubtreeSnapshot` under a single shared deadline with per-subtree failure isolation.
+  - Read-only `SupervisorHandle::watch_child_status(name)` returning `ChildStatusWatcher`.
+  - Lock-free `ActorClient::queue_stats()` returning `QueueStats` (`max_capacity`, `available`, `queued`, `is_closed`, `is_full()`).
+  - Synchronous 0-hop `ResourceClient::cache_state()` returning `CacheState` (`Empty`, `Fresh`, `RefreshDue`, `StaleUsable`, `Expired`, `Invalidated`) without touching the mailbox or exposing cached values.
+  - Re-exported all 10 new public symbols (`DEFAULT_SNAPSHOT_TIMEOUT`, `ActorScope`, `QueueStats`, `CacheState`, `ChildStatus`, `ChildSnapshot`, `SupervisorSnapshot`, `SupervisorTreeSnapshot`, `SubtreeSnapshot`, `ChildStatusWatcher`) from both `otp_actor::actor` and `otp_actor`.
+- **Examples & Documentation:**
+  - Added [`examples/minimum.rs`](examples/minimum.rs), [`examples/quickstart.rs`](examples/quickstart.rs), and [`examples/rest_for_one_pipeline.rs`](examples/rest_for_one_pipeline.rs); extended [`examples/microservice_pipeline.rs`](examples/microservice_pipeline.rs).
+  - Added Sections `3.7` and `4.6` and updated Sections `4.5` and `5.2` in [`docs/actor_model_guide.md`](docs/actor_model_guide.md); updated [`README.md`](README.md).
+  - Configured `[package.metadata.docs.rs] all-features = true` in [`Cargo.toml`](Cargo.toml) and added a `Feature Flags` overview in [`src/lib.rs`](src/lib.rs).
+
+### Compatibility
+- 100% backwards-compatible with `0.3.0` (`SupervisorError` and all new enums/structs carry `#[non_exhaustive]`).
+
+---
+
+## [0.3.0] - 2026-11-10
+
+`otp-actor` **0.3.0** is a major architectural release unifying the supervision tree, introducing a reactive `watch` data plane with 0-hop resource cache reads, expanding `StatefulActor` ergonomics, and gating chaos-testing helpers.
+
+### Added
+- **Unified Recursive `Supervisor` (`src/actor/supervisor.rs`, `src/actor/model.rs`):**
+  - Single composable `Supervisor` supporting arbitrary `N`-level nesting (`OneForOne`, `OneForAll`, `RestForOne`) via `Supervisor::new`, `new_root`, `with_strategy`, `builder`, `spawn_child`, `spawn_child_with_strategy`, and `SupervisorBuilder::add_child(impl Into<ChildSpec>)`.
+  - Nested supervisors default to `ShutdownPolicy::Infinity` for reverse-order subtree teardown.
+  - Typed lookups on `SupervisorHandle`: `get_resource_client::<T, E>`, `get_actor_client::<A>`, `get_supervisor`, and `request_shutdown()`.
+  - Child factory panic isolation (`SupervisorError::FactoryPanicked`) and monotonic supervisor-wide `spawn_id` tracking to prevent stale-exit ABA races.
+  - `RestartPolicy::new(max_restarts, time_window)` with fluent setters; encapsulated `RestartTracker` behind `policy()` and `consecutive_failures()`.
+- **Reactive `watch` Rebinding & 0-Hop Resource Cache (`src/actor/generic_actor.rs`):**
+  - `ResourceClient::get()` serves fresh values lock-free in 0 hops from `watch::Receiver<Option<ResourceSnapshot<T>>>`, falling back to the coalesced mailbox path only for cold starts, refreshes, or stale/expired recovery.
+  - Zero-polling lifecycle rebinding across `ResourceClient`, `ActorClient`, and `SupervisorHandle` via `watch::Receiver<SlotState>`.
+- **`StatefulActor` Ergonomics & Backpressure (`src/actor/stateful_actor.rs`):**
+  - Optional `StatefulActor::handle_cast` hook and typed sub-message responses via `CallMessage<A>` + `ActorClient::ask()`.
+  - `ActorContext<Self>` with `client()`, `supervisor()`, and `send_after(delay, msg)`.
+  - Non-blocking `ActorClient::try_cast(msg)` (`ActorError::MailboxFull`), `cast_timeout()`, and `call_retry_timeout()`.
+- **Remote gRPC Enhancements (`--features remote`, `proto/actor_node.proto`):**
+  - Bounded `postcard` 1.1.3 wire serialization (4 MiB cap) with trailing-byte rejection, replacing `bincode`.
+  - Protocol versioning (`protocol_version = 5`, `REMOTE_PROTOCOL_VERSION = 1`, `INCOMPATIBLE_PROTOCOL = 10`), server-side timeout caps (`DEFAULT_REMOTE_CALL_TIMEOUT = 30s`, `MAX_REMOTE_REQUEST_TIMEOUT = 300s`), sanitized tracing/errors, and `ActorNodeBuilder` (`server`, `authorizer`, `start_with_interceptor`) alongside `RemoteActorClient::connect_with` and `with_request_metadata`.
+  - `CastRequest.timeout_ms` propagated by `RemoteActorClient::cast_timeout` and `AnyActorClient::cast_timeout`.
+  - `RemoteError::Kind::MAX_RESTARTS_EXCEEDED = 9` (`RemoteActorError::MaxRestartsExceeded`), `RemoteNodeError`, and `ActorNodeHandle::start` accepting `Option<SupervisorHandle>` for Phase-2 subtree teardown.
+- **Feature-Gated Chaos Engineering (`chaos_test`):**
+  - `ResourceClient::simulate_crash()`, `ActorClient::simulate_crash()`, `SupervisorHandle::simulate_crash()`, and `SupervisorHandle::trigger_child_crash()` gated behind `#[cfg(any(test, feature = "chaos_test"))]` (enabled in `[dev-dependencies]`).
+
+### Changed & Breaking Changes (from `0.2.x` to `0.3.0`)
+- Marked core config, policy, and error enums/structs as `#[non_exhaustive]` (`SupervisionStrategy`, `RestartType`, `ShutdownPolicy`, `RestartPolicy`, `SupervisorError`, `ResourceActorConfig`, `StatefulActorConfig`, `ResourceError`, `ActorError`, `RemoteActorError`, `RemoteNodeError`).
+- Renamed/unified symbols:
+  - `RootSupervisor` / `ServiceSupervisor` (`*Handle`, `*Builder`) → `Supervisor` / `SupervisorHandle` / `SupervisorBuilder`
+  - `ServiceSupervisor::spawn_and_register(name, &root)` → `Supervisor::spawn_child(name, &root)` / `Supervisor::builder(name).spawn(&root)`
+  - `RootError` / `ServiceError` → `SupervisorError` (`ResourceError::Supervisor`, `ActorError::Supervisor`)
+  - `service.get_client::<T, E>(name)` → `supervisor.get_resource_client::<T, E>(name)`
+  - `root.resolve_service_handle(name)` → `supervisor.get_supervisor(name)`
+  - `resolve_actor_channel*` / `resolve_service_channel` → `resolve_child_channel::<S>(name)` / `resolve_child_channel_untyped(name)`
+  - `GenericResourceActor` / `ActorConfig` / `ActorBuilder` / `GenericResourceActorBuilder` → `ResourceActor` / `ResourceActorConfig` / `ResourceActorBuilder`
+  - `ResourceActor::builder(name).spawn_and_register(&svc, &root)` → `ResourceActor::builder(name).spawn(&supervisor)`
+  - `ActorContext` → `ActorContext<Self>`
+  - `stop_service` / `restart_service` / `delete_service` → `stop_child` / `restart_child` / `delete_child`
+  - `trigger_service_crash()` → `supervisor.simulate_crash()` / `parent.trigger_child_crash(name)` *(requires `chaos_test`)*
+  - `ActorNodeHandle::start(addr, reg, Option<RootSupervisorHandle>)` → `ActorNodeHandle::start(addr, reg, Option<SupervisorHandle>)`
+- For detailed migration code examples, see [`Release_note_0.3.0.md`](Release_note_0.3.0.md).
