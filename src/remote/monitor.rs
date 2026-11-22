@@ -9,7 +9,7 @@ use crate::actor::{
     HealthState, LocalNodeMonitor, NodeHealth, NodeStatus, StatusOptions, SupervisorError,
     SupervisorHandle, format_prometheus_metrics,
 };
-use crate::remote::client::duration_to_wire_ms;
+use crate::remote::client::{duration_to_wire_ms, server_budget_for_deadline};
 use crate::remote::endpoint::{MAX_GRPC_FRAME_BYTES, REMOTE_PROTOCOL_VERSION, decode_payload};
 use crate::remote::error::RemoteActorError;
 use crate::remote::proto::status_response::Result as StatusResult;
@@ -78,11 +78,8 @@ impl RemoteNodeMonitor {
         &self.channel
     }
 
-    fn prepare_request<T>(&self, body: T, timeout: Option<Duration>) -> tonic::Request<T> {
+    fn prepare_request<T>(&self, body: T) -> tonic::Request<T> {
         let mut request = tonic::Request::new(body);
-        if let Some(dur) = timeout {
-            request.set_timeout(dur);
-        }
         if let Some(injector) = &self.metadata_injector {
             injector(request.metadata_mut());
         }
@@ -92,27 +89,21 @@ impl RemoteNodeMonitor {
     /// Queries fast liveness status (`Health` RPC) from the remote node.
     #[tracing::instrument(skip(self), err)]
     pub async fn health(&self) -> Result<NodeHealth, RemoteMonitorError> {
-        self.health_internal(None).await
+        self.health_internal().await
     }
 
     /// Queries fast liveness status (`Health` RPC) bounded by `timeout`.
     #[tracing::instrument(skip(self), err)]
     pub async fn health_timeout(&self, timeout: Duration) -> Result<NodeHealth, RemoteMonitorError> {
-        tokio::time::timeout(timeout, self.health_internal(Some(timeout)))
+        tokio::time::timeout(timeout, self.health_internal())
             .await
             .map_err(|_| RemoteActorError::Timeout)?
     }
 
-    async fn health_internal(
-        &self,
-        timeout: Option<Duration>,
-    ) -> Result<NodeHealth, RemoteMonitorError> {
-        let req = self.prepare_request(
-            HealthRequest {
-                protocol_version: REMOTE_PROTOCOL_VERSION,
-            },
-            timeout,
-        );
+    async fn health_internal(&self) -> Result<NodeHealth, RemoteMonitorError> {
+        let req = self.prepare_request(HealthRequest {
+            protocol_version: REMOTE_PROTOCOL_VERSION,
+        });
         let mut client = self.client.clone();
         let resp = client.health(req).await?.into_inner();
         if let Some(err) = resp.framework_error {
@@ -137,7 +128,8 @@ impl RemoteNodeMonitor {
     #[tracing::instrument(skip(self), err)]
     pub async fn status(&self, opts: StatusOptions) -> Result<NodeStatus, RemoteMonitorError> {
         let timeout = opts.timeout;
-        tokio::time::timeout(timeout, self.status_internal(opts))
+        let server_tree_budget = server_budget_for_deadline(timeout);
+        tokio::time::timeout(timeout, self.status_internal(opts, server_tree_budget))
             .await
             .map_err(|_| RemoteActorError::Timeout)?
     }
@@ -150,16 +142,14 @@ impl RemoteNodeMonitor {
     async fn status_internal(
         &self,
         opts: StatusOptions,
+        server_tree_budget: Duration,
     ) -> Result<NodeStatus, RemoteMonitorError> {
-        let req = self.prepare_request(
-            StatusRequest {
-                protocol_version: REMOTE_PROTOCOL_VERSION,
-                timeout_ms: Some(duration_to_wire_ms(opts.timeout)),
-                include_tree: opts.include_tree,
-                include_child_details: opts.include_child_details,
-            },
-            Some(opts.timeout),
-        );
+        let req = self.prepare_request(StatusRequest {
+            protocol_version: REMOTE_PROTOCOL_VERSION,
+            timeout_ms: Some(duration_to_wire_ms(server_tree_budget)),
+            include_tree: opts.include_tree,
+            include_child_details: opts.include_child_details,
+        });
 
         let mut client = self.client.clone();
         let resp = client.status(req).await?.into_inner();

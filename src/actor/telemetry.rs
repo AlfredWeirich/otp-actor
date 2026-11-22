@@ -997,6 +997,21 @@ pub fn format_prometheus_metrics(status: &NodeStatus) -> String {
 
         let _ = writeln!(
             out,
+            "# HELP otp_actor_remote_incompatible_protocol_total Total gRPC requests rejected due to unsupported wire protocol_version."
+        );
+        let _ = writeln!(
+            out,
+            "# TYPE otp_actor_remote_incompatible_protocol_total counter"
+        );
+        let _ = writeln!(
+            out,
+            "otp_actor_remote_incompatible_protocol_total {}",
+            remote.incompatible_protocol_total
+        );
+        out.push('\n');
+
+        let _ = writeln!(
+            out,
             "# HELP otp_actor_remote_framework_errors_total Total framework-level errors returned over gRPC."
         );
         let _ = writeln!(out, "# TYPE otp_actor_remote_framework_errors_total counter");

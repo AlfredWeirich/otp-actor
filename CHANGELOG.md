@@ -37,6 +37,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   - Added `TimedResource::{is_still_usable_at, is_usable_stale_at}` so `ResourceClient::get()` and `ResourceEndpoint::cache_state()` perform at most one `Instant::now()` call (and zero clock calls for perpetual resources with no refresh threshold).
 
 ### Fixed
+- **Reserve Transport Headroom Between Server Timeout Budget & Client Deadline (`src/remote/{client,monitor}.rs`, Finding `F-17`):**
+  - Added `server_budget_for_deadline` (reserving up to `min(deadline / 4, 100ms)` of transport/serialization headroom) for `RemoteActorClient::{call_timeout, cast_timeout}` and `RemoteNodeMonitor::status`, and removed redundant per-request `tonic::Request::set_timeout` timers already enforced by the outer `tokio::time::timeout`.
+  - Prevents premature HTTP/2 `RST_STREAM` cancellations so degraded `NodeStatus` snapshots (when a subtree hangs) and structured server `Kind::Timeout` responses (and server `framework_errors_total` accounting) arrive cleanly within the client's deadline.
+- **Export Missing `otp_actor_remote_incompatible_protocol_total` Prometheus Metric (`src/actor/telemetry.rs`, Finding `F-16`):**
+  - Exported `RemoteMetricsSnapshot::incompatible_protocol_total` as `otp_actor_remote_incompatible_protocol_total` (`counter`) in `format_prometheus_metrics`, aligning Prometheus text exposition with all `RemoteNodeMetrics` counters.
 - **Abort Dependent Restarts on Factory Panic & Cancel Backoff Tasks on Shutdown (`src/actor/supervisor.rs`, Finding `F-07`):**
   - Under `SupervisionStrategy::OneForAll` / `RestForOne`, when a predecessor's child factory panics during a manual `restart_child`, `Supervisor::execute_restart` now aborts spawning subsequent dependent siblings and transitions their slots to `Failed(FactoryPanicked(...))` so clients fail fast and a follow-up `restart_child` can recover the entire group.
   - Coupled backoff sleep tasks in `handle_child_failure` to both `shutdown_rx` and `scheduled_restart_tx.closed()` (and closed `scheduled_restart_rx` at shutdown entry) so pending backoff timers terminate immediately on supervisor shutdown.

@@ -1425,7 +1425,7 @@ The output is intentionally verbose (emoji-tagged log lines such as `🔥 Eager 
 
 ```bash
 cargo test                                            # core suite + doc-tests (108 + 4 = 112)
-cargo test --all-features                             # core, remote gRPC, codec unit & doc-tests (108 + 11 + 1 + 4 = 124)
+cargo test --all-features                             # core, remote gRPC, codec unit & doc-tests (108 + 12 + 1 + 4 = 125)
 cargo test --test actor_supervision_test              # core integration suite only
 cargo test --test remote_grpc_test --features remote  # remote gRPC suite only
 cargo test test_strategy_rest_for_one -- --nocapture  # a single test with logs
@@ -1433,7 +1433,7 @@ cargo test test_strategy_rest_for_one -- --nocapture  # a single test with logs
 
 *(Note: `[dev-dependencies]` enables `otp-actor = { path = ".", features = ["chaos_test"] }`, so integration tests, doc-tests, and examples can call chaos hooks out of the box without exposing them in default production builds.)*
 
-> **Remote test suite ([`tests/remote_grpc_test.rs`](tests/remote_grpc_test.rs)):** 11 tests (8 end-to-end TCP/HTTP2 integration tests + 3 in-process gRPC service unit tests) covering request/response `call`, `cast`, `cast_timeout`, domain error round-tripping, location transparency (`AnyActorClient`, `AnyNodeMonitor`), `ActorNodeAdmin` (`Health` & `Status` RPCs), crash recovery over an active channel, wire protocol version checks, request authorization hooks, untrusted label sanitization, timeout clamping, trailing-byte rejection, and coordinated 2-phase graceful shutdown.
+> **Remote test suite ([`tests/remote_grpc_test.rs`](tests/remote_grpc_test.rs)):** 12 tests (9 end-to-end TCP/HTTP2 integration tests + 3 in-process gRPC service unit tests) covering request/response `call`, `cast`, `cast_timeout`, domain error round-tripping, location transparency (`AnyActorClient`, `AnyNodeMonitor`), `ActorNodeAdmin` (`Health` & `Status` RPCs including degraded snapshots when a subtree hangs), crash recovery over an active channel, wire protocol version checks, request authorization hooks, untrusted label sanitization, timeout clamping & headroom budgeting, trailing-byte rejection, and coordinated 2-phase graceful shutdown.
 
 The integration suite in [`tests/actor_supervision_test.rs`](tests/actor_supervision_test.rs) covers 108 deterministic tests:
 

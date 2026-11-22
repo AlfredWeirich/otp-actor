@@ -315,7 +315,8 @@ async fn test_remote_grpc_call_timeout() -> Result<(), Box<dyn std::error::Error
     )
     .await?;
 
-    // Request takes 200ms, but timeout deadline is 50ms
+    // Request takes 200ms, but client deadline is 50ms (server budget reserves headroom, so
+    // the server records and returns a structured Kind::Timeout before the client cancels HTTP/2)
     let err = remote_client
         .call_timeout(
             CalcMsg::Delay(Duration::from_millis(200)),
@@ -327,6 +328,11 @@ async fn test_remote_grpc_call_timeout() -> Result<(), Box<dyn std::error::Error
         Err(RemoteActorError::Timeout) => (),
         other => panic!("Expected Timeout, got {other:?}"),
     }
+    assert_eq!(
+        node.remote_metrics().framework_errors_total,
+        1,
+        "server should return structured Kind::Timeout before client cancels the HTTP/2 stream"
+    );
 
     node.shutdown().await?;
     Ok(())
@@ -872,6 +878,14 @@ async fn test_admin_service_health_status_authorizer_and_registry_only_mode() {
         decoded.registered_endpoints[0].queue.unwrap().max_capacity,
         12
     );
+    assert_eq!(
+        decoded.remote.as_ref().unwrap().incompatible_protocol_total,
+        1
+    );
+    let prom = otp_actor::format_prometheus_metrics(&decoded);
+    assert!(prom.contains("# HELP otp_actor_remote_incompatible_protocol_total "));
+    assert!(prom.contains("# TYPE otp_actor_remote_incompatible_protocol_total counter\n"));
+    assert!(prom.contains("otp_actor_remote_incompatible_protocol_total 1\n"));
 
     // Ensure StatusOptions::default() stays aligned
     assert!(StatusOptions::default().include_tree);
@@ -978,11 +992,84 @@ async fn test_remote_node_monitor_and_any_node_monitor_end_to_end()
         .await?;
     assert!(prom.contains("otp_actor_remote_grpc_calls_total 3\n"));
     assert!(prom.contains("otp_actor_remote_not_found_total{kind=\"actor\"} 1\n"));
+    assert!(prom.contains("otp_actor_remote_incompatible_protocol_total 0\n"));
     assert!(prom.contains("otp_actor_calls_total{supervisor=\"e2e-admin-root/calc-svc\",child=\"calc\"} 2\n"));
 
     // 4. Local handle counters match
     assert_eq!(node.remote_metrics().grpc_calls_total, 3);
 
+    node.shutdown().await?;
+    Ok(())
+}
+
+// ----------------------------------------------------------------------------
+// Test 12: RemoteNodeMonitor::status Receives Degraded Snapshot When Subtree Hangs (F-17)
+// ----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_remote_monitor_status_receives_degraded_snapshot_when_subtree_hangs()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use otp_actor::actor::{HealthState, StatusOptions};
+    use otp_actor::remote::{ActorNodeBuilder, RemoteNodeMonitor};
+
+    let root = Supervisor::new("f17-degraded-root");
+    let healthy_svc = Supervisor::builder("healthy-svc").spawn(&root).await?;
+    let healthy_calc = StatefulActorBuilder::from_default::<CalculatorActor>("calc-ok")
+        .spawn(&healthy_svc)
+        .await?;
+
+    let stuck_svc = Supervisor::builder("stuck-svc").spawn(&root).await?;
+    let stuck_calc = StatefulActorBuilder::from_default::<CalculatorActor>("calc-stuck")
+        .shutdown_timeout(Duration::from_millis(700))
+        .spawn(&stuck_svc)
+        .await?;
+
+    let registry = ActorNodeRegistry::new();
+    registry.register("healthy-svc", "calc-ok", healthy_calc);
+
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let node = ActorNodeBuilder::new(bind_addr, registry)
+        .supervisor(root)
+        .start()
+        .await?;
+    let endpoint_url = format!("http://{}", node.local_addr());
+
+    // Block `stuck-svc`'s command loop while waiting for its child's in-flight delay during shutdown
+    stuck_calc
+        .cast(CalcMsg::Delay(Duration::from_millis(500)))
+        .await?;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let stuck_for_shutdown = stuck_svc.clone();
+    let shutdown_task = tokio::spawn(async move { stuck_for_shutdown.shutdown().await });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let remote_monitor = RemoteNodeMonitor::connect(&endpoint_url).await?;
+    let status = remote_monitor
+        .status(StatusOptions::new().timeout(Duration::from_millis(160)))
+        .await?;
+
+    assert!(status.health.alive);
+    assert_eq!(status.health.state, HealthState::Degraded);
+    assert_eq!(status.summary.unavailable_subtrees, 1);
+
+    let tree = status
+        .supervision_tree
+        .expect("supervision tree should be attached");
+    let healthy_entry = tree
+        .subtrees
+        .iter()
+        .find(|s| s.child_name == "healthy-svc")
+        .expect("healthy-svc subtree entry missing");
+    assert!(healthy_entry.result.is_ok());
+
+    let stuck_entry = tree
+        .subtrees
+        .iter()
+        .find(|s| s.child_name == "stuck-svc")
+        .expect("stuck-svc subtree entry missing");
+    assert!(stuck_entry.result.is_err());
+
+    let _ = shutdown_task.await;
     node.shutdown().await?;
     Ok(())
 }

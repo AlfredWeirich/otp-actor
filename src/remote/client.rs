@@ -15,6 +15,12 @@ use crate::remote::proto::{ActorNodeClient, CallRequest, CastRequest};
 
 type MetadataInjector = Arc<dyn Fn(&mut tonic::metadata::MetadataMap) + Send + Sync>;
 
+/// Maximum transport and serialization headroom reserved between the server execution budget
+/// (`timeout_ms`) and the client's overall deadline so structured server responses (such as
+/// degraded `NodeStatus` snapshots or `Kind::Timeout` framework errors) arrive before the client
+/// cancels the HTTP/2 stream.
+const MAX_TRANSPORT_HEADROOM: Duration = Duration::from_millis(100);
+
 /// Safely converts a [`Duration`] into non-overflowing milliseconds, clamping sub-millisecond
 /// non-zero durations to `1ms` so they do not truncate to `0ms` on the wire.
 pub(crate) fn duration_to_wire_ms(d: Duration) -> u64 {
@@ -22,6 +28,18 @@ pub(crate) fn duration_to_wire_ms(d: Duration) -> u64 {
         0
     } else {
         d.as_millis().clamp(1, u128::from(u64::MAX)) as u64
+    }
+}
+
+/// Derives the server-side execution budget (`timeout_ms`) from a client-side `deadline`,
+/// reserving up to `min(deadline / 4, 100ms)` of transport/serialization headroom so the server
+/// can finish and return a structured response before the client's deadline elapses.
+pub(crate) fn server_budget_for_deadline(deadline: Duration) -> Duration {
+    let headroom = (deadline / 4).min(MAX_TRANSPORT_HEADROOM);
+    if headroom.is_zero() {
+        deadline
+    } else {
+        deadline.saturating_sub(headroom)
     }
 }
 
@@ -123,7 +141,8 @@ impl<A: StatefulActor> RemoteActorClient<A> {
         A::Response: serde::de::DeserializeOwned,
         A::Error: serde::de::DeserializeOwned,
     {
-        tokio::time::timeout(timeout, self.call_internal(msg, Some(timeout)))
+        let server_budget = server_budget_for_deadline(timeout);
+        tokio::time::timeout(timeout, self.call_internal(msg, Some(server_budget)))
             .await
             .map_err(|_| RemoteActorError::Timeout)?
     }
@@ -132,7 +151,7 @@ impl<A: StatefulActor> RemoteActorClient<A> {
     async fn call_internal(
         &self,
         msg: A::Message,
-        timeout: Option<Duration>,
+        server_timeout: Option<Duration>,
     ) -> Result<A::Response, RemoteActorError<A::Error>>
     where
         A::Message: serde::Serialize,
@@ -146,12 +165,9 @@ impl<A: StatefulActor> RemoteActorClient<A> {
             service_name: self.service_name.clone(),
             actor_name: self.actor_name.clone(),
             payload,
-            timeout_ms: timeout.map(duration_to_wire_ms),
+            timeout_ms: server_timeout.map(duration_to_wire_ms),
             protocol_version: REMOTE_PROTOCOL_VERSION,
         });
-        if let Some(dur) = timeout {
-            request.set_timeout(dur);
-        }
         if let Some(injector) = &self.metadata_injector {
             injector(request.metadata_mut());
         }
@@ -192,7 +208,8 @@ impl<A: StatefulActor> RemoteActorClient<A> {
     where
         A::Message: serde::Serialize,
     {
-        tokio::time::timeout(timeout, self.cast_internal(msg, Some(timeout)))
+        let server_budget = server_budget_for_deadline(timeout);
+        tokio::time::timeout(timeout, self.cast_internal(msg, Some(server_budget)))
             .await
             .map_err(|_| RemoteActorError::Timeout)?
     }
@@ -200,7 +217,7 @@ impl<A: StatefulActor> RemoteActorClient<A> {
     async fn cast_internal(
         &self,
         msg: A::Message,
-        timeout: Option<Duration>,
+        server_timeout: Option<Duration>,
     ) -> Result<(), RemoteActorError<A::Error>>
     where
         A::Message: serde::Serialize,
@@ -212,12 +229,9 @@ impl<A: StatefulActor> RemoteActorClient<A> {
             service_name: self.service_name.clone(),
             actor_name: self.actor_name.clone(),
             payload,
-            timeout_ms: timeout.map(duration_to_wire_ms),
+            timeout_ms: server_timeout.map(duration_to_wire_ms),
             protocol_version: REMOTE_PROTOCOL_VERSION,
         });
-        if let Some(dur) = timeout {
-            request.set_timeout(dur);
-        }
         if let Some(injector) = &self.metadata_injector {
             injector(request.metadata_mut());
         }
