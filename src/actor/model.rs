@@ -179,6 +179,7 @@ pub struct RestartTracker {
 
 impl RestartTracker {
     /// Creates a new [`RestartTracker`] governed by the given [`RestartPolicy`].
+    #[must_use]
     pub fn new(policy: RestartPolicy) -> Self {
         Self {
             policy,
@@ -188,6 +189,7 @@ impl RestartTracker {
     }
 
     /// Returns the configured [`RestartPolicy`].
+    #[must_use]
     pub fn policy(&self) -> &RestartPolicy {
         &self.policy
     }
@@ -198,6 +200,7 @@ impl RestartTracker {
     }
 
     /// Returns the number of consecutive failures within the active window.
+    #[must_use]
     pub fn consecutive_failures(&self) -> usize {
         self.consecutive_failures
     }
@@ -206,6 +209,7 @@ impl RestartTracker {
     ///
     /// Unlike [`Self::consecutive_failures`], expired crash timestamps age out dynamically even
     /// when no recent crash has occurred, making this metric directly suitable for flapping checks.
+    #[must_use]
     pub fn restarts_in_window(&self) -> usize {
         let now = Instant::now();
         let window = self.policy.time_window;

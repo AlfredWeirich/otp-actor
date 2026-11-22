@@ -81,16 +81,19 @@ impl<A: StatefulActor> std::fmt::Debug for ActorScope<A> {
 
 impl<A: StatefulActor> ActorScope<A> {
     /// Returns the registered name of the owning actor.
+    #[must_use]
     pub fn name(&self) -> &str {
         &self.name
     }
 
     /// Returns the instance ID (`1`, `2`, ...) to which this scope is pinned.
+    #[must_use]
     pub fn instance_id(&self) -> usize {
         self.instance_id
     }
 
     /// Returns `true` if this actor instance has exited, panicked, or begun stopping its lifecycle tasks.
+    #[must_use]
     pub fn is_cancelled(&self) -> bool {
         *self.cancel_rx.borrow()
     }
@@ -199,11 +202,13 @@ impl<A: StatefulActor> ActorContext<A> {
     }
 
     /// Returns the registered name of this actor.
+    #[must_use]
     pub fn name(&self) -> &str {
         &self.name
     }
 
     /// Returns the current actor instance ID (starts at 1 and increments on each supervisor restart).
+    #[must_use]
     pub fn instance_id(&self) -> usize {
         self.instance_id
     }
@@ -218,11 +223,13 @@ impl<A: StatefulActor> ActorContext<A> {
     /// those operations, which will deadlock until the actor's [`super::model::ShutdownPolicy`]
     /// timeout expires. Use [`SupervisorHandle::request_shutdown`] or [`ActorContext::stop`]
     /// instead.
+    #[must_use]
     pub fn supervisor(&self) -> &SupervisorHandle {
         &self.supervisor
     }
 
     /// Returns a self-healing [`ActorClient<A>`] pointing to this actor.
+    #[must_use]
     pub fn client(&self) -> ActorClient<A> {
         let sender = self.weak_sender.upgrade().unwrap_or_else(|| {
             let (tx, _rx) = mpsc::channel(1);
@@ -564,9 +571,18 @@ pub struct StatefulActorBuilder<A, F> {
     _marker: PhantomData<A>,
 }
 
+impl<A, F> std::fmt::Debug for StatefulActorBuilder<A, F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StatefulActorBuilder")
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
+}
+
 impl StatefulActorBuilder<(), ()> {
     /// Creates a builder using a factory closure `Fn(usize) -> A` that receives the `instance_id`
     /// on initial start and on every subsequent supervisor restart.
+    #[must_use]
     pub fn new<A, F>(name: impl Into<String>, factory: F) -> StatefulActorBuilder<A, F>
     where
         A: StatefulActor,
@@ -579,8 +595,30 @@ impl StatefulActorBuilder<(), ()> {
         }
     }
 
+    /// Creates a builder from an explicit [`StatefulActorConfig`] and a factory closure
+    /// `Fn(usize) -> A`.
+    ///
+    /// `channel_capacity` is clamped to `>= 1`.
+    #[must_use]
+    pub fn from_config<A, F>(
+        mut config: StatefulActorConfig,
+        factory: F,
+    ) -> StatefulActorBuilder<A, F>
+    where
+        A: StatefulActor,
+        F: Fn(usize) -> A + Send + Sync + 'static,
+    {
+        config.channel_capacity = config.channel_capacity.max(1);
+        StatefulActorBuilder {
+            config,
+            factory: Arc::new(factory),
+            _marker: PhantomData,
+        }
+    }
+
     /// Creates a builder from a `Clone`-able initial actor instance.
     /// On each supervisor restart, a fresh clone of the initial state is spawned.
+    #[must_use]
     pub fn from_instance<A>(
         name: impl Into<String>,
         initial: A,
@@ -592,6 +630,7 @@ impl StatefulActorBuilder<(), ()> {
     }
 
     /// Creates a builder for an actor implementing [`Default`].
+    #[must_use]
     pub fn from_default<A>(
         name: impl Into<String>,
     ) -> StatefulActorBuilder<A, impl Fn(usize) -> A + Send + Sync + 'static>
@@ -607,6 +646,22 @@ where
     A: StatefulActor,
     F: Fn(usize) -> A + Send + Sync + 'static,
 {
+    /// Replaces the builder's [`StatefulActorConfig`] while preserving the actor factory.
+    ///
+    /// `channel_capacity` is clamped to `>= 1`.
+    #[must_use]
+    pub fn with_config(mut self, mut config: StatefulActorConfig) -> Self {
+        config.channel_capacity = config.channel_capacity.max(1);
+        self.config = config;
+        self
+    }
+
+    /// Returns a shared reference to the current [`StatefulActorConfig`].
+    #[must_use]
+    pub fn config(&self) -> &StatefulActorConfig {
+        &self.config
+    }
+
     /// Sets the actor's bounded mailbox channel capacity (defaults to 256; clamped to `>= 1`).
     #[must_use]
     pub fn channel_capacity(mut self, capacity: usize) -> Self {
@@ -650,6 +705,7 @@ where
     }
 
     /// Builds an OTP-style [`ChildSpec`] that can be registered with a [`super::supervisor::Supervisor`].
+    #[must_use]
     pub fn build_child_spec(self) -> ChildSpec {
         let mut config = self.config;
         config.channel_capacity = config.channel_capacity.max(1);
@@ -1128,6 +1184,7 @@ pub struct QueueStats {
 
 impl QueueStats {
     /// Returns `true` if no free slots are currently available in the cached mailbox (`available == 0`).
+    #[must_use]
     pub fn is_full(&self) -> bool {
         self.available == 0
     }
@@ -1164,6 +1221,21 @@ impl<A: StatefulActor> Clone for ActorClient<A> {
     }
 }
 
+impl<A: StatefulActor> std::fmt::Debug for ActorClient<A> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let is_closed = self
+            .sender
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_closed();
+        f.debug_struct("ActorClient")
+            .field("name", &self.name)
+            .field("supervisor", &self.supervisor.name())
+            .field("is_closed", &is_closed)
+            .finish()
+    }
+}
+
 impl<A: StatefulActor> ActorClient<A> {
     /// Creates a new direct client handle subscribed to the child's [`SlotState`] watch channel.
     pub(crate) fn new(
@@ -1195,16 +1267,19 @@ impl<A: StatefulActor> ActorClient<A> {
     }
 
     /// Returns the name of the supervised actor.
+    #[must_use]
     pub fn name(&self) -> &str {
         &self.name
     }
 
     /// Returns the name of the [`SupervisorHandle`] managing this actor.
+    #[must_use]
     pub fn service_name(&self) -> &str {
         self.supervisor.name()
     }
 
     /// Returns a reference to the [`SupervisorHandle`] managing this actor.
+    #[must_use]
     pub fn supervisor(&self) -> &SupervisorHandle {
         &self.supervisor
     }

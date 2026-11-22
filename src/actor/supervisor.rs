@@ -47,6 +47,16 @@ pub struct SpawnContext {
     pub supervisor: SupervisorHandle,
 }
 
+impl std::fmt::Debug for SpawnContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpawnContext")
+            .field("instance_id", &self.instance_id)
+            .field("shutdown_requested", &*self.shutdown_rx.borrow())
+            .field("supervisor", &self.supervisor.name())
+            .finish()
+    }
+}
+
 /// Type-erased factory closure invoked by the [`Supervisor`] to spawn or restart a supervised child.
 pub type UntypedActorFactory =
     Arc<dyn Fn(SpawnContext) -> (UntypedSender, JoinHandle<TaskResult>) + Send + Sync + 'static>;
@@ -81,6 +91,23 @@ pub enum SlotState {
     Failed(SupervisorError),
 }
 
+impl std::fmt::Debug for SlotState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Running { instance_id, .. } => f
+                .debug_struct("Running")
+                .field("instance_id", instance_id)
+                .finish_non_exhaustive(),
+            Self::Restarting { instance_id } => f
+                .debug_struct("Restarting")
+                .field("instance_id", instance_id)
+                .finish(),
+            Self::Stopped => f.write_str("Stopped"),
+            Self::Failed(err) => f.debug_tuple("Failed").field(err).finish(),
+        }
+    }
+}
+
 /// Public lifecycle status of a supervised child at the time of inspection.
 ///
 /// Mirrors [`SlotState`] without exposing internal communication endpoints (`UntypedSender`).
@@ -99,26 +126,31 @@ pub enum ChildStatus {
 
 impl ChildStatus {
     /// Returns `true` if the child is currently running (`ChildStatus::Running`).
+    #[must_use]
     pub fn is_running(&self) -> bool {
         matches!(self, Self::Running { .. })
     }
 
     /// Returns `true` if the child is restarting or waiting in backoff (`ChildStatus::Restarting`).
+    #[must_use]
     pub fn is_restarting(&self) -> bool {
         matches!(self, Self::Restarting { .. })
     }
 
     /// Returns `true` if the child is stopped (`ChildStatus::Stopped`).
+    #[must_use]
     pub fn is_stopped(&self) -> bool {
         matches!(self, Self::Stopped)
     }
 
     /// Returns `true` if the child is permanently failed (`ChildStatus::Failed`).
+    #[must_use]
     pub fn is_failed(&self) -> bool {
         matches!(self, Self::Failed(_))
     }
 
     /// Returns the active or restarting `instance_id`, or `None` if `Stopped` / `Failed`.
+    #[must_use]
     pub fn instance_id(&self) -> Option<usize> {
         match self {
             Self::Running { instance_id } | Self::Restarting { instance_id } => Some(*instance_id),
@@ -198,6 +230,7 @@ pub struct SupervisorSnapshot {
 
 impl SupervisorSnapshot {
     /// Looks up a child snapshot by registered name.
+    #[must_use]
     pub fn child(&self, name: &str) -> Option<&ChildSnapshot> {
         self.children.iter().find(|c| c.name == name)
     }
@@ -206,21 +239,25 @@ impl SupervisorSnapshot {
     ///
     /// Note that this returns `true` when `children` is empty; check
     /// `!snapshot.children.is_empty()` as well if at least one active child is required.
+    #[must_use]
     pub fn all_running(&self) -> bool {
         self.children.iter().all(|c| c.status.is_running())
     }
 
     /// Returns `true` if at least one child is in [`ChildStatus::Failed`].
+    #[must_use]
     pub fn any_failed(&self) -> bool {
         self.children.iter().any(|c| c.status.is_failed())
     }
 
     /// Returns `true` if at least one child is in [`ChildStatus::Restarting`].
+    #[must_use]
     pub fn any_restarting(&self) -> bool {
         self.children.iter().any(|c| c.status.is_restarting())
     }
 
     /// Returns the number of children in [`ChildStatus::Running`].
+    #[must_use]
     pub fn running_count(&self) -> usize {
         self.children
             .iter()
@@ -229,6 +266,7 @@ impl SupervisorSnapshot {
     }
 
     /// Returns the number of children in [`ChildStatus::Restarting`].
+    #[must_use]
     pub fn restarting_count(&self) -> usize {
         self.children
             .iter()
@@ -237,6 +275,7 @@ impl SupervisorSnapshot {
     }
 
     /// Returns the number of children in [`ChildStatus::Stopped`].
+    #[must_use]
     pub fn stopped_count(&self) -> usize {
         self.children
             .iter()
@@ -245,6 +284,7 @@ impl SupervisorSnapshot {
     }
 
     /// Returns the number of children in [`ChildStatus::Failed`].
+    #[must_use]
     pub fn failed_count(&self) -> usize {
         self.children
             .iter()
@@ -287,6 +327,7 @@ pub struct SubtreeSnapshot {
 
 impl SupervisorTreeSnapshot {
     /// Looks up the [`SubtreeSnapshot`] entry for the direct child supervisor `child_name`.
+    #[must_use]
     pub fn subtree(&self, child_name: &str) -> Option<&SubtreeSnapshot> {
         self.subtrees.iter().find(|s| s.child_name == child_name)
     }
@@ -295,6 +336,7 @@ impl SupervisorTreeSnapshot {
     ///
     /// An empty `path` returns `self`. Returns `None` if a name is unknown or its subtree could
     /// not be inspected (see [`SubtreeSnapshot::result`]).
+    #[must_use]
     pub fn find(&self, path: &[&str]) -> Option<&SupervisorTreeSnapshot> {
         let mut current = self;
         for name in path {
@@ -307,6 +349,7 @@ impl SupervisorTreeSnapshot {
     /// child supervisor could be inspected.
     ///
     /// Like [`SupervisorSnapshot::all_running`], this is `true` for a tree without any children.
+    #[must_use]
     pub fn all_running_deep(&self) -> bool {
         self.snapshot.all_running()
             && self
@@ -316,6 +359,7 @@ impl SupervisorTreeSnapshot {
     }
 
     /// Returns `true` if at least one inspected level contains a [`ChildStatus::Failed`] child.
+    #[must_use]
     pub fn any_failed_deep(&self) -> bool {
         self.snapshot.any_failed()
             || self
@@ -325,6 +369,7 @@ impl SupervisorTreeSnapshot {
     }
 
     /// Returns `true` if at least one inspected level contains a [`ChildStatus::Restarting`] child.
+    #[must_use]
     pub fn any_restarting_deep(&self) -> bool {
         self.snapshot.any_restarting()
             || self
@@ -334,6 +379,7 @@ impl SupervisorTreeSnapshot {
     }
 
     /// Returns the number of child supervisors, on every inspected level, that could not be inspected.
+    #[must_use]
     pub fn unavailable_count(&self) -> usize {
         self.subtrees
             .iter()
@@ -368,11 +414,13 @@ impl std::fmt::Debug for ChildStatusWatcher {
 
 impl ChildStatusWatcher {
     /// Returns the registered name of the observed child.
+    #[must_use]
     pub fn child_name(&self) -> &str {
         &self.child_name
     }
 
     /// Returns the child's latest observed [`ChildStatus`] without blocking.
+    #[must_use]
     pub fn current(&self) -> ChildStatus {
         ChildStatus::from(&*self.rx.borrow())
     }
@@ -424,8 +472,21 @@ pub struct ChildSpec {
     pub(crate) cache_probe: Option<CacheProbeFn>,
 }
 
+impl std::fmt::Debug for ChildSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChildSpec")
+            .field("name", &self.name)
+            .field("restart_policy", &self.restart_policy)
+            .field("restart_type", &self.restart_type)
+            .field("shutdown_policy", &self.shutdown_policy)
+            .field("is_supervisor", &self.is_supervisor)
+            .finish_non_exhaustive()
+    }
+}
+
 impl ChildSpec {
     /// Creates a new child specification with default [`RestartType::Transient`] and [`ShutdownPolicy`].
+    #[must_use]
     pub fn new(
         name: impl Into<String>,
         factory: UntypedActorFactory,
@@ -455,6 +516,7 @@ impl ChildSpec {
     }
 
     /// Returns the registered child name in this specification.
+    #[must_use]
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -528,8 +590,23 @@ pub struct SupervisorBuilder {
     escalate_on_failure: bool,
 }
 
+impl std::fmt::Debug for SupervisorBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SupervisorBuilder")
+            .field("name", &self.name)
+            .field("strategy", &self.strategy)
+            .field("children_count", &self.child_specs.len())
+            .field("restart_policy", &self.restart_policy)
+            .field("restart_type", &self.restart_type)
+            .field("shutdown_policy", &self.shutdown_policy)
+            .field("escalate_on_failure", &self.escalate_on_failure)
+            .finish()
+    }
+}
+
 impl SupervisorBuilder {
     /// Creates a new [`SupervisorBuilder`] with the given supervisor name.
+    #[must_use]
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -608,6 +685,7 @@ impl SupervisorBuilder {
     }
 
     /// Converts this [`SupervisorBuilder`] into a [`ChildSpec`] that can be supervised by any parent [`Supervisor`].
+    #[must_use]
     pub fn build_child_spec(self) -> ChildSpec {
         let name = self.name;
         let strategy = self.strategy;
@@ -1018,11 +1096,13 @@ impl Supervisor {
     ///
     /// # Panics
     /// Panics if called outside the context of an active Tokio runtime.
+    #[must_use]
     pub fn new_root() -> SupervisorHandle {
         SupervisorBuilder::new("root").spawn_root()
     }
 
     /// Returns a fluent [`SupervisorBuilder`] for configuring a root or child [`Supervisor`].
+    #[must_use]
     pub fn builder(name: impl Into<String>) -> SupervisorBuilder {
         SupervisorBuilder::new(name)
     }
@@ -1087,9 +1167,9 @@ impl Supervisor {
     }
 
     /// Spawns a child from a [`ChildSpec`], tracking it in `join_set` and `children`.
-    fn spawn_child_from_spec(&mut self, spec: ChildSpec) -> Result<(), SupervisorError> {
-        let name = spec.name;
-        if let Some(existing) = self.children.get(&name)
+    fn spawn_child_from_spec(&mut self, spec: &ChildSpec) -> Result<(), SupervisorError> {
+        let name = &spec.name;
+        if let Some(existing) = self.children.get(name)
             && existing.phase.is_active_or_terminating(&existing.term_rx)
         {
             tracing::warn!(
@@ -1103,7 +1183,7 @@ impl Supervisor {
 
         let inst_id = self
             .children
-            .get(&name)
+            .get(name)
             .map_or(1, |entry| entry.instance_id + 1);
 
         tracing::info!(
@@ -1136,7 +1216,7 @@ impl Supervisor {
                     panic = %panic_msg,
                     "💥 Child factory panicked during spawn!"
                 );
-                return Err(SupervisorError::FactoryPanicked(name, panic_msg));
+                return Err(SupervisorError::FactoryPanicked(name.clone(), panic_msg));
             }
         };
 
@@ -1152,15 +1232,15 @@ impl Supervisor {
             (name_for_task, spawn_id, res)
         });
 
-        if !self.child_order.contains(&name) {
-            self.child_order.push(name.clone());
-        }
-
         let initial_state = SlotState::Running {
             instance_id: inst_id,
             endpoint: sender.clone(),
         };
-        let (slot_tx, prev_restarts_total) = if let Some(existing) = self.children.remove(&name) {
+        let existing = self.children.remove(name);
+        if existing.is_none() {
+            self.child_order.push(name.clone());
+        }
+        let (slot_tx, prev_restarts_total) = if let Some(existing) = existing {
             existing.slot_tx.send_replace(initial_state);
             (existing.slot_tx.clone(), existing.restarts_total)
         } else {
@@ -1169,23 +1249,23 @@ impl Supervisor {
         };
 
         self.children.insert(
-            name,
+            name.clone(),
             ActiveChild {
                 sender,
                 slot_tx,
                 shutdown_tx,
                 abort_handle: Some(abort_handle),
                 term_rx,
-                factory: spec.factory,
+                factory: spec.factory.clone(),
                 restart_type: spec.restart_type,
                 shutdown_policy: spec.shutdown_policy,
-                shutdown_signal: spec.shutdown_signal,
+                shutdown_signal: spec.shutdown_signal.clone(),
                 #[cfg(any(test, feature = "chaos_test"))]
-                crash_signal: spec.crash_signal,
+                crash_signal: spec.crash_signal.clone(),
                 is_supervisor: spec.is_supervisor,
-                actor_metrics: spec.actor_metrics,
-                queue_probe: spec.queue_probe,
-                cache_probe: spec.cache_probe,
+                actor_metrics: spec.actor_metrics.clone(),
+                queue_probe: spec.queue_probe.clone(),
+                cache_probe: spec.cache_probe.clone(),
                 instance_id: inst_id,
                 instance_started_at: Instant::now(),
                 restarts_total: prev_restarts_total,
@@ -1403,13 +1483,13 @@ impl Supervisor {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         for spec in initial_specs {
-            if let Err(err) = self.spawn_child_from_spec(spec.clone()) {
+            if let Err(err) = self.spawn_child_from_spec(&spec) {
                 let ticket = self.allocate_restart_ticket();
                 let (term_tx, term_rx) = watch::channel(true);
                 drop(term_tx);
                 let (shutdown_tx, _) = watch::channel(true);
                 let (slot_tx, _) = watch::channel(SlotState::Failed(err.clone()));
-                if !self.child_order.contains(&spec.name) {
+                if !self.children.contains_key(&spec.name) {
                     self.child_order.push(spec.name.clone());
                 }
                 self.children.insert(
@@ -1593,7 +1673,7 @@ impl Supervisor {
                 if already_running {
                     let _ = respond_to.send(Err(SupervisorError::ChildAlreadyExists(spec.name)));
                 } else {
-                    match self.spawn_child_from_spec(spec.clone()) {
+                    match self.spawn_child_from_spec(&spec) {
                         Ok(()) => {
                             {
                                 let mut guard = self
@@ -2501,21 +2581,25 @@ impl SupervisorHandle {
     }
 
     /// Returns the registered name of this [`Supervisor`].
+    #[must_use]
     pub fn name(&self) -> &str {
         &self.name
     }
 
     /// Returns the [`Instant`] at which this handle's supervisor was created.
+    #[must_use]
     pub fn started_at(&self) -> Instant {
         self.started_at
     }
 
     /// Returns the elapsed uptime since this handle's supervisor was created.
+    #[must_use]
     pub fn uptime(&self) -> Duration {
         self.started_at.elapsed()
     }
 
     /// Returns `true` if the supervisor's command channel is still open (zero-hop liveness check).
+    #[must_use]
     pub fn is_alive(&self) -> bool {
         self.current_command_sender().is_some()
     }

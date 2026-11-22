@@ -7177,3 +7177,152 @@ async fn test_tracing_spans_propagate_to_actors_workers_and_scoped_tasks() {
 
     root.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn test_supervisor_child_order_remains_deduplicated_across_stop_restart_and_delete() {
+    let root = Supervisor::new("f12-child-order-root");
+
+    let make_spec = |name: &'static str| {
+        StatefulActorBuilder::new(name, |_inst| CounterActor { total: 0 }).build_child_spec()
+    };
+
+    root.start_child(make_spec("alpha")).await.unwrap();
+    root.start_child(make_spec("beta")).await.unwrap();
+    root.start_child(make_spec("gamma")).await.unwrap();
+
+    let names = |snap: &SupervisorSnapshot| -> Vec<String> {
+        snap.children.iter().map(|c| c.name.clone()).collect()
+    };
+
+    let snap1 = root.snapshot().await.unwrap();
+    assert_eq!(names(&snap1), vec!["alpha", "beta", "gamma"]);
+    assert_eq!(snap1.child("beta").unwrap().instance_id, 1);
+
+    // Stopping and re-starting an existing slot reuses the slot without duplicating child_order
+    root.stop_child("beta").await.unwrap();
+    root.start_child(make_spec("beta")).await.unwrap();
+
+    let snap2 = root.snapshot().await.unwrap();
+    assert_eq!(names(&snap2), vec!["alpha", "beta", "gamma"]);
+    assert_eq!(snap2.child("beta").unwrap().instance_id, 2);
+    assert!(snap2.child("beta").unwrap().status.is_running());
+
+    // Deleting removes the slot from child_order; re-adding appends it once at the end
+    root.delete_child("beta").await.unwrap();
+    root.start_child(make_spec("beta")).await.unwrap();
+
+    let snap3 = root.snapshot().await.unwrap();
+    assert_eq!(names(&snap3), vec!["alpha", "gamma", "beta"]);
+    assert_eq!(snap3.child("beta").unwrap().instance_id, 1);
+    assert!(snap3.child("beta").unwrap().status.is_running());
+
+    root.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_config_builders_and_debug_impls_for_public_types() {
+    use otp_actor::{
+        ResourceActorBuilder, ResourceActorConfig, SlotState, SpawnContext, StatefulActorConfig,
+    };
+
+    let root = Supervisor::new("f14-config-debug-root");
+
+    // 1. StatefulActorConfig -> StatefulActorBuilder::{from_config, with_config, config} + Debug
+    let mut actor_cfg = StatefulActorConfig::new("cfg-actor");
+    actor_cfg.channel_capacity = 0; // must be clamped to >= 1
+    actor_cfg.restart_type = RestartType::Permanent;
+    actor_cfg.handler_timeout = Some(Duration::from_secs(5));
+
+    let actor_builder = StatefulActorBuilder::from_config(actor_cfg, |_| CounterActor { total: 7 });
+    assert_eq!(actor_builder.config().name, "cfg-actor");
+    assert_eq!(actor_builder.config().channel_capacity, 1);
+    assert_eq!(actor_builder.config().restart_type, RestartType::Permanent);
+    assert_eq!(
+        actor_builder.config().handler_timeout,
+        Some(Duration::from_secs(5))
+    );
+
+    let mut updated_actor_cfg = StatefulActorConfig::new("cfg-actor-v2");
+    updated_actor_cfg.channel_capacity = 0; // clamped to >= 1 on with_config as well
+    let actor_builder = actor_builder.with_config(updated_actor_cfg);
+    assert_eq!(actor_builder.config().name, "cfg-actor-v2");
+    assert_eq!(actor_builder.config().channel_capacity, 1);
+
+    let builder_dbg = format!("{actor_builder:?}");
+    assert!(builder_dbg.contains("StatefulActorBuilder"));
+    assert!(builder_dbg.contains("cfg-actor-v2"));
+
+    let child_spec =
+        StatefulActorBuilder::from_config(StatefulActorConfig::new("spec-actor"), |_| {
+            CounterActor { total: 0 }
+        })
+        .build_child_spec();
+    let spec_dbg = format!("{child_spec:?}");
+    assert!(spec_dbg.contains("ChildSpec"));
+    assert!(spec_dbg.contains("spec-actor"));
+
+    let sup_builder = Supervisor::builder("dbg-sup").add_child(child_spec);
+    let sup_builder_dbg = format!("{sup_builder:?}");
+    assert!(sup_builder_dbg.contains("SupervisorBuilder"));
+    assert!(sup_builder_dbg.contains("dbg-sup"));
+    assert!(sup_builder_dbg.contains("children_count: 1"));
+
+    let actor_client = actor_builder.spawn(&root).await.unwrap();
+    let client_dbg = format!("{actor_client:?}");
+    assert!(client_dbg.contains("ActorClient"));
+    assert!(client_dbg.contains("cfg-actor-v2"));
+    assert_eq!(
+        actor_client
+            .call(CounterMsg::GetWithInstance)
+            .await
+            .unwrap(),
+        (7, 1)
+    );
+
+    // 2. ResourceActorConfig -> ResourceActorBuilder::{from_config, with_config, config} + Debug
+    let mut res_cfg = ResourceActorConfig::new("cfg-res");
+    res_cfg.channel_capacity = 0;
+    res_cfg.max_waiters = 0;
+    res_cfg.eager_prewarm = true;
+
+    let res_builder = ResourceActorBuilder::from_config(res_cfg)
+        .worker(|_ctx: WorkerContext| async { Ok::<_, String>(TimedResource::perpetual(42u32)) });
+    assert_eq!(res_builder.config().name, "cfg-res");
+    assert_eq!(res_builder.config().channel_capacity, 1);
+    assert_eq!(res_builder.config().max_waiters, 1);
+    assert!(res_builder.config().eager_prewarm);
+
+    let mut updated_res_cfg = ResourceActorConfig::new("cfg-res-v2");
+    updated_res_cfg.channel_capacity = 0;
+    updated_res_cfg.max_waiters = 0;
+    let res_builder = res_builder.with_config(updated_res_cfg);
+    assert_eq!(res_builder.config().name, "cfg-res-v2");
+    assert_eq!(res_builder.config().channel_capacity, 1);
+    assert_eq!(res_builder.config().max_waiters, 1);
+
+    let res_builder_dbg = format!("{res_builder:?}");
+    assert!(res_builder_dbg.contains("ResourceActorBuilder"));
+    assert!(res_builder_dbg.contains("cfg-res-v2"));
+
+    let res_client = res_builder.spawn(&root).await.unwrap();
+    assert_eq!(res_client.get().await.unwrap(), 42);
+    let res_client_dbg = format!("{res_client:?}");
+    assert!(res_client_dbg.contains("ResourceClient"));
+    assert!(res_client_dbg.contains("cfg-res-v2"));
+    assert!(res_client_dbg.contains("cache_state"));
+
+    // 3. SlotState & SpawnContext Debug formatting
+    assert_eq!(format!("{:?}", SlotState::Stopped), "Stopped");
+    assert!(format!("{:?}", SlotState::Restarting { instance_id: 3 }).contains("instance_id: 3"));
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let spawn_ctx = SpawnContext {
+        instance_id: 2,
+        shutdown_rx,
+        supervisor: root.clone(),
+    };
+    let spawn_ctx_dbg = format!("{spawn_ctx:?}");
+    assert!(spawn_ctx_dbg.contains("SpawnContext"));
+    assert!(spawn_ctx_dbg.contains("f14-config-debug-root"));
+
+    root.shutdown().await.unwrap();
+}

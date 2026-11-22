@@ -10,7 +10,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [0.3.4] - Unreleased
 
+### Added
+- **Config-Driven Builders & `Debug` Implementations for Public Core Types (`src/actor/{generic_actor,stateful_actor,supervisor}.rs`, Finding `F-14` — SemVer-compatible part):**
+  - Connected `ResourceActorConfig` and `StatefulActorConfig` to their builders via `ResourceActorBuilder::{from_config, with_config, config}` and `StatefulActorBuilder::{from_config, with_config, config}` (with automatic `>= 1` clamping on `channel_capacity` and `max_waiters`).
+  - Added manual `std::fmt::Debug` implementations without tightening generic trait bounds for `ActorClient<A>`, `ResourceClient<T, E>`, `StatefulActorBuilder<A, F>`, `ResourceActorBuilder<T, E, W>`, `ChildSpec`, `SupervisorBuilder`, `SpawnContext`, and `SlotState`.
+
 ### Changed
+- **`#[must_use]` Annotations & Allocation-Free Secret Masking (`src/actor/*`, `examples/{simple,otp_actor}.rs`, Finding `F-15`):**
+  - Added `#[must_use]` to pure getters, predicates, snapshots, and builder/constructor methods across `src/actor/*` (0 `clippy::must_use_candidate` warnings on `--lib`).
+  - Rewrote `mask_secret` in `examples/simple.rs` and `examples/otp_actor.rs` using `str::char_indices()` without intermediate `Vec<char>` or temporary prefix/suffix `String` allocations.
+- **Avoid $O(N)$ `child_order` Scans & Upfront `ChildSpec` Clones (`src/actor/supervisor.rs`, Finding `F-12`):**
+  - Updated `Supervisor::spawn_child_from_spec` to borrow `&ChildSpec`, eliminating upfront `ChildSpec::clone()` calls in `boot_initial_children` and `SupervisorCommand::StartChild` (especially on failure paths).
+  - Replaced $O(N)$ `self.child_order.contains(...)` scans with $O(1)$ map checks (`existing.is_none()` / `!self.children.contains_key(...)`).
 - **Structured Tracing Instrumentation & Span Propagation (`src/actor/{supervisor,stateful_actor,generic_actor}.rs`, Finding `F-13`):**
   - Added `#[tracing::instrument(..., err)]` on `SupervisorHandle` control-plane methods (`start_child`, `restart_child`, `stop_child`, `delete_child`, `request_shutdown`, `shutdown`, `snapshot_timeout`, `snapshot_tree_timeout`, `watch_child_status`) without tightening generic trait bounds.
   - Bound spawned `Supervisor`, `StatefulActor`, `ResourceActor`, background `Worker`, and `ActorContext` lifecycle tasks (`send_after`, `send_interval_with`, `spawn_scoped`, `forward_receiver`) to their respective actor/supervisor spans via `tracing::Instrument`.

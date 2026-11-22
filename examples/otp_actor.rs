@@ -88,15 +88,25 @@ pub async fn gcp_bigquery_worker(ctx: WorkerContext) -> Result<TimedResource<Str
     })
 }
 
-/// Helper to safely mask and format secrets/tokens in output without raw slicing panics.
+/// Helper to safely mask and format secrets/tokens in output without intermediate `Vec<char>` allocation.
 fn mask_secret(s: &str) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() <= 12 {
+    let mut char_count = 0usize;
+    let mut prefix_end = s.len();
+    for (idx, _) in s.char_indices() {
+        if char_count == 8 {
+            prefix_end = idx;
+        }
+        char_count += 1;
+    }
+    if char_count <= 12 {
         "***".to_string()
     } else {
-        let prefix: String = chars[..8.min(chars.len())].iter().collect();
-        let suffix: String = chars[chars.len().saturating_sub(4)..].iter().collect();
-        format!("{prefix}…{suffix} (len: {})", chars.len())
+        let suffix_start = s.char_indices().rev().nth(3).map_or(0, |(idx, _)| idx);
+        format!(
+            "{}…{} (len: {char_count})",
+            &s[..prefix_end],
+            &s[suffix_start..]
+        )
     }
 }
 

@@ -74,6 +74,7 @@ impl Drop for RunnerPanicGuard {
 
 impl ActorMetrics {
     /// Creates a new zero-initialized [`ActorMetrics`] instance.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -139,6 +140,7 @@ impl ActorMetrics {
     }
 
     /// Captures a lock-free point-in-time snapshot of all atomic actor counters.
+    #[must_use]
     pub fn snapshot(&self) -> ActorMetricsSnapshot {
         ActorMetricsSnapshot {
             in_flight: self.inner.in_flight.load(Ordering::Relaxed),
@@ -197,6 +199,7 @@ pub enum HealthState {
 
 impl HealthState {
     /// Returns a stable lowercase string identifier (`"ok"`, `"degraded"`, `"draining"`, `"unavailable"`).
+    #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Healthy => "ok",
@@ -245,6 +248,7 @@ impl Default for StatusOptions {
 
 impl StatusOptions {
     /// Creates default [`StatusOptions`] (`timeout = DEFAULT_SNAPSHOT_TIMEOUT`, full tree & details).
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -283,6 +287,7 @@ pub enum ChildKind {
 
 impl ChildKind {
     /// Returns `"actor"` or `"supervisor"`.
+    #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Actor => "actor",
@@ -303,6 +308,7 @@ pub enum ChildLifecycle {
 
 impl ChildLifecycle {
     /// Returns a stable status label (`"running"`, `"restarting"`, `"stopped"`, `"failed"`).
+    #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Running => "running",
@@ -491,6 +497,7 @@ impl std::fmt::Debug for LocalNodeMonitor {
 
 impl LocalNodeMonitor {
     /// Creates a [`LocalNodeMonitor`] anchored to `supervisor`'s start timestamp.
+    #[must_use]
     pub fn new(supervisor: SupervisorHandle) -> Self {
         let started_at = supervisor.started_at();
         Self {
@@ -508,11 +515,13 @@ impl LocalNodeMonitor {
     }
 
     /// Returns a reference to the monitored [`SupervisorHandle`].
+    #[must_use]
     pub fn supervisor(&self) -> &SupervisorHandle {
         &self.supervisor
     }
 
     /// Elapsed duration since `started_at`.
+    #[must_use]
     pub fn uptime(&self) -> Duration {
         self.started_at.elapsed()
     }
@@ -521,6 +530,7 @@ impl LocalNodeMonitor {
     ///
     /// Checks whether the supervisor command channel is still open without sending a message
     /// or walking the supervision tree.
+    #[must_use]
     pub fn health(&self) -> NodeHealth {
         let alive = self.supervisor.is_alive();
         NodeHealth {
@@ -798,6 +808,7 @@ fn collect_flat_children<'a>(
 
 /// Formats a [`NodeStatus`] snapshot into Prometheus / OpenMetrics text exposition format
 /// (`text/plain; version=0.0.4; charset=utf-8`).
+#[must_use]
 pub fn format_prometheus_metrics(status: &NodeStatus) -> String {
     let mut out = String::with_capacity(4096);
 

@@ -266,12 +266,14 @@ pub enum CacheState {
 
 impl CacheState {
     /// Returns `true` if [`ResourceClient::get`] is currently served from the cache in 0 hops.
+    #[must_use]
     pub fn is_fresh(&self) -> bool {
         matches!(self, Self::Fresh { .. })
     }
 
     /// Returns `true` if a cached value could currently be returned to callers
     /// (`Fresh`, `RefreshDue`, or `StaleUsable`).
+    #[must_use]
     pub fn has_usable_value(&self) -> bool {
         matches!(
             self,
@@ -388,11 +390,34 @@ pub struct ResourceActorBuilder<T = (), E = (), W = ()> {
     _marker: PhantomData<(T, E)>,
 }
 
+impl<T, E, W> std::fmt::Debug for ResourceActorBuilder<T, E, W> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResourceActorBuilder")
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
+}
+
 impl ResourceActorBuilder<(), (), ()> {
     /// Creates a new [`ResourceActorBuilder`] initialized with production-safe defaults.
+    #[must_use]
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             config: ResourceActorConfig::new(name),
+            worker: (),
+            _marker: PhantomData,
+        }
+    }
+
+    /// Creates a new [`ResourceActorBuilder`] initialized from an explicit [`ResourceActorConfig`].
+    ///
+    /// `channel_capacity` and `max_waiters` are clamped to `>= 1`.
+    #[must_use]
+    pub fn from_config(mut config: ResourceActorConfig) -> Self {
+        config.channel_capacity = config.channel_capacity.max(1);
+        config.max_waiters = config.max_waiters.max(1);
+        Self {
+            config,
             worker: (),
             _marker: PhantomData,
         }
@@ -416,6 +441,23 @@ impl ResourceActorBuilder<(), (), ()> {
 }
 
 impl<T, E, W> ResourceActorBuilder<T, E, W> {
+    /// Replaces the builder's [`ResourceActorConfig`] while preserving any attached [`Worker`].
+    ///
+    /// `channel_capacity` and `max_waiters` are clamped to `>= 1`.
+    #[must_use]
+    pub fn with_config(mut self, mut config: ResourceActorConfig) -> Self {
+        config.channel_capacity = config.channel_capacity.max(1);
+        config.max_waiters = config.max_waiters.max(1);
+        self.config = config;
+        self
+    }
+
+    /// Returns a shared reference to the current [`ResourceActorConfig`].
+    #[must_use]
+    pub fn config(&self) -> &ResourceActorConfig {
+        &self.config
+    }
+
     /// Sets the expiration safety buffer window (defaults to [`EXPIRY_BUFFER`], 2 seconds).
     #[must_use]
     pub fn expiry_buffer(mut self, buffer: Duration) -> Self {
@@ -533,6 +575,7 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
     ResourceActorBuilder<T, E, Arc<W>>
 {
     /// Builds an OTP-style [`ChildSpec`] that can be passed to a [`super::supervisor::Supervisor`].
+    #[must_use]
     pub fn build_child_spec(self) -> ChildSpec {
         let mut config = self.config;
         config.channel_capacity = config.channel_capacity.max(1);
@@ -1540,6 +1583,21 @@ pub struct ResourceClient<T, E> {
     supervisor: SupervisorHandle,
 }
 
+impl<T, E> std::fmt::Debug for ResourceClient<T, E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let cache_state = self
+            .endpoint
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .cache_state();
+        f.debug_struct("ResourceClient")
+            .field("name", &self.name)
+            .field("supervisor", &self.supervisor.name())
+            .field("cache_state", &cache_state)
+            .finish()
+    }
+}
+
 impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static> ResourceClient<T, E> {
     /// Creates a new direct client handle subscribed to the child's [`SlotState`] watch channel.
     pub(crate) fn new(
@@ -1557,11 +1615,13 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static> Resourc
     }
 
     /// Returns the name of the monitored actor.
+    #[must_use]
     pub fn name(&self) -> &str {
         &self.name
     }
 
     /// Returns a reference to the [`SupervisorHandle`] managing this actor.
+    #[must_use]
     pub fn supervisor(&self) -> &SupervisorHandle {
         &self.supervisor
     }
