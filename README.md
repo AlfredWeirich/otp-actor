@@ -1425,7 +1425,7 @@ The output is intentionally verbose (emoji-tagged log lines such as `🔥 Eager 
 
 ```bash
 cargo test                                            # core suite + doc-tests (108 + 4 = 112)
-cargo test --all-features                             # core, remote gRPC, codec unit & doc-tests (108 + 12 + 1 + 4 = 125)
+cargo test --all-features                             # core, remote gRPC, unit & doc-tests (108 + 12 + 3 + 4 = 127)
 cargo test --test actor_supervision_test              # core integration suite only
 cargo test --test remote_grpc_test --features remote  # remote gRPC suite only
 cargo test test_strategy_rest_for_one -- --nocapture  # a single test with logs

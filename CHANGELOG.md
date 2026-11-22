@@ -16,6 +16,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   - Added manual `std::fmt::Debug` implementations without tightening generic trait bounds for `ActorClient<A>`, `ResourceClient<T, E>`, `StatefulActorBuilder<A, F>`, `ResourceActorBuilder<T, E, W>`, `ChildSpec`, `SupervisorBuilder`, `SpawnContext`, and `SlotState`.
 
 ### Changed
+- **Zero-Allocation Label Sanitization & Pre-Sized `BoundedVec` in Remote gRPC Hot Path (`src/remote/{registry,server,endpoint}.rs`, Finding `F-18` — SemVer-compatible part):**
+  - Switched `sanitize_label` to return `Cow<'_, str>` with a zero-allocation `Cow::Borrowed` fast path for clean labels (`<= MAX_LABEL_CHARS` chars, no control chars), and guarded `span.record(...)` in `ActorNodeService::{call, cast}` with `if !span.is_disabled()`.
+  - Pre-allocated `BoundedVec` with `Vec::with_capacity(64)` in `encode_payload` and removed the redundant exact-size `self.buf.reserve(...)` call in `BoundedVec::try_extend` so `Vec::extend_from_slice` uses amortized growth within the 4 MiB cap (Prost `bytes::Bytes` migration remains planned for `v0.4.0`).
 - **`#[must_use]` Annotations & Allocation-Free Secret Masking (`src/actor/*`, `examples/{simple,otp_actor}.rs`, Finding `F-15`):**
   - Added `#[must_use]` to pure getters, predicates, snapshots, and builder/constructor methods across `src/actor/*` (0 `clippy::must_use_candidate` warnings on `--lib`).
   - Rewrote `mask_secret` in `examples/simple.rs` and `examples/otp_actor.rs` using `str::char_indices()` without intermediate `Vec<char>` or temporary prefix/suffix `String` allocations.
@@ -37,6 +40,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   - Added `TimedResource::{is_still_usable_at, is_usable_stale_at}` so `ResourceClient::get()` and `ResourceEndpoint::cache_state()` perform at most one `Instant::now()` call (and zero clock calls for perpetual resources with no refresh threshold).
 
 ### Fixed
+- **Preserve `Error::source()` Chain on `RemoteActorError` & Deduplicate gRPC Auth/Protocol Checks (`src/remote/{error,server}.rs`, Finding `F-19`):**
+  - Implemented `std::error::Error::source()` on `RemoteActorError<E>` to expose the underlying `tonic::Status` for `RemoteActorError::Transport` without tightening generic bounds on `E`.
+  - Extracted shared `authorize_or_record` and `check_protocol_version` helpers in `src/remote/server.rs` across `ActorNodeService::{call, cast}` and `ActorNodeAdminService::{health, status}`.
 - **Reserve Transport Headroom Between Server Timeout Budget & Client Deadline (`src/remote/{client,monitor}.rs`, Finding `F-17`):**
   - Added `server_budget_for_deadline` (reserving up to `min(deadline / 4, 100ms)` of transport/serialization headroom) for `RemoteActorClient::{call_timeout, cast_timeout}` and `RemoteNodeMonitor::status`, and removed redundant per-request `tonic::Request::set_timeout` timers already enforced by the outer `tokio::time::timeout`.
   - Prevents premature HTTP/2 `RST_STREAM` cancellations so degraded `NodeStatus` snapshots (when a subtree hangs) and structured server `Kind::Timeout` responses (and server `framework_errors_total` accounting) arrive cleanly within the client's deadline.

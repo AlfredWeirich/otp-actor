@@ -93,7 +93,14 @@ impl<E: Display> Display for RemoteActorError<E> {
     }
 }
 
-impl<E: Debug + Display> std::error::Error for RemoteActorError<E> {}
+impl<E: Debug + Display> std::error::Error for RemoteActorError<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Transport(status) => Some(status),
+            _ => None,
+        }
+    }
+}
 
 fn status_is_timeout(status: &tonic::Status) -> bool {
     if status.code() == tonic::Code::DeadlineExceeded {
@@ -177,5 +184,30 @@ impl<E: ToString> From<crate::actor::ActorError<E>> for RemoteError {
                 message: format!("Unhandled actor domain error: {}", domain_err.to_string()),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error as _;
+
+    #[test]
+    fn test_remote_actor_error_preserves_transport_source_chain() {
+        let status = tonic::Status::permission_denied("missing bearer token");
+        let err: RemoteActorError<String> = RemoteActorError::Transport(status);
+        let source = err
+            .source()
+            .expect("Transport variant must expose tonic::Status via Error::source()");
+        let downcast = source
+            .downcast_ref::<tonic::Status>()
+            .expect("source must downcast to tonic::Status");
+        assert_eq!(downcast.code(), tonic::Code::PermissionDenied);
+        assert_eq!(downcast.message(), "missing bearer token");
+
+        let domain_err: RemoteActorError<String> = RemoteActorError::Actor("boom".to_string());
+        assert!(domain_err.source().is_none());
+        let timeout_err: RemoteActorError<String> = RemoteActorError::Timeout;
+        assert!(timeout_err.source().is_none());
     }
 }

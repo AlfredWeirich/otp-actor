@@ -1,5 +1,6 @@
 //! Thread-safe registry mapping `(service_name, actor_name)` to `ByteEndpoint`s.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{Arc, PoisonError, RwLock};
 
@@ -14,7 +15,23 @@ pub(crate) const MAX_LABEL_CHARS: usize = 128;
 
 /// Sanitizes untrusted service/actor labels before placing them in logs or error messages:
 /// replaces control characters (`\n`, `\r`, ANSI escapes) with `'?'` and truncates overly long strings.
-pub(crate) fn sanitize_label(input: &str) -> String {
+///
+/// Uses a zero-allocation `Cow::Borrowed` fast path when `input` contains no control characters
+/// and is at most [`MAX_LABEL_CHARS`] Unicode scalar values long.
+pub(crate) fn sanitize_label(input: &str) -> Cow<'_, str> {
+    let mut char_count = 0usize;
+    let mut needs_sanitize = false;
+    for ch in input.chars() {
+        char_count += 1;
+        if char_count > MAX_LABEL_CHARS || ch.is_control() {
+            needs_sanitize = true;
+            break;
+        }
+    }
+    if !needs_sanitize {
+        return Cow::Borrowed(input);
+    }
+
     let mut out = String::with_capacity(input.len().min(MAX_LABEL_CHARS));
     let mut chars = input.chars();
     for ch in chars.by_ref().take(MAX_LABEL_CHARS) {
@@ -27,7 +44,7 @@ pub(crate) fn sanitize_label(input: &str) -> String {
     if chars.next().is_some() {
         out.push('…');
     }
-    out
+    Cow::Owned(out)
 }
 
 /// Registry that routes incoming gRPC calls to local actors.
@@ -185,8 +202,37 @@ impl ActorNodeRegistry {
             },
             None => Err(RemoteError {
                 kind: Kind::ServiceNotFound as i32,
-                message: sanitize_label(service_name),
+                message: sanitize_label(service_name).into_owned(),
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sanitize_label_zero_alloc_fast_path_and_control_truncation() {
+        // Clean ASCII label -> Cow::Borrowed (zero heap allocation)
+        let clean = sanitize_label("billing-service_1");
+        assert!(matches!(clean, Cow::Borrowed("billing-service_1")));
+
+        // Clean multi-byte UTF-8 label within MAX_LABEL_CHARS chars -> Cow::Borrowed
+        let utf8 = "ü".repeat(100);
+        assert!(utf8.len() > MAX_LABEL_CHARS);
+        let clean_utf8 = sanitize_label(&utf8);
+        assert!(matches!(clean_utf8, Cow::Borrowed(s) if s == utf8));
+
+        // Control characters -> Cow::Owned with '?'
+        let dirty = sanitize_label("svc\nwith\x1bctrl");
+        assert!(matches!(dirty, Cow::Owned(ref s) if s == "svc?with?ctrl"));
+
+        // Overlong label -> Cow::Owned truncated to MAX_LABEL_CHARS + '…'
+        let overlong = "a".repeat(MAX_LABEL_CHARS + 5);
+        let truncated = sanitize_label(&overlong);
+        assert!(matches!(truncated, Cow::Owned(_)));
+        assert_eq!(truncated.chars().count(), MAX_LABEL_CHARS + 1);
+        assert!(truncated.ends_with('…'));
     }
 }

@@ -204,6 +204,42 @@ impl ActorNodeService {
     }
 }
 
+/// Executes an optional [`Authorizer`] hook and records rejected attempts in [`RemoteNodeMetrics`].
+fn authorize_or_record(
+    authorizer: &Option<Authorizer>,
+    metrics: &RemoteNodeMetrics,
+    metadata: &tonic::metadata::MetadataMap,
+    extensions: &tonic::Extensions,
+    service_name: &str,
+    actor_name: &str,
+) -> Result<(), Status> {
+    if let Some(auth) = authorizer
+        && let Err(status) = auth(metadata, extensions, service_name, actor_name)
+    {
+        metrics.record_auth_rejected();
+        return Err(status);
+    }
+    Ok(())
+}
+
+/// Validates the incoming wire protocol version and records mismatches in [`RemoteNodeMetrics`].
+fn check_protocol_version(
+    protocol_version: u32,
+    metrics: &RemoteNodeMetrics,
+) -> Result<(), RemoteError> {
+    if protocol_version != REMOTE_PROTOCOL_VERSION {
+        let err = RemoteError {
+            kind: Kind::IncompatibleProtocol as i32,
+            message: format!(
+                "Unsupported protocol version {protocol_version} (expected {REMOTE_PROTOCOL_VERSION})"
+            ),
+        };
+        metrics.record_remote_error(&err);
+        return Err(err);
+    }
+    Ok(())
+}
+
 #[tonic::async_trait]
 impl ActorNode for ActorNodeService {
     #[tracing::instrument(
@@ -220,25 +256,21 @@ impl ActorNode for ActorNodeService {
 
         let (metadata, extensions, req) = request.into_parts();
         let span = tracing::Span::current();
-        span.record("service", sanitize_label(&req.service_name).as_str());
-        span.record("actor", sanitize_label(&req.actor_name).as_str());
-
-        if let Some(auth) = &self.authorizer
-            && let Err(status) = auth(&metadata, &extensions, &req.service_name, &req.actor_name)
-        {
-            self.metrics.record_auth_rejected();
-            return Err(status);
+        if !span.is_disabled() {
+            span.record("service", sanitize_label(&req.service_name).as_ref());
+            span.record("actor", sanitize_label(&req.actor_name).as_ref());
         }
 
-        if req.protocol_version != REMOTE_PROTOCOL_VERSION {
-            let remote_err = RemoteError {
-                kind: Kind::IncompatibleProtocol as i32,
-                message: format!(
-                    "Unsupported protocol version {} (expected {})",
-                    req.protocol_version, REMOTE_PROTOCOL_VERSION
-                ),
-            };
-            self.metrics.record_remote_error(&remote_err);
+        authorize_or_record(
+            &self.authorizer,
+            &self.metrics,
+            &metadata,
+            &extensions,
+            &req.service_name,
+            &req.actor_name,
+        )?;
+
+        if let Err(remote_err) = check_protocol_version(req.protocol_version, &self.metrics) {
             return Ok(Response::new(CallResponse {
                 result: Some(CallResult::FrameworkError(remote_err)),
             }));
@@ -277,25 +309,21 @@ impl ActorNode for ActorNodeService {
 
         let (metadata, extensions, req) = request.into_parts();
         let span = tracing::Span::current();
-        span.record("service", sanitize_label(&req.service_name).as_str());
-        span.record("actor", sanitize_label(&req.actor_name).as_str());
-
-        if let Some(auth) = &self.authorizer
-            && let Err(status) = auth(&metadata, &extensions, &req.service_name, &req.actor_name)
-        {
-            self.metrics.record_auth_rejected();
-            return Err(status);
+        if !span.is_disabled() {
+            span.record("service", sanitize_label(&req.service_name).as_ref());
+            span.record("actor", sanitize_label(&req.actor_name).as_ref());
         }
 
-        if req.protocol_version != REMOTE_PROTOCOL_VERSION {
-            let remote_err = RemoteError {
-                kind: Kind::IncompatibleProtocol as i32,
-                message: format!(
-                    "Unsupported protocol version {} (expected {})",
-                    req.protocol_version, REMOTE_PROTOCOL_VERSION
-                ),
-            };
-            self.metrics.record_remote_error(&remote_err);
+        authorize_or_record(
+            &self.authorizer,
+            &self.metrics,
+            &metadata,
+            &extensions,
+            &req.service_name,
+            &req.actor_name,
+        )?;
+
+        if let Err(remote_err) = check_protocol_version(req.protocol_version, &self.metrics) {
             return Ok(Response::new(CastResponse {
                 framework_error: Some(remote_err),
             }));
@@ -412,22 +440,16 @@ impl ActorNodeAdmin for ActorNodeAdminService {
         request: Request<HealthRequest>,
     ) -> Result<Response<HealthResponse>, Status> {
         let (metadata, extensions, req) = request.into_parts();
-        if let Some(auth) = &self.authorizer
-            && let Err(status) = auth(&metadata, &extensions, "__admin", "health")
-        {
-            self.metrics.record_auth_rejected();
-            return Err(status);
-        }
+        authorize_or_record(
+            &self.authorizer,
+            &self.metrics,
+            &metadata,
+            &extensions,
+            "__admin",
+            "health",
+        )?;
 
-        if req.protocol_version != REMOTE_PROTOCOL_VERSION {
-            let err = RemoteError {
-                kind: Kind::IncompatibleProtocol as i32,
-                message: format!(
-                    "Unsupported protocol version {} (expected {})",
-                    req.protocol_version, REMOTE_PROTOCOL_VERSION
-                ),
-            };
-            self.metrics.record_remote_error(&err);
+        if let Err(err) = check_protocol_version(req.protocol_version, &self.metrics) {
             return Ok(Response::new(HealthResponse {
                 alive: false,
                 uptime_seconds: self.started_at.elapsed().as_secs(),
@@ -451,22 +473,16 @@ impl ActorNodeAdmin for ActorNodeAdminService {
         request: Request<StatusRequest>,
     ) -> Result<Response<StatusResponse>, Status> {
         let (metadata, extensions, req) = request.into_parts();
-        if let Some(auth) = &self.authorizer
-            && let Err(status) = auth(&metadata, &extensions, "__admin", "status")
-        {
-            self.metrics.record_auth_rejected();
-            return Err(status);
-        }
+        authorize_or_record(
+            &self.authorizer,
+            &self.metrics,
+            &metadata,
+            &extensions,
+            "__admin",
+            "status",
+        )?;
 
-        if req.protocol_version != REMOTE_PROTOCOL_VERSION {
-            let err = RemoteError {
-                kind: Kind::IncompatibleProtocol as i32,
-                message: format!(
-                    "Unsupported protocol version {} (expected {})",
-                    req.protocol_version, REMOTE_PROTOCOL_VERSION
-                ),
-            };
-            self.metrics.record_remote_error(&err);
+        if let Err(err) = check_protocol_version(req.protocol_version, &self.metrics) {
             return Ok(Response::new(StatusResponse {
                 result: Some(StatusResult::FrameworkError(err)),
             }));

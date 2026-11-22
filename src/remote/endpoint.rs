@@ -49,7 +49,7 @@ impl postcard::ser_flavors::Flavor for BoundedVec {
             .checked_add(data.len())
             .filter(|&len| len <= self.max_len)
             .ok_or(postcard::Error::SerializeBufferFull)?;
-        self.buf.reserve(next_len - self.buf.len());
+        debug_assert!(next_len <= self.max_len);
         self.buf.extend_from_slice(data);
         Ok(())
     }
@@ -73,7 +73,7 @@ pub(crate) fn encode_payload<T: serde::Serialize>(val: &T) -> Result<Vec<u8>, Pa
     let bytes = postcard::serialize_with_flavor(
         val,
         BoundedVec {
-            buf: Vec::new(),
+            buf: Vec::with_capacity(64),
             max_len,
         },
     )?;
