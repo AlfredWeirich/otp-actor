@@ -146,9 +146,24 @@ fn clamp_timeout(
 pub struct ActorNodeService {
     registry: ActorNodeRegistry,
     default_call_timeout: Option<Duration>,
+    default_cast_timeout: Option<Duration>,
     max_request_timeout: Option<Duration>,
     authorizer: Option<Authorizer>,
+    draining: Arc<AtomicBool>,
     metrics: RemoteNodeMetrics,
+}
+
+impl std::fmt::Debug for ActorNodeService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActorNodeService")
+            .field("registered_endpoints", &self.registry.len())
+            .field("default_call_timeout", &self.default_call_timeout)
+            .field("default_cast_timeout", &self.default_cast_timeout)
+            .field("max_request_timeout", &self.max_request_timeout)
+            .field("draining", &self.draining.load(Ordering::Acquire))
+            .field("has_authorizer", &self.authorizer.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl ActorNodeService {
@@ -158,8 +173,10 @@ impl ActorNodeService {
         Self {
             registry,
             default_call_timeout: Some(DEFAULT_REMOTE_CALL_TIMEOUT),
+            default_cast_timeout: None,
             max_request_timeout: Some(MAX_REMOTE_REQUEST_TIMEOUT),
             authorizer: None,
+            draining: Arc::new(AtomicBool::new(false)),
             metrics: RemoteNodeMetrics::default(),
         }
     }
@@ -168,6 +185,17 @@ impl ActorNodeService {
     #[must_use]
     pub fn with_default_call_timeout(mut self, timeout: Option<Duration>) -> Self {
         self.default_call_timeout = timeout;
+        self
+    }
+
+    /// Sets the fallback timeout for `cast` requests that do not specify `timeout_ms`.
+    ///
+    /// When set to `Some(Duration::ZERO)`, casts without an explicit timeout perform non-blocking
+    /// `try_cast` load-shedding (`MailboxFull`) instead of waiting up to
+    /// [`crate::remote::DEFAULT_REMOTE_CAST_TIMEOUT`].
+    #[must_use]
+    pub fn with_default_cast_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.default_cast_timeout = timeout;
         self
     }
 
@@ -182,6 +210,11 @@ impl ActorNodeService {
     #[must_use]
     pub fn with_authorizer(mut self, authorizer: Authorizer) -> Self {
         self.authorizer = Some(authorizer);
+        self
+    }
+
+    pub(crate) fn with_draining(mut self, draining: Arc<AtomicBool>) -> Self {
+        self.draining = draining;
         self
     }
 
@@ -201,6 +234,18 @@ impl ActorNodeService {
         fallback: Option<Duration>,
     ) -> Option<Duration> {
         clamp_timeout(client_timeout_ms, fallback, self.max_request_timeout)
+    }
+
+    fn check_not_draining(&self) -> Result<(), RemoteError> {
+        if self.draining.load(Ordering::Acquire) {
+            let err = RemoteError {
+                kind: Kind::ActorUnavailable as i32,
+                message: "Node is draining for shutdown".into(),
+            };
+            self.metrics.record_remote_error(&err);
+            return Err(err);
+        }
+        Ok(())
     }
 }
 
@@ -276,6 +321,12 @@ impl ActorNode for ActorNodeService {
             }));
         }
 
+        if let Err(remote_err) = self.check_not_draining() {
+            return Ok(Response::new(CallResponse {
+                result: Some(CallResult::FrameworkError(remote_err)),
+            }));
+        }
+
         let timeout = self.effective_timeout(req.timeout_ms, self.default_call_timeout);
 
         let endpoint = match self.registry.resolve(&req.service_name, &req.actor_name) {
@@ -329,7 +380,13 @@ impl ActorNode for ActorNodeService {
             }));
         }
 
-        let timeout = self.effective_timeout(req.timeout_ms, None);
+        if let Err(remote_err) = self.check_not_draining() {
+            return Ok(Response::new(CastResponse {
+                framework_error: Some(remote_err),
+            }));
+        }
+
+        let timeout = self.effective_timeout(req.timeout_ms, self.default_cast_timeout);
 
         let endpoint = match self.registry.resolve(&req.service_name, &req.actor_name) {
             Ok(ep) => ep,
@@ -359,6 +416,18 @@ pub struct ActorNodeAdminService {
     metrics: RemoteNodeMetrics,
     max_request_timeout: Option<Duration>,
     authorizer: Option<Authorizer>,
+}
+
+impl std::fmt::Debug for ActorNodeAdminService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActorNodeAdminService")
+            .field("registered_endpoints", &self.registry.len())
+            .field("supervisor", &self.supervisor.as_ref().map(SupervisorHandle::name))
+            .field("draining", &self.draining.load(Ordering::Acquire))
+            .field("max_request_timeout", &self.max_request_timeout)
+            .field("has_authorizer", &self.authorizer.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl ActorNodeAdminService {
@@ -587,10 +656,29 @@ pub struct ActorNodeBuilder {
     supervisor: Option<SupervisorHandle>,
     server: tonic::transport::Server,
     default_call_timeout: Option<Duration>,
+    default_cast_timeout: Option<Duration>,
     max_request_timeout: Option<Duration>,
     authorizer: Option<Authorizer>,
     drain_timeout: Option<Duration>,
     started_at: Option<Instant>,
+}
+
+impl std::fmt::Debug for ActorNodeBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActorNodeBuilder")
+            .field("addr", &self.addr)
+            .field("registered_endpoints", &self.registry.len())
+            .field(
+                "supervisor",
+                &self.supervisor.as_ref().map(SupervisorHandle::name),
+            )
+            .field("default_call_timeout", &self.default_call_timeout)
+            .field("default_cast_timeout", &self.default_cast_timeout)
+            .field("max_request_timeout", &self.max_request_timeout)
+            .field("drain_timeout", &self.drain_timeout)
+            .field("has_authorizer", &self.authorizer.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl ActorNodeBuilder {
@@ -602,6 +690,7 @@ impl ActorNodeBuilder {
             supervisor: None,
             server: tonic::transport::Server::builder(),
             default_call_timeout: Some(DEFAULT_REMOTE_CALL_TIMEOUT),
+            default_cast_timeout: None,
             max_request_timeout: Some(MAX_REMOTE_REQUEST_TIMEOUT),
             authorizer: None,
             drain_timeout: Some(DEFAULT_DRAIN_TIMEOUT),
@@ -638,6 +727,17 @@ impl ActorNodeBuilder {
         self
     }
 
+    /// Sets the fallback timeout for `cast` requests omitting `timeout_ms`.
+    ///
+    /// When set to `Some(Duration::ZERO)`, casts without an explicit timeout execute non-blocking
+    /// `try_cast` load-shedding (`MailboxFull`) instead of waiting up to
+    /// [`crate::remote::DEFAULT_REMOTE_CAST_TIMEOUT`].
+    #[must_use]
+    pub fn default_cast_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.default_cast_timeout = timeout;
+        self
+    }
+
     /// Sets the maximum per-request timeout accepted from remote callers.
     #[must_use]
     pub fn max_request_timeout(mut self, timeout: Option<Duration>) -> Self {
@@ -670,7 +770,9 @@ impl ActorNodeBuilder {
     ) {
         let mut node_svc = ActorNodeService::new(self.registry.clone())
             .with_default_call_timeout(self.default_call_timeout)
+            .with_default_cast_timeout(self.default_cast_timeout)
             .with_max_request_timeout(self.max_request_timeout)
+            .with_draining(draining.clone())
             .with_metrics(metrics.clone());
         let mut admin_svc = ActorNodeAdminService::new(self.registry.clone(), self.supervisor.clone())
             .with_started_at(started_at)
@@ -785,6 +887,21 @@ pub struct ActorNodeHandle {
     metrics: RemoteNodeMetrics,
     shutdown_tx: Option<oneshot::Sender<()>>,
     server_task: Option<tokio::task::JoinHandle<Result<(), tonic::transport::Error>>>,
+}
+
+impl std::fmt::Debug for ActorNodeHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActorNodeHandle")
+            .field("addr", &self.addr)
+            .field("registered_endpoints", &self.registry.len())
+            .field(
+                "supervisor",
+                &self.supervisor.as_ref().map(SupervisorHandle::name),
+            )
+            .field("draining", &self.draining.load(Ordering::Acquire))
+            .field("drain_timeout", &self.drain_timeout)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ActorNodeHandle {

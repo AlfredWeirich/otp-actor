@@ -11,11 +11,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ## [0.3.4] - Unreleased
 
 ### Added
+- **Location-Transparent `ask`/`ask_timeout` & `Debug` Implementations for Remote Types (`src/remote/{client,registry,server}.rs`, Finding `F-20`):**
+  - Added `ask` and `ask_timeout` (`CallMessage<A>`) on both `RemoteActorClient<A>` and `AnyActorClient<A>`, matching local `ActorClient::ask` ergonomics.
+  - Added `std::fmt::Debug` implementations for `RemoteActorClient<A>`, `AnyActorClient<A>`, `ActorNodeRegistry`, `ActorNodeService`, `ActorNodeAdminService`, `ActorNodeBuilder`, and `ActorNodeHandle`.
 - **Config-Driven Builders & `Debug` Implementations for Public Core Types (`src/actor/{generic_actor,stateful_actor,supervisor}.rs`, Finding `F-14` — SemVer-compatible part):**
   - Connected `ResourceActorConfig` and `StatefulActorConfig` to their builders via `ResourceActorBuilder::{from_config, with_config, config}` and `StatefulActorBuilder::{from_config, with_config, config}` (with automatic `>= 1` clamping on `channel_capacity` and `max_waiters`).
   - Added manual `std::fmt::Debug` implementations without tightening generic trait bounds for `ActorClient<A>`, `ResourceClient<T, E>`, `StatefulActorBuilder<A, F>`, `ResourceActorBuilder<T, E, W>`, `ChildSpec`, `SupervisorBuilder`, `SpawnContext`, and `SlotState`.
 
 ### Changed
+- **Deterministic Assertions & Zero-Sleep Termination in Remote Examples (`examples/remote/{all_in_one,client}.rs`, Finding `F-22`):**
+  - Replaced `let _ = ...` on `AccountMsg::SimulateCrash` with explicit `assert!(matches!(..., Err(RemoteActorError::Actor(_))))` checks and removed the unnecessary `sleep(50ms)` in `all_in_one.rs`, documenting the deterministic `receiver.close()`-before-reply guarantee.
 - **Zero-Allocation Label Sanitization & Pre-Sized `BoundedVec` in Remote gRPC Hot Path (`src/remote/{registry,server,endpoint}.rs`, Finding `F-18` — SemVer-compatible part):**
   - Switched `sanitize_label` to return `Cow<'_, str>` with a zero-allocation `Cow::Borrowed` fast path for clean labels (`<= MAX_LABEL_CHARS` chars, no control chars), and guarded `span.record(...)` in `ActorNodeService::{call, cast}` with `if !span.is_disabled()`.
   - Pre-allocated `BoundedVec` with `Vec::with_capacity(64)` in `encode_payload` and removed the redundant exact-size `self.buf.reserve(...)` call in `BoundedVec::try_extend` so `Vec::extend_from_slice` uses amortized growth within the 4 MiB cap (Prost `bytes::Bytes` migration remains planned for `v0.4.0`).
@@ -40,6 +45,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   - Added `TimedResource::{is_still_usable_at, is_usable_stale_at}` so `ResourceClient::get()` and `ResourceEndpoint::cache_state()` perform at most one `Instant::now()` call (and zero clock calls for perpetual resources with no refresh threshold).
 
 ### Fixed
+- **Non-Blocking Remote `try_cast`, Configurable `default_cast_timeout` & Phase-1 Drain Rejection (`src/remote/{endpoint,client,server}.rs`, Finding `F-21`):**
+  - Updated `ByteEndpoint::cast_bytes` so `timeout == Some(Duration::ZERO)` invokes `ActorClient::try_cast` directly (returning `Kind::MailboxFull` immediately without blocking), and updated `RemoteActorClient::cast_timeout` / `AnyActorClient::cast_timeout` for symmetric `Duration::ZERO` semantics.
+  - Added `ActorNodeService::with_default_cast_timeout` and `ActorNodeBuilder::default_cast_timeout` so operators can configure server-side fallback cast backpressure (including `Some(Duration::ZERO)` for non-blocking load-shedding).
+  - Wired the node's Phase-1 `draining` flag into `ActorNodeService` so new `Call`/`Cast` frames arriving after shutdown begins are rejected cleanly with `Kind::ActorUnavailable` while already in-flight requests finish draining.
 - **Preserve `Error::source()` Chain on `RemoteActorError` & Deduplicate gRPC Auth/Protocol Checks (`src/remote/{error,server}.rs`, Finding `F-19`):**
   - Implemented `std::error::Error::source()` on `RemoteActorError<E>` to expose the underlying `tonic::Status` for `RemoteActorError::Transport` without tightening generic bounds on `E`.
   - Extracted shared `authorize_or_record` and `check_protocol_version` helpers in `src/remote/server.rs` across `ActorNodeService::{call, cast}` and `ActorNodeAdminService::{health, status}`.

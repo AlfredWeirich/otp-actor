@@ -54,6 +54,16 @@ pub struct RemoteActorClient<A: StatefulActor> {
     _phantom: PhantomData<A>,
 }
 
+impl<A: StatefulActor> std::fmt::Debug for RemoteActorClient<A> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteActorClient")
+            .field("service_name", &self.service_name)
+            .field("actor_name", &self.actor_name)
+            .field("has_metadata_injector", &self.metadata_injector.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
 impl<A: StatefulActor> RemoteActorClient<A> {
     /// Creates a client from an existing connected gRPC `Channel`.
     pub fn new(
@@ -200,6 +210,9 @@ impl<A: StatefulActor> RemoteActorClient<A> {
     }
 
     /// Sends an asynchronous fire-and-forget notification (`cast`) with a client-side timeout deadline.
+    ///
+    /// Passing [`Duration::ZERO`] performs a non-blocking `try_cast` on the remote actor, returning
+    /// [`RemoteActorError::MailboxFull`] immediately if its bounded mailbox is saturated.
     pub async fn cast_timeout(
         &self,
         msg: A::Message,
@@ -208,6 +221,9 @@ impl<A: StatefulActor> RemoteActorClient<A> {
     where
         A::Message: serde::Serialize,
     {
+        if timeout.is_zero() {
+            return self.cast_internal(msg, Some(Duration::ZERO)).await;
+        }
         let server_budget = server_budget_for_deadline(timeout);
         tokio::time::timeout(timeout, self.cast_internal(msg, Some(server_budget)))
             .await
@@ -245,6 +261,36 @@ impl<A: StatefulActor> RemoteActorClient<A> {
 
         Ok(())
     }
+
+    /// Sends a typed sub-message implementing [`crate::actor::CallMessage<A>`] to the remote actor
+    /// and unpacks its strongly typed [`crate::actor::CallMessage::Reply`].
+    pub async fn ask<M>(&self, msg: M) -> Result<M::Reply, RemoteActorError<A::Error>>
+    where
+        M: crate::actor::CallMessage<A>,
+        A::Message: serde::Serialize,
+        A::Response: serde::de::DeserializeOwned,
+        A::Error: serde::de::DeserializeOwned,
+    {
+        let resp = self.call(msg.into()).await?;
+        M::extract_reply(resp).map_err(RemoteActorError::Actor)
+    }
+
+    /// Sends a typed sub-message implementing [`crate::actor::CallMessage<A>`] with a client-side
+    /// timeout deadline and unpacks its strongly typed [`crate::actor::CallMessage::Reply`].
+    pub async fn ask_timeout<M>(
+        &self,
+        msg: M,
+        timeout: Duration,
+    ) -> Result<M::Reply, RemoteActorError<A::Error>>
+    where
+        M: crate::actor::CallMessage<A>,
+        A::Message: serde::Serialize,
+        A::Response: serde::de::DeserializeOwned,
+        A::Error: serde::de::DeserializeOwned,
+    {
+        let resp = self.call_timeout(msg.into(), timeout).await?;
+        M::extract_reply(resp).map_err(RemoteActorError::Actor)
+    }
 }
 
 /// Unified client enum providing complete Location Transparency across local and remote actors.
@@ -254,6 +300,18 @@ pub enum AnyActorClient<A: StatefulActor> {
     Local(ActorClient<A>),
     /// Remote actor client communicating over gRPC network transport.
     Remote(RemoteActorClient<A>),
+}
+
+impl<A: StatefulActor> std::fmt::Debug for AnyActorClient<A> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Local(client) => f.debug_tuple("AnyActorClient::Local").field(client).finish(),
+            Self::Remote(client) => f
+                .debug_tuple("AnyActorClient::Remote")
+                .field(client)
+                .finish(),
+        }
+    }
 }
 
 impl<A: StatefulActor> AnyActorClient<A> {
@@ -308,6 +366,38 @@ impl<A: StatefulActor> AnyActorClient<A> {
         }
     }
 
+    /// Sends a typed sub-message implementing [`crate::actor::CallMessage<A>`] transparently to
+    /// either a local or remote actor and unpacks its strongly typed reply.
+    pub async fn ask<M>(&self, msg: M) -> Result<M::Reply, RemoteActorError<A::Error>>
+    where
+        M: crate::actor::CallMessage<A>,
+        A::Message: serde::Serialize,
+        A::Response: serde::de::DeserializeOwned,
+        A::Error: serde::de::DeserializeOwned,
+    {
+        match self {
+            Self::Local(client) => client.ask(msg).await.map_err(Self::map_local_error),
+            Self::Remote(client) => client.ask(msg).await,
+        }
+    }
+
+    /// Sends a typed sub-message implementing [`crate::actor::CallMessage<A>`] with a timeout
+    /// deadline transparently to either a local or remote actor and unpacks its strongly typed reply.
+    pub async fn ask_timeout<M>(
+        &self,
+        msg: M,
+        timeout: Duration,
+    ) -> Result<M::Reply, RemoteActorError<A::Error>>
+    where
+        M: crate::actor::CallMessage<A>,
+        A::Message: serde::Serialize,
+        A::Response: serde::de::DeserializeOwned,
+        A::Error: serde::de::DeserializeOwned,
+    {
+        let resp = self.call_timeout(msg.into(), timeout).await?;
+        M::extract_reply(resp).map_err(RemoteActorError::Actor)
+    }
+
     /// Sends an asynchronous notification (`cast`) transparently to either a local or remote actor.
     pub async fn cast(&self, msg: A::Message) -> Result<(), RemoteActorError<A::Error>>
     where
@@ -320,6 +410,9 @@ impl<A: StatefulActor> AnyActorClient<A> {
     }
 
     /// Sends an asynchronous notification (`cast`) with a timeout deadline transparently to either a local or remote actor.
+    ///
+    /// Passing [`Duration::ZERO`] performs a non-blocking `try_cast` on both local and remote actors,
+    /// returning [`RemoteActorError::MailboxFull`] immediately if the bounded mailbox is saturated.
     pub async fn cast_timeout(
         &self,
         msg: A::Message,
@@ -329,6 +422,9 @@ impl<A: StatefulActor> AnyActorClient<A> {
         A::Message: serde::Serialize,
     {
         match self {
+            Self::Local(client) if timeout.is_zero() => {
+                client.try_cast(msg).map_err(Self::map_local_error)
+            }
             Self::Local(client) => client
                 .cast_timeout(msg, timeout)
                 .await

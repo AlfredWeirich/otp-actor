@@ -277,6 +277,49 @@ async fn test_location_transparency_any_client()
         70
     );
 
+    // Typed CallMessage (`ask` / `ask_timeout`) location transparency (F-20)
+    struct AddTyped(i64);
+    impl From<AddTyped> for CalcMsg {
+        fn from(m: AddTyped) -> Self {
+            CalcMsg::Add(m.0)
+        }
+    }
+    impl otp_actor::CallMessage<CalculatorActor> for AddTyped {
+        type Reply = i64;
+        fn extract_reply(resp: i64) -> Result<Self::Reply, String> {
+            Ok(resp)
+        }
+    }
+
+    assert_eq!(client_a.ask(AddTyped(5)).await?, 75);
+    assert_eq!(client_b.ask(AddTyped(5)).await?, 80);
+    assert_eq!(
+        client_a
+            .ask_timeout(AddTyped(2), Duration::from_secs(2))
+            .await?,
+        82
+    );
+    assert_eq!(
+        client_b
+            .ask_timeout(AddTyped(3), Duration::from_secs(2))
+            .await?,
+        85
+    );
+
+    // Debug formatting on public remote types (F-20)
+    assert!(format!("{client_a:?}").contains("AnyActorClient::Local"));
+    assert!(format!("{client_b:?}").contains("AnyActorClient::Remote"));
+    assert!(format!("{client_b:?}").contains("calc-local"));
+    assert!(format!("{node:?}").contains("ActorNodeHandle"));
+    let dbg_registry = ActorNodeRegistry::new();
+    assert!(format!("{dbg_registry:?}").contains("ActorNodeRegistry"));
+    let dbg_svc = otp_actor::remote::ActorNodeService::new(dbg_registry.clone());
+    assert!(format!("{dbg_svc:?}").contains("ActorNodeService"));
+    let dbg_admin = otp_actor::remote::ActorNodeAdminService::new(dbg_registry.clone(), None);
+    assert!(format!("{dbg_admin:?}").contains("ActorNodeAdminService"));
+    let dbg_builder = otp_actor::remote::ActorNodeBuilder::new(bind_addr, dbg_registry);
+    assert!(format!("{dbg_builder:?}").contains("ActorNodeBuilder"));
+
     node.shutdown().await?;
     Ok(())
 }
@@ -1071,5 +1114,98 @@ async fn test_remote_monitor_status_receives_degraded_snapshot_when_subtree_hang
 
     let _ = shutdown_task.await;
     node.shutdown().await?;
+    Ok(())
+}
+
+// ----------------------------------------------------------------------------
+// Test 13: Non-Blocking `cast_timeout(Duration::ZERO)`, `default_cast_timeout` & Draining (F-21)
+// ----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_remote_cast_zero_timeout_try_cast_and_draining_rejects_new_requests()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use otp_actor::remote::ActorNodeBuilder;
+
+    let root = Supervisor::new("f21-root");
+    let svc = Supervisor::builder("f21-svc").spawn(&root).await?;
+    let local_calc = StatefulActorBuilder::from_default::<CalculatorActor>("bounded-calc")
+        .channel_capacity(1)
+        .spawn(&svc)
+        .await?;
+
+    let registry = ActorNodeRegistry::new();
+    registry.register("f21-svc", "bounded-calc", local_calc.clone());
+
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let node = ActorNodeBuilder::new(bind_addr, registry)
+        .supervisor(root)
+        .default_cast_timeout(Some(Duration::ZERO))
+        .start()
+        .await?;
+    let endpoint_url = format!("http://{}", node.local_addr());
+
+    let remote_calc = RemoteActorClient::<CalculatorActor>::connect(
+        &endpoint_url,
+        "f21-svc",
+        "bounded-calc",
+    )
+    .await?;
+    let any_local = AnyActorClient::Local(local_calc.clone());
+
+    // 1. Occupy handler with a 250ms delay and fill the single bounded mailbox slot
+    local_calc
+        .cast(CalcMsg::Delay(Duration::from_millis(250)))
+        .await?;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    local_calc.try_cast(CalcMsg::Add(1))?;
+
+    // 2. Both `cast_timeout(..., Duration::ZERO)` (local & remote) and `cast(...)` under
+    //    `default_cast_timeout(Some(Duration::ZERO))` fail immediately with MailboxFull.
+    let started = std::time::Instant::now();
+    assert!(matches!(
+        remote_calc.cast_timeout(CalcMsg::Add(1), Duration::ZERO).await,
+        Err(RemoteActorError::MailboxFull)
+    ));
+    assert!(matches!(
+        any_local.cast_timeout(CalcMsg::Add(1), Duration::ZERO).await,
+        Err(RemoteActorError::MailboxFull)
+    ));
+    assert!(matches!(
+        remote_calc.cast(CalcMsg::Add(1)).await,
+        Err(RemoteActorError::MailboxFull)
+    ));
+    assert!(
+        started.elapsed() < Duration::from_millis(200),
+        "non-blocking cast load-shedding should return immediately, took {:?}",
+        started.elapsed()
+    );
+
+    // Wait for the delay + queued Add(1) to finish
+    assert_eq!(remote_calc.call(CalcMsg::Get).await?, 1);
+
+    // 3. Start an in-flight call, trigger Phase-1 draining via `node.shutdown()`, and verify
+    //    that new calls arriving while draining are rejected while the in-flight call finishes.
+    let inflight_client = remote_calc.clone();
+    let inflight = tokio::spawn(async move {
+        inflight_client
+            .call(CalcMsg::Delay(Duration::from_millis(250)))
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(40)).await;
+
+    let shutdown_task = tokio::spawn(async move { node.shutdown().await });
+    tokio::time::sleep(Duration::from_millis(25)).await;
+
+    let during_drain = remote_calc.call(CalcMsg::Get).await;
+    assert!(
+        matches!(
+            during_drain,
+            Err(RemoteActorError::ActorUnavailable | RemoteActorError::Transport(_))
+        ),
+        "Expected ActorUnavailable or Transport during Phase-1 drain, got {during_drain:?}"
+    );
+
+    assert_eq!(inflight.await??, 1);
+    shutdown_task.await??;
     Ok(())
 }

@@ -101,7 +101,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("------------------------------------------------------------");
 
     println!("[Client] Injecting fatal crash command into remote actor...");
-    let _ = remote_client.call(AccountMsg::SimulateCrash).await;
+    let crash_res = remote_client.call(AccountMsg::SimulateCrash).await;
+    assert!(
+        matches!(crash_res, Err(RemoteActorError::Actor(_))),
+        "Expected domain error from crashing handler, got {crash_res:?}"
+    );
 
     println!("[Client] Immediately dispatching new request over the existing gRPC channel...");
     // The server-side ActorClient automatically waits on its watch slot for Supervisor
@@ -124,10 +128,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("[Client] Account closed with final payout balance: {final_balance} EUR.");
     assert_eq!(final_balance, 1250);
 
-    // Wait a brief tick for actor exit event to be processed by supervisor
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    // Verify actor is now dead and Supervisor (RestartType::Transient) did not resurrect it!
+    // No sleep needed: StatefulActorRunner closes the mailbox receiver before sending the
+    // CloseAccount response, so the immediate follow-up call deterministically sees a closed
+    // channel and awaits SlotState::Stopped via the watch channel (0ms polling).
     match remote_client.call(AccountMsg::GetBalance).await {
         Err(RemoteActorError::ActorNotFound(_) | RemoteActorError::ActorUnavailable) => {
             println!(

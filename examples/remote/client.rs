@@ -66,7 +66,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // 5. Crash & Self-Healing Showcase
     println!("\n5️⃣ [Resilience Test] Sending crash injection to remote actor...");
-    let _ = client.call(AccountMsg::SimulateCrash).await;
+    let crash_res = client.call(AccountMsg::SimulateCrash).await;
+    assert!(
+        matches!(crash_res, Err(RemoteActorError::Actor(_))),
+        "Expected domain error from crashing handler, got {crash_res:?}"
+    );
     println!("   ↳ Crash command delivered! Remote supervisor is restarting actor...");
 
     println!("   ↳ Immediately dispatching follow-up deposit over existing gRPC connection...");
@@ -84,7 +88,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "   ↳ Supervisor (RestartType::Transient) honors clean shutdown and leaves actor dead."
     );
 
-    // Verify actor is truly stopped and no longer available
+    // No sleep needed: StatefulActorRunner closes its mailbox receiver before sending the
+    // CloseAccount response, so the follow-up call deterministically awaits SlotState::Stopped.
     match client.call(AccountMsg::GetBalance).await {
         Err(RemoteActorError::ActorNotFound(_) | RemoteActorError::ActorUnavailable) => {
             println!("   ↳ ✅ Verified: Follow-up call correctly reports actor no longer active!");

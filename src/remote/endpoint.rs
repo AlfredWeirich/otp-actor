@@ -205,6 +205,14 @@ where
             };
 
             match timeout {
+                Some(dur) if dur.is_zero() => match self.try_cast(msg) {
+                    Ok(()) => CastResponse {
+                        framework_error: None,
+                    },
+                    Err(err) => CastResponse {
+                        framework_error: Some(err.into()),
+                    },
+                },
                 Some(dur) => match self.cast_timeout(msg, dur).await {
                     Ok(()) => CastResponse {
                         framework_error: None,

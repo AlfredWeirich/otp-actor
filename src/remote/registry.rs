@@ -53,6 +53,14 @@ pub struct ActorNodeRegistry {
     endpoints: Arc<RwLock<EndpointMap>>,
 }
 
+impl std::fmt::Debug for ActorNodeRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActorNodeRegistry")
+            .field("registered_endpoints", &self.len())
+            .finish()
+    }
+}
+
 impl ActorNodeRegistry {
     /// Creates a new empty registry.
     pub fn new() -> Self {
