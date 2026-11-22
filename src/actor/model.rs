@@ -258,7 +258,9 @@ impl RestartTracker {
     pub(crate) fn offset_for_backoff(&mut self, backoff: Duration) {
         if !backoff.is_zero() {
             for t in &mut self.restarts {
-                *t += backoff;
+                if let Some(shifted) = t.checked_add(backoff) {
+                    *t = shifted;
+                }
             }
         }
     }

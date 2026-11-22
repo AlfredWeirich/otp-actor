@@ -1450,6 +1450,7 @@ impl Supervisor {
         loop {
             if *self.shutdown_rx.borrow() {
                 receiver.close();
+                scheduled_restart_rx.close();
                 self.graceful_shutdown_all().await;
                 return Ok(());
             }
@@ -1458,6 +1459,7 @@ impl Supervisor {
                 Ok(()) = self.shutdown_rx.changed() => {
                     if *self.shutdown_rx.borrow() {
                         receiver.close();
+                        scheduled_restart_rx.close();
                         self.graceful_shutdown_all().await;
                         return Ok(());
                     }
@@ -1488,12 +1490,18 @@ impl Supervisor {
                             instance = self.instance_id,
                             "All supervisor handles dropped. Aborting supervised child tasks."
                         );
+                        scheduled_restart_rx.close();
                         self.join_set.abort_all();
                         return Ok(());
                     };
 
                     if let Some(outcome) = self
-                        .handle_command(cmd, &mut receiver, &scheduled_restart_tx)
+                        .handle_command(
+                            cmd,
+                            &mut receiver,
+                            &scheduled_restart_tx,
+                            &mut scheduled_restart_rx,
+                        )
                         .await
                     {
                         return outcome;
@@ -1559,6 +1567,7 @@ impl Supervisor {
         cmd: SupervisorCommand,
         receiver: &mut Receiver<SupervisorCommand>,
         scheduled_restart_tx: &Sender<ScheduledRestartBatch>,
+        scheduled_restart_rx: &mut Receiver<ScheduledRestartBatch>,
     ) -> Option<TaskResult> {
         match cmd {
             SupervisorCommand::StartChild { spec, respond_to } => {
@@ -1730,6 +1739,7 @@ impl Supervisor {
 
             SupervisorCommand::Shutdown { respond_to } => {
                 receiver.close();
+                scheduled_restart_rx.close();
                 self.graceful_shutdown_all().await;
                 let _ = respond_to.send(());
                 return Some(Ok(()));
@@ -2121,12 +2131,20 @@ impl Supervisor {
                         "⏳ Backoff delay / sibling shutdown: Scheduling non-blocking restart..."
                     );
                     let tx = scheduled_restart_tx.clone();
+                    let mut shutdown_rx = self.shutdown_rx.clone();
                     tokio::spawn(async move {
                         TerminationPlan::execute_sequence(termination_plans).await;
                         if !backoff.is_zero() {
-                            tokio::time::sleep(backoff).await;
+                            tokio::select! {
+                                biased;
+                                Ok(_) = shutdown_rx.wait_for(|&shutting_down| shutting_down) => return,
+                                _ = tx.closed() => return,
+                                _ = tokio::time::sleep(backoff) => {}
+                            }
                         }
-                        let _ = tx.send((targets, None)).await;
+                        if !*shutdown_rx.borrow() && !tx.is_closed() {
+                            let _ = tx.send((targets, None)).await;
+                        }
                     });
                 }
                 Ok(())
@@ -2216,6 +2234,19 @@ impl Supervisor {
         }
     }
 
+    /// Transitions a child slot into permanent failure with `err` and notifies all pending waiters.
+    fn mark_entry_failed(entry: &mut ActiveChild, err: &SupervisorError) {
+        entry.phase = ChildPhase::Failed(err.clone());
+        entry.abort_handle = None;
+        let (term_tx, term_rx) = watch::channel(true);
+        drop(term_tx);
+        entry.term_rx = term_rx;
+        entry.slot_tx.send_replace(SlotState::Failed(err.clone()));
+        for waiter in entry.pending_resolutions.drain(..) {
+            let _ = waiter.send(Err(err.clone()));
+        }
+    }
+
     /// Spawns fresh child instances for the requested target names if their restart ticket matches.
     fn execute_restart(
         &mut self,
@@ -2223,6 +2254,8 @@ impl Supervisor {
         retry_tx: Option<&Sender<ScheduledRestartBatch>>,
     ) -> RestartOutcome {
         let mut result = Ok(());
+        let mut upstream_panic: Option<SupervisorError> = None;
+
         for (target_name, expected_ticket) in targets {
             let should_restart = self.children.get(&target_name).is_some_and(|entry| {
                 let phase_allows_restart = match &entry.phase {
@@ -2236,6 +2269,14 @@ impl Supervisor {
                 phase_allows_restart && entry.restart_ticket == expected_ticket
             });
             if !should_restart {
+                continue;
+            }
+            if let Some(err) = &upstream_panic {
+                // Under OneForAll / RestForOne, do not spawn dependent downstream children after a
+                // predecessor's factory panicked; mark their slots Failed so clients fail fast.
+                if let Some(entry) = self.children.get_mut(&target_name) {
+                    Self::mark_entry_failed(entry, err);
+                }
                 continue;
             }
             let new_spawn_id = self.allocate_spawn_id();
@@ -2299,14 +2340,12 @@ impl Supervisor {
                             };
                         }
 
-                        entry.phase = ChildPhase::Failed(err.clone());
-                        entry.abort_handle = None;
-                        let (term_tx, term_rx) = watch::channel(true);
-                        drop(term_tx);
-                        entry.term_rx = term_rx;
-                        entry.slot_tx.send_replace(SlotState::Failed(err.clone()));
-                        for waiter in entry.pending_resolutions.drain(..) {
-                            let _ = waiter.send(Err(err.clone()));
+                        Self::mark_entry_failed(entry, &err);
+                        if matches!(
+                            self.strategy,
+                            SupervisionStrategy::OneForAll | SupervisionStrategy::RestForOne
+                        ) {
+                            upstream_panic = Some(err.clone());
                         }
                         result = Err(err);
                         continue;

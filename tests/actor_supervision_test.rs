@@ -6619,3 +6619,259 @@ async fn test_resource_client_returns_max_restarts_exceeded_on_third_attempt() {
 
     root.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn test_duration_max_backoff_does_not_panic_supervisor_offset() {
+    let root = Supervisor::new("f06-max-backoff-sup");
+    let client = StatefulActorBuilder::from_default::<CounterActor>("max-backoff-worker")
+        .restart_policy(
+            RestartPolicy::new(3, Duration::from_secs(5))
+                .initial_backoff(Duration::MAX)
+                .max_backoff(Duration::MAX),
+        )
+        .spawn(&root)
+        .await
+        .unwrap();
+
+    let mut watcher = root.watch_child_status("max-backoff-worker").await.unwrap();
+    client.simulate_crash().await.unwrap();
+
+    // Supervisor must enter Restarting cleanly without panicking on `Instant + Duration::MAX`.
+    watcher
+        .wait_for(|s| matches!(s, ChildStatus::Restarting { .. }))
+        .await
+        .unwrap();
+    assert!(root.is_alive());
+
+    root.shutdown().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_stateful_actor_metrics_latency_uses_tokio_virtual_time() {
+    struct VirtualSleepActor;
+    impl StatefulActor for VirtualSleepActor {
+        type Message = Duration;
+        type Response = ();
+        type Error = &'static str;
+
+        async fn handle(
+            &mut self,
+            delay: Self::Message,
+            _ctx: &mut ActorContext<Self>,
+        ) -> Result<Self::Response, Self::Error> {
+            tokio::time::sleep(delay).await;
+            Ok(())
+        }
+    }
+
+    let root = Supervisor::new("f06-virtual-time-sup");
+    let client = StatefulActorBuilder::new("virtual-latency-actor", |_| VirtualSleepActor)
+        .spawn(&root)
+        .await
+        .unwrap();
+
+    client.call(Duration::from_millis(50)).await.unwrap();
+    let snap_after_call = root.snapshot().await.unwrap();
+    let call_metrics = snap_after_call
+        .child("virtual-latency-actor")
+        .unwrap()
+        .actor_metrics
+        .unwrap();
+    assert_eq!(call_metrics.calls_total, 1);
+    assert!(
+        call_metrics.last_latency_us >= 50_000,
+        "Expected virtual-time call latency >= 50_000us, got {}us",
+        call_metrics.last_latency_us
+    );
+
+    client.cast(Duration::from_millis(80)).await.unwrap();
+    client.call(Duration::from_millis(80)).await.unwrap();
+    let snap_after_cast = root.snapshot().await.unwrap();
+    let cast_metrics = snap_after_cast
+        .child("virtual-latency-actor")
+        .unwrap()
+        .actor_metrics
+        .unwrap();
+    assert_eq!(cast_metrics.casts_total, 1);
+    assert!(
+        cast_metrics.last_latency_us >= 80_000,
+        "Expected virtual-time latency >= 80_000us, got {}us",
+        cast_metrics.last_latency_us
+    );
+
+    root.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_manual_restart_aborts_dependent_siblings_when_upstream_factory_panics() {
+    let root = Supervisor::new("f07-factory-panic-root");
+    let sup = Supervisor::builder("f07-pipeline-sup")
+        .strategy(SupervisionStrategy::RestForOne)
+        .spawn(&root)
+        .await
+        .unwrap();
+
+    let stage1_panic = Arc::new(AtomicBool::new(false));
+    let s1_flag = stage1_panic.clone();
+    let stage1_spawns = Arc::new(AtomicUsize::new(0));
+    let stage2_spawns = Arc::new(AtomicUsize::new(0));
+    let stage3_spawns = Arc::new(AtomicUsize::new(0));
+    let s1_cnt = stage1_spawns.clone();
+    let s2_cnt = stage2_spawns.clone();
+    let s3_cnt = stage3_spawns.clone();
+
+    let stage1_spec = ChildSpec::new(
+        "stage-1",
+        Arc::new(move |spawn_ctx| {
+            s1_cnt.fetch_add(1, Ordering::SeqCst);
+            assert!(
+                !s1_flag.load(Ordering::SeqCst),
+                "stage-1 factory intentional panic"
+            );
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(4);
+            let mut shutdown_rx = spawn_ctx.shutdown_rx;
+            let handle = tokio::spawn(async move {
+                tokio::select! {
+                    _ = shutdown_rx.wait_for(|&s| s) => Ok(()),
+                    _ = rx.recv() => Ok(()),
+                }
+            });
+            (Arc::new(tx), handle)
+        }),
+        RestartPolicy::default(),
+    );
+    sup.start_child(stage1_spec).await.unwrap();
+
+    let c2 = StatefulActorBuilder::new("stage-2", move |_| {
+        s2_cnt.fetch_add(1, Ordering::SeqCst);
+        CounterActor::default()
+    })
+    .spawn(&sup)
+    .await
+    .unwrap();
+
+    let c3 = StatefulActorBuilder::new("stage-3", move |_| {
+        s3_cnt.fetch_add(1, Ordering::SeqCst);
+        CounterActor::default()
+    })
+    .spawn(&sup)
+    .await
+    .unwrap();
+
+    assert_eq!(
+        (
+            stage1_spawns.load(Ordering::SeqCst),
+            stage2_spawns.load(Ordering::SeqCst),
+            stage3_spawns.load(Ordering::SeqCst)
+        ),
+        (1, 1, 1)
+    );
+
+    // Enable panic on stage-1 factory and trigger manual RestForOne restart.
+    stage1_panic.store(true, Ordering::SeqCst);
+    let restart_err = sup.restart_child("stage-1").await.unwrap_err();
+    assert!(
+        matches!(restart_err, SupervisorError::FactoryPanicked(ref n, _) if n == "stage-1"),
+        "Expected FactoryPanicked for stage-1, got {restart_err:?}"
+    );
+
+    // Dependent stage-2 and stage-3 must NOT be spawned while stage-1 failed to start!
+    assert_eq!(stage1_spawns.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        stage2_spawns.load(Ordering::SeqCst),
+        1,
+        "Downstream stage-2 factory must not be invoked after stage-1 factory panicked"
+    );
+    assert_eq!(
+        stage3_spawns.load(Ordering::SeqCst),
+        1,
+        "Downstream stage-3 factory must not be invoked after stage-1 factory panicked"
+    );
+
+    // Downstream clients must fail fast with FactoryPanicked rather than hanging in Restarting.
+    let err2 = tokio::time::timeout(
+        Duration::from_millis(200),
+        c2.call(CounterMsg::GetWithInstance),
+    )
+    .await
+    .expect("c2.call must fail fast instead of hanging in Restarting")
+    .unwrap_err();
+    assert!(
+        matches!(
+            err2,
+            ActorError::Supervisor(SupervisorError::FactoryPanicked(ref n, _)) if n == "stage-1"
+        ),
+        "Expected FactoryPanicked(\"stage-1\") on c2, got {err2:?}"
+    );
+    let err3 = c3.call(CounterMsg::GetWithInstance).await.unwrap_err();
+    assert!(
+        matches!(
+            err3,
+            ActorError::Supervisor(SupervisorError::FactoryPanicked(ref n, _)) if n == "stage-1"
+        ),
+        "Expected FactoryPanicked(\"stage-1\") on c3, got {err3:?}"
+    );
+
+    // Snapshot reports all 3 children as Failed; once fixed, manual restart_child("stage-1") recovers all 3.
+    let failed_snap = sup.snapshot().await.unwrap();
+    assert!(failed_snap.children.iter().all(|c| c.status.is_failed()));
+
+    stage1_panic.store(false, Ordering::SeqCst);
+    sup.restart_child("stage-1").await.unwrap();
+    // stage-1 incremented instance_id on the failed attempt (#2) and recovered on #3;
+    // stage-2 and stage-3 were never spawned during the failed attempt so they recover on #2.
+    let recovered_snap = sup.snapshot().await.unwrap();
+    assert_eq!(recovered_snap.child("stage-1").unwrap().instance_id, 3);
+    assert!(recovered_snap.all_running());
+    assert_eq!(c2.call(CounterMsg::GetWithInstance).await.unwrap().1, 2);
+    assert_eq!(c3.call(CounterMsg::GetWithInstance).await.unwrap().1, 2);
+    assert_eq!(
+        (
+            stage1_spawns.load(Ordering::SeqCst),
+            stage2_spawns.load(Ordering::SeqCst),
+            stage3_spawns.load(Ordering::SeqCst)
+        ),
+        (3, 2, 2)
+    );
+
+    root.shutdown().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_backoff_sleep_task_exits_promptly_on_supervisor_shutdown() {
+    let root = Supervisor::new("f07-backoff-cancel-root");
+    let sup = Supervisor::builder("f07-backoff-cancel-svc")
+        .spawn(&root)
+        .await
+        .unwrap();
+
+    let factory_calls = Arc::new(AtomicUsize::new(0));
+    let fc = factory_calls.clone();
+    let client = StatefulActorBuilder::new("long-backoff-actor", move |_| {
+        fc.fetch_add(1, Ordering::SeqCst);
+        CounterActor::default()
+    })
+    .restart_policy(
+        RestartPolicy::new(3, Duration::from_secs(600))
+            .initial_backoff(Duration::from_secs(300))
+            .max_backoff(Duration::from_secs(300)),
+    )
+    .spawn(&sup)
+    .await
+    .unwrap();
+
+    let mut watcher = sup.watch_child_status("long-backoff-actor").await.unwrap();
+    client.simulate_crash().await.unwrap();
+    watcher
+        .wait_for(|s| matches!(s, ChildStatus::Restarting { .. }))
+        .await
+        .unwrap();
+
+    // Shutdown parent/root while backoff sleep (300s) is in flight; shutdown must finish immediately.
+    root.shutdown().await.unwrap();
+
+    // Advance virtual time well past the 300s backoff; cancelled task must never attempt a respawn.
+    tokio::time::advance(Duration::from_secs(310)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(factory_calls.load(Ordering::SeqCst), 1);
+}

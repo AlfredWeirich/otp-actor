@@ -787,7 +787,7 @@ impl<A: StatefulActor> StatefulActorRunner<A> {
         ctx: &mut ActorContext<A>,
     ) -> Result<A::Response, ActorError<A::Error>> {
         let _in_flight = self.metrics.enter_in_flight();
-        let started = std::time::Instant::now();
+        let started = Instant::now();
 
         let result = if let Some(timeout) = self.config.handler_timeout {
             match tokio::time::timeout(timeout, self.actor.handle(msg, ctx)).await {
@@ -825,7 +825,7 @@ impl<A: StatefulActor> StatefulActorRunner<A> {
         ctx: &mut ActorContext<A>,
     ) -> Result<(), ActorError<A::Error>> {
         let _in_flight = self.metrics.enter_in_flight();
-        let started = std::time::Instant::now();
+        let started = Instant::now();
 
         let result = if let Some(timeout) = self.config.handler_timeout {
             match tokio::time::timeout(timeout, self.actor.handle_cast(msg, ctx)).await {

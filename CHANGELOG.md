@@ -11,6 +11,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ## [0.3.4] - Unreleased
 
 ### Fixed
+- **Abort Dependent Restarts on Factory Panic & Cancel Backoff Tasks on Shutdown (`src/actor/supervisor.rs`, Finding `F-07`):**
+  - Under `SupervisionStrategy::OneForAll` / `RestForOne`, when a predecessor's child factory panics during a manual `restart_child`, `Supervisor::execute_restart` now aborts spawning subsequent dependent siblings and transitions their slots to `Failed(FactoryPanicked(...))` so clients fail fast and a follow-up `restart_child` can recover the entire group.
+  - Coupled backoff sleep tasks in `handle_child_failure` to both `shutdown_rx` and `scheduled_restart_tx.closed()` (and closed `scheduled_restart_rx` at shutdown entry) so pending backoff timers terminate immediately on supervisor shutdown.
+- **Overflow-Safe Backoff Offsetting & Virtual-Time Handler Latency (`src/actor/model.rs`, `src/actor/stateful_actor.rs`, Finding `F-06`):**
+  - Switched `RestartTracker::offset_for_backoff` to `Instant::checked_add(backoff)` to prevent panics when large backoffs (up to `Duration::MAX`) are configured.
+  - Switched internal handler latency measurements in `StatefulActorRunner::{execute_call, execute_cast}` to `tokio::time::Instant::now()` so `ActorMetrics` honors Tokio virtual time (`start_paused = true`), while preserving `std::time::Instant` on public `SupervisorHandle::started_at` and `LocalNodeMonitor::with_started_at` APIs.
 - **Preserve `SupervisorError` on Final Client Retry Attempt (`src/actor/stateful_actor.rs`, `src/actor/generic_actor.rs`, Finding `F-05`):**
   - Updated all retry loops in `ActorClient` (`call`, `call_retry`, `cast`, `send_control`) and `ResourceClient` (`get`, `send_control`) to also invoke `rebind_channel(...).await?` after `attempt == MAX_ATTEMPTS` (`3`).
   - Prevents terminal `SupervisorError::MaxRestartsExceeded` / `ChildNotFound` states reached on the 3rd crash from being masked as `ActorUnavailable` (both locally and via gRPC `RemoteError`).
