@@ -11,6 +11,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ## [0.3.4] - Unreleased
 
 ### Fixed
+- **Rescue Buffered Non-`Clone` `Call` Messages on `StatefulActor` Failure Exits (`src/actor/stateful_actor.rs`, Finding `F-03`):**
+  - Added `StatefulActorRunner::return_unprocessed_calls` and `escalate_failure` so all buffered `ActorEnvelope::Call` messages remaining in the mailbox are returned via `CallOutcome::Unprocessed(msg)` across `on_start` failure, `ActorControl::Fail` (from `handle`, `handle_cast`, or `finish_graceful_shutdown`), `handler_timeout`, and `ActorEnvelope::SimulateCrash`, letting `ActorClient::call` transparently rebind and deliver them to the replacement instance without losing non-`Clone` payloads.
+- **Sequential Reverse-Order Sibling Termination for `OneForAll` & `RestForOne` (`src/actor/supervisor.rs`, Finding `F-02`):**
+  - Updated `handle_restart_child` and both branches of `handle_child_failure` (recovery wave and `MaxRestartsExceeded`) to capture owned `TerminationPlan`s (including removed `RestartType::Temporary` siblings via `remove_child_slot_plan`) after synchronously transitioning slots to `ChildPhase::Restarting` / `Failed`.
+  - Sibling shutdown signals and `ShutdownPolicy` deadlines now execute strictly sequentially in reverse registration order (`TerminationPlan::execute_sequence`), ensuring downstream `on_stop` hooks complete and can flush final messages to upstream siblings before upstream siblings begin shutting down.
 - **Synchronous `ActorClient::try_cast` Rebinding (`src/actor/stateful_actor.rs`, Finding `F-01`):**
   - When `try_cast` encounters a closed cached mailbox (`TrySendError::Closed`), it now synchronously inspects the local `SlotState` watch channel (`try_rebind_sync`) without blocking or contacting the supervisor.
   - If a replacement instance is already `SlotState::Running`, `ActorClient` immediately updates its cached sender (so `queue_stats()` also reflects the live channel) and retries `try_send` on the new instance.

@@ -854,6 +854,31 @@ impl<A: StatefulActor> StatefulActorRunner<A> {
         result
     }
 
+    /// Closes the mailbox receiver and returns any already-buffered [`ActorEnvelope::Call`]
+    /// payloads via [`CallOutcome::Unprocessed`] so callers can rebind cleanly without losing
+    /// non-`Clone` messages.
+    fn return_unprocessed_calls(&mut self) {
+        self.receiver.close();
+        while let Ok(env) = self.receiver.try_recv() {
+            if let ActorEnvelope::Call { msg, respond_to } = env {
+                let _ = respond_to.send(CallOutcome::Unprocessed(msg));
+            }
+        }
+    }
+
+    /// Logs failure escalation, drains buffered calls via [`Self::return_unprocessed_calls`],
+    /// and returns `Err(reason)`.
+    fn escalate_failure(&mut self, reason: &str) -> TaskResult {
+        tracing::error!(
+            actor = %self.config.name,
+            instance = self.instance_id,
+            reason = %reason,
+            "💥 StatefulActor escalated failure to supervisor."
+        );
+        self.return_unprocessed_calls();
+        Err(reason.to_owned())
+    }
+
     /// Drains remaining queued messages in the mailbox and runs `on_stop` before exiting cleanly.
     async fn finish_graceful_shutdown(
         &mut self,
@@ -875,7 +900,8 @@ impl<A: StatefulActor> StatefulActorRunner<A> {
                     let res = self.execute_call(msg, ctx).await;
                     let _ = respond_to.send(CallOutcome::Processed(res));
                     if let ActorControl::Fail(reason) = &ctx.control {
-                        return Err(reason.clone());
+                        let reason_owned = reason.clone();
+                        return self.escalate_failure(&reason_owned);
                     }
                 }
                 ActorEnvelope::Cast { msg } => {
@@ -888,12 +914,16 @@ impl<A: StatefulActor> StatefulActorRunner<A> {
                         );
                     }
                     if let ActorControl::Fail(reason) = &ctx.control {
-                        return Err(reason.clone());
+                        let reason_owned = reason.clone();
+                        return self.escalate_failure(&reason_owned);
                     }
                 }
                 ActorEnvelope::Shutdown => continue,
                 #[cfg(any(test, feature = "chaos_test"))]
-                ActorEnvelope::SimulateCrash => break,
+                ActorEnvelope::SimulateCrash => {
+                    self.return_unprocessed_calls();
+                    break;
+                }
             }
         }
 
@@ -930,13 +960,7 @@ impl<A: StatefulActor> StatefulActorRunner<A> {
                 reason = %reason,
                 "❌ StatefulActor failed in on_start hook."
             );
-            // Return any queued `Call` messages untouched so callers can rebind without losing non-Clone payloads
-            self.receiver.close();
-            while let Ok(env) = self.receiver.try_recv() {
-                if let ActorEnvelope::Call { msg, respond_to } = env {
-                    let _ = respond_to.send(CallOutcome::Unprocessed(msg));
-                }
-            }
+            self.return_unprocessed_calls();
             return Err(reason);
         }
 
@@ -950,12 +974,7 @@ impl<A: StatefulActor> StatefulActorRunner<A> {
             }
             ActorControl::Fail(reason) => {
                 let reason_owned = reason.clone();
-                self.receiver.close();
-                while let Ok(env) = self.receiver.try_recv() {
-                    if let ActorEnvelope::Call { msg, respond_to } = env {
-                        let _ = respond_to.send(CallOutcome::Unprocessed(msg));
-                    }
-                }
+                self.return_unprocessed_calls();
                 return Err(reason_owned);
             }
         }
@@ -999,13 +1018,7 @@ impl<A: StatefulActor> StatefulActorRunner<A> {
                                 }
                                 ActorControl::Fail(reason) => {
                                     let reason_owned = reason.clone();
-                                    tracing::error!(
-                                        actor = %self.config.name,
-                                        instance = self.instance_id,
-                                        reason = %reason_owned,
-                                        "💥 StatefulActor escalated failure to supervisor."
-                                    );
-                                    return Err(reason_owned);
+                                    return self.escalate_failure(&reason_owned);
                                 }
                             }
                         }
@@ -1030,13 +1043,7 @@ impl<A: StatefulActor> StatefulActorRunner<A> {
                                 }
                                 ActorControl::Fail(reason) => {
                                     let reason_owned = reason.clone();
-                                    tracing::error!(
-                                        actor = %self.config.name,
-                                        instance = self.instance_id,
-                                        reason = %reason_owned,
-                                        "💥 StatefulActor escalated failure to supervisor."
-                                    );
-                                    return Err(reason_owned);
+                                    return self.escalate_failure(&reason_owned);
                                 }
                             }
                         }
@@ -1052,6 +1059,7 @@ impl<A: StatefulActor> StatefulActorRunner<A> {
                                 instance = self.instance_id,
                                 "💥 CRASH COMMAND RECEIVED: Terminating StatefulActor with crash error!"
                             );
+                            self.return_unprocessed_calls();
                             return Err(format!(
                                 "Intentional crash triggered via SimulateCrash on StatefulActor '{}' #{}",
                                 self.config.name, self.instance_id

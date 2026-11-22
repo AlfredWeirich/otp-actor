@@ -847,6 +847,127 @@ impl Drop for TermSignalGuard {
     }
 }
 
+/// Owned snapshot of everything required to terminate a single supervised child according to its
+/// [`ShutdownPolicy`], enabling strictly sequential termination in reverse registration order
+/// outside the `Supervisor::run` event loop.
+struct TerminationPlan {
+    supervisor_name: String,
+    child_name: String,
+    policy: ShutdownPolicy,
+    shutdown_tx: watch::Sender<bool>,
+    shutdown_signal: Option<ShutdownSignalFn>,
+    sender: UntypedSender,
+    abort_handle: Option<tokio::task::AbortHandle>,
+    term_rx: watch::Receiver<bool>,
+    /// Keeps a removed `Temporary` entry alive until termination finishes so its `Drop`
+    /// (`abort_handle.abort()`) does not cancel graceful shutdown prematurely.
+    removed_entry: Option<ActiveChild>,
+}
+
+impl TerminationPlan {
+    /// Captures termination inputs from an active slot while clearing `entry.sender`.
+    fn take(supervisor_name: String, child_name: String, entry: &mut ActiveChild) -> Self {
+        let sender = std::mem::replace(&mut entry.sender, Arc::new(()));
+        Self {
+            supervisor_name,
+            child_name,
+            policy: entry.shutdown_policy,
+            shutdown_tx: entry.shutdown_tx.clone(),
+            shutdown_signal: entry.shutdown_signal.clone(),
+            sender,
+            abort_handle: entry.abort_handle.clone(),
+            term_rx: entry.term_rx.clone(),
+            removed_entry: None,
+        }
+    }
+
+    /// Captures termination inputs from a removed `ActiveChild`, retaining ownership of the entry
+    /// until termination completes.
+    fn take_removed(supervisor_name: String, child_name: String, mut entry: ActiveChild) -> Self {
+        let mut plan = Self::take(supervisor_name, child_name, &mut entry);
+        plan.removed_entry = Some(entry);
+        plan
+    }
+
+    /// Emits the child's termination signal synchronously without waiting for completion,
+    /// returning `Some(timeout)` when [`ShutdownPolicy::Timeout`] requires an abort deadline.
+    fn signal_start(&mut self) -> Option<Duration> {
+        match self.policy {
+            ShutdownPolicy::BrutalKill => {
+                tracing::info!(
+                    supervisor = %self.supervisor_name,
+                    child = %self.child_name,
+                    "⚡ BrutalKill policy: Immediately aborting child."
+                );
+                if let Some(handle) = &self.abort_handle {
+                    handle.abort();
+                }
+                None
+            }
+            ShutdownPolicy::Timeout(timeout) => {
+                tracing::info!(
+                    supervisor = %self.supervisor_name,
+                    child = %self.child_name,
+                    timeout = ?timeout,
+                    "🛑 Signaling graceful shutdown to child with timeout..."
+                );
+                let _ = self.shutdown_tx.send(true);
+                if let Some(sig) = &self.shutdown_signal {
+                    sig(&self.sender);
+                }
+                self.sender = Arc::new(());
+                Some(timeout)
+            }
+            ShutdownPolicy::Infinity => {
+                tracing::info!(
+                    supervisor = %self.supervisor_name,
+                    child = %self.child_name,
+                    "🛑 Signaling graceful shutdown to child (Infinity policy)..."
+                );
+                let _ = self.shutdown_tx.send(true);
+                if let Some(sig) = &self.shutdown_signal {
+                    sig(&self.sender);
+                }
+                self.sender = Arc::new(());
+                None
+            }
+        }
+    }
+
+    /// Signals this child to terminate according to its [`ShutdownPolicy`] and awaits
+    /// task completion before returning (and before dropping any `removed_entry`).
+    async fn execute(mut self) {
+        if let Some(timeout) = self.signal_start() {
+            let timed_out = tokio::time::timeout(timeout, async {
+                let _ = self.term_rx.wait_for(|&done| done).await;
+            })
+            .await
+            .is_err();
+            if timed_out {
+                tracing::warn!(
+                    supervisor = %self.supervisor_name,
+                    child = %self.child_name,
+                    timeout = ?timeout,
+                    "⚠️ Child exceeded graceful shutdown timeout; forcefully aborting!"
+                );
+                if let Some(handle) = &self.abort_handle {
+                    handle.abort();
+                }
+                let _ = self.term_rx.wait_for(|&done| done).await;
+            }
+        } else {
+            let _ = self.term_rx.wait_for(|&done| done).await;
+        }
+    }
+
+    /// Terminates a sequence of children strictly one after another in slice order.
+    async fn execute_sequence(plans: Vec<Self>) {
+        for plan in plans {
+            plan.execute().await;
+        }
+    }
+}
+
 /// Unified, recursive OTP Supervisor actor capable of supervising leaf actors and nested [`Supervisor`]s.
 pub struct Supervisor {
     name: String,
@@ -1074,69 +1195,32 @@ impl Supervisor {
         child_name: String,
         entry: &mut ActiveChild,
     ) -> watch::Receiver<bool> {
-        let policy = entry.shutdown_policy;
-        let abort_handle = entry.abort_handle.clone();
-        let term_rx = entry.term_rx.clone();
-
-        match policy {
-            ShutdownPolicy::BrutalKill => {
-                tracing::info!(
-                    supervisor = %supervisor_name,
-                    child = %child_name,
-                    "⚡ BrutalKill policy: Immediately aborting child."
-                );
-                entry.sender = Arc::new(());
-                if let Some(handle) = abort_handle {
-                    handle.abort();
-                }
-            }
-            ShutdownPolicy::Timeout(timeout) => {
-                tracing::info!(
-                    supervisor = %supervisor_name,
-                    child = %child_name,
-                    timeout = ?timeout,
-                    "🛑 Signaling graceful shutdown to child with timeout..."
-                );
-                let _ = entry.shutdown_tx.send(true);
-                if let Some(sig) = &entry.shutdown_signal {
-                    sig(&entry.sender);
-                }
-                entry.sender = Arc::new(());
-
-                let mut rx_for_timeout = term_rx.clone();
-                tokio::spawn(async move {
-                    let timed_out = tokio::time::timeout(timeout, async {
-                        let _ = rx_for_timeout.wait_for(|&done| done).await;
-                    })
-                    .await
-                    .is_err();
-                    if timed_out {
-                        tracing::warn!(
-                            supervisor = %supervisor_name,
-                            child = %child_name,
-                            timeout = ?timeout,
-                            "⚠️ Child exceeded graceful shutdown timeout; forcefully aborting!"
-                        );
-                        if let Some(handle) = abort_handle {
-                            handle.abort();
-                        }
+        let mut plan = TerminationPlan::take(supervisor_name, child_name, entry);
+        let term_rx = plan.term_rx.clone();
+        if let Some(timeout) = plan.signal_start() {
+            let mut rx_for_timeout = term_rx.clone();
+            let abort_handle = plan.abort_handle.take();
+            let sup_name = plan.supervisor_name;
+            let c_name = plan.child_name;
+            tokio::spawn(async move {
+                let timed_out = tokio::time::timeout(timeout, async {
+                    let _ = rx_for_timeout.wait_for(|&done| done).await;
+                })
+                .await
+                .is_err();
+                if timed_out {
+                    tracing::warn!(
+                        supervisor = %sup_name,
+                        child = %c_name,
+                        timeout = ?timeout,
+                        "⚠️ Child exceeded graceful shutdown timeout; forcefully aborting!"
+                    );
+                    if let Some(handle) = abort_handle {
+                        handle.abort();
                     }
-                });
-            }
-            ShutdownPolicy::Infinity => {
-                tracing::info!(
-                    supervisor = %supervisor_name,
-                    child = %child_name,
-                    "🛑 Signaling graceful shutdown to child (Infinity policy)..."
-                );
-                let _ = entry.shutdown_tx.send(true);
-                if let Some(sig) = &entry.shutdown_signal {
-                    sig(&entry.sender);
                 }
-                entry.sender = Arc::new(());
-            }
+            });
         }
-
         term_rx
     }
 
@@ -1195,14 +1279,14 @@ impl Supervisor {
     }
 
     /// Removes a child slot completely (`child_specs`, `child_order`, `children`), publishes
-    /// `SlotState::Stopped`, notifies pending waiters, and optionally initiates graceful termination
-    /// if the child task is still running.
-    fn remove_child_slot(
+    /// `SlotState::Stopped`, notifies pending waiters, and returns a [`TerminationPlan`] if
+    /// `terminate_if_running` is true and the child task has not yet finished.
+    fn remove_child_slot_plan(
         &mut self,
         child_name: &str,
         expected_spawn_id: Option<u64>,
         terminate_if_running: bool,
-    ) -> Option<watch::Receiver<bool>> {
+    ) -> Option<TerminationPlan> {
         self.remove_child_spec(child_name);
         if let Some(expected_id) = expected_spawn_id
             && !self
@@ -1224,22 +1308,30 @@ impl Supervisor {
         }
 
         if terminate_if_running && !*entry.term_rx.borrow() {
-            let mut term_rx = Self::initiate_child_termination(
+            Some(TerminationPlan::take_removed(
                 self.name.clone(),
                 child_name.to_string(),
-                &mut entry,
-            );
-            let rx_clone = term_rx.clone();
-            // Move entry into the spawned task so its Drop (abort_handle.abort())
-            // only runs after graceful shutdown completes or times out.
-            tokio::spawn(async move {
-                let _ = term_rx.wait_for(|&done| done).await;
-                drop(entry);
-            });
-            Some(rx_clone)
+                entry,
+            ))
         } else {
             None
         }
+    }
+
+    /// Removes a child slot completely (`child_specs`, `child_order`, `children`), publishes
+    /// `SlotState::Stopped`, notifies pending waiters, and optionally initiates graceful termination
+    /// if the child task is still running.
+    fn remove_child_slot(
+        &mut self,
+        child_name: &str,
+        expected_spawn_id: Option<u64>,
+        terminate_if_running: bool,
+    ) -> Option<watch::Receiver<bool>> {
+        let plan =
+            self.remove_child_slot_plan(child_name, expected_spawn_id, terminate_if_running)?;
+        let term_rx = plan.term_rx.clone();
+        tokio::spawn(plan.execute());
+        Some(term_rx)
     }
 
     /// Gracefully shuts down all supervised children sequentially in reverse registration order
@@ -1707,22 +1799,30 @@ impl Supervisor {
         );
 
         let children_to_restart = self.restart_group_for(&child_name);
-        let mut term_receivers = Vec::new();
-        let mut temp_to_remove = Vec::new();
+        let mut termination_plans = Vec::new();
+        let mut targets = Vec::new();
 
         for target_name in children_to_restart.iter().rev() {
+            let is_skipped_sibling = self.children.get(target_name).is_some_and(|entry| {
+                target_name != &child_name
+                    && matches!(entry.phase, ChildPhase::Stopping | ChildPhase::Stopped)
+            });
+            if is_skipped_sibling {
+                continue;
+            }
+
+            let is_temp_sibling = self.children.get(target_name).is_some_and(|entry| {
+                target_name != &child_name && entry.restart_type == RestartType::Temporary
+            });
+            if is_temp_sibling {
+                if let Some(plan) = self.remove_child_slot_plan(target_name, None, true) {
+                    termination_plans.push(plan);
+                }
+                continue;
+            }
+
             let ticket = self.allocate_restart_ticket();
             if let Some(entry) = self.children.get_mut(target_name) {
-                if target_name != &child_name
-                    && matches!(entry.phase, ChildPhase::Stopping | ChildPhase::Stopped)
-                {
-                    continue;
-                }
-                if target_name != &child_name && entry.restart_type == RestartType::Temporary {
-                    temp_to_remove.push(target_name.clone());
-                    continue;
-                }
-
                 // Ensure manually restarted child is present in shared child_specs
                 if target_name == &child_name {
                     let mut guard = self
@@ -1756,39 +1856,20 @@ impl Supervisor {
                 });
 
                 if is_running {
-                    let rx = Self::initiate_child_termination(
+                    termination_plans.push(TerminationPlan::take(
                         self.name.clone(),
                         target_name.clone(),
                         entry,
-                    );
-                    term_receivers.push(rx);
+                    ));
                 }
+                targets.push((target_name.clone(), ticket));
             }
         }
 
-        for temp_name in temp_to_remove {
-            if let Some(rx) = self.remove_child_slot(&temp_name, None, true) {
-                term_receivers.push(rx);
-            }
-        }
+        // Preserve registration order for spawning after reverse-order termination completes.
+        targets.reverse();
 
-        let targets: Vec<(String, u64)> = children_to_restart
-            .iter()
-            .filter_map(|name| {
-                self.children.get(name).and_then(|entry| {
-                    if name != &child_name
-                        && (matches!(entry.phase, ChildPhase::Stopping | ChildPhase::Stopped)
-                            || entry.restart_type == RestartType::Temporary)
-                    {
-                        None
-                    } else {
-                        Some((name.clone(), entry.restart_ticket))
-                    }
-                })
-            })
-            .collect();
-
-        if term_receivers.is_empty() {
+        if termination_plans.is_empty() {
             let res = match self.execute_restart(targets, None) {
                 RestartOutcome::Done(r) => r,
                 RestartOutcome::Escalate(msg) => return Err(msg),
@@ -1797,9 +1878,7 @@ impl Supervisor {
         } else {
             let tx = scheduled_restart_tx.clone();
             tokio::spawn(async move {
-                for mut rx in term_receivers {
-                    let _ = rx.wait_for(|&done| done).await;
-                }
+                TerminationPlan::execute_sequence(termination_plans).await;
                 let _ = tx.send((targets, Some(respond_to))).await;
             });
         }
@@ -1982,65 +2061,53 @@ impl Supervisor {
 
         match maybe_backoff {
             Some(backoff) => {
-                let mut term_receivers = Vec::new();
-                let mut temp_to_remove = Vec::new();
+                let mut termination_plans = Vec::new();
+                let mut targets = Vec::new();
                 for target_name in children_to_restart.iter().rev() {
+                    let is_skipped_sibling = self.children.get(target_name).is_some_and(|entry| {
+                        target_name != &child_name
+                            && matches!(entry.phase, ChildPhase::Stopping | ChildPhase::Stopped)
+                    });
+                    if is_skipped_sibling {
+                        continue;
+                    }
+
+                    let is_temp = self
+                        .children
+                        .get(target_name)
+                        .is_some_and(|entry| entry.restart_type == RestartType::Temporary);
+                    if is_temp {
+                        let terminate = target_name != &child_name;
+                        if let Some(plan) = self.remove_child_slot_plan(target_name, None, terminate)
+                        {
+                            termination_plans.push(plan);
+                        }
+                        continue;
+                    }
+
                     let ticket = self.allocate_restart_ticket();
                     if let Some(entry) = self.children.get_mut(target_name) {
-                        if target_name != &child_name
-                            && matches!(entry.phase, ChildPhase::Stopping | ChildPhase::Stopped)
-                        {
-                            continue;
+                        let is_running = target_name != &child_name && !*entry.term_rx.borrow();
+                        entry.phase = ChildPhase::Restarting;
+                        entry.restart_ticket = ticket;
+                        entry.slot_tx.send_replace(SlotState::Restarting {
+                            instance_id: entry.instance_id,
+                        });
+                        if is_running {
+                            termination_plans.push(TerminationPlan::take(
+                                self.name.clone(),
+                                target_name.clone(),
+                                entry,
+                            ));
                         }
-                        if entry.restart_type == RestartType::Temporary {
-                            temp_to_remove.push(target_name.clone());
-                        } else {
-                            let is_running =
-                                target_name != &child_name && !*entry.term_rx.borrow();
-                            entry.phase = ChildPhase::Restarting;
-                            entry.restart_ticket = ticket;
-                            entry.slot_tx.send_replace(SlotState::Restarting {
-                                instance_id: entry.instance_id,
-                            });
-                            if is_running {
-                                let rx = Self::initiate_child_termination(
-                                    self.name.clone(),
-                                    target_name.clone(),
-                                    entry,
-                                );
-                                term_receivers.push(rx);
-                            }
-                        }
+                        targets.push((target_name.clone(), ticket));
                     }
                 }
 
-                for temp_name in temp_to_remove {
-                    let terminate = temp_name != child_name;
-                    if let Some(rx) = self.remove_child_slot(&temp_name, None, terminate) {
-                        term_receivers.push(rx);
-                    }
-                }
+                // Preserve registration order for spawning after reverse-order termination completes.
+                targets.reverse();
 
-                let targets: Vec<(String, u64)> = children_to_restart
-                    .iter()
-                    .filter_map(|name| {
-                        self.children.get(name).and_then(|entry| {
-                            if (name != &child_name
-                                && matches!(
-                                    entry.phase,
-                                    ChildPhase::Stopping | ChildPhase::Stopped
-                                ))
-                                || entry.restart_type == RestartType::Temporary
-                            {
-                                None
-                            } else {
-                                Some((name.clone(), entry.restart_ticket))
-                            }
-                        })
-                    })
-                    .collect();
-
-                if !defer_via_channel && backoff.is_zero() && term_receivers.is_empty() {
+                if !defer_via_channel && backoff.is_zero() && termination_plans.is_empty() {
                     if let RestartOutcome::Escalate(msg) =
                         self.execute_restart(targets, Some(scheduled_restart_tx))
                     {
@@ -2055,9 +2122,7 @@ impl Supervisor {
                     );
                     let tx = scheduled_restart_tx.clone();
                     tokio::spawn(async move {
-                        for mut rx in term_receivers {
-                            let _ = rx.wait_for(|&done| done).await;
-                        }
+                        TerminationPlan::execute_sequence(termination_plans).await;
                         if !backoff.is_zero() {
                             tokio::time::sleep(backoff).await;
                         }
@@ -2086,19 +2151,31 @@ impl Supervisor {
                     "🛑 CRASH-LOOP DETECTED: Child exceeded max restarts! Marking restart group as permanently FAILED."
                 );
 
-                let mut temp_to_remove = Vec::new();
+                let mut termination_plans = Vec::new();
                 for target_name in children_to_restart.iter().rev() {
+                    let is_skipped_sibling = self.children.get(target_name).is_some_and(|entry| {
+                        target_name != &child_name
+                            && matches!(entry.phase, ChildPhase::Stopping | ChildPhase::Stopped)
+                    });
+                    if is_skipped_sibling {
+                        continue;
+                    }
+
+                    let is_temp = self
+                        .children
+                        .get(target_name)
+                        .is_some_and(|entry| entry.restart_type == RestartType::Temporary);
+                    if is_temp {
+                        let terminate = target_name != &child_name;
+                        if let Some(plan) = self.remove_child_slot_plan(target_name, None, terminate)
+                        {
+                            termination_plans.push(plan);
+                        }
+                        continue;
+                    }
+
                     let ticket = self.allocate_restart_ticket();
                     if let Some(entry) = self.children.get_mut(target_name) {
-                        if target_name != &child_name
-                            && matches!(entry.phase, ChildPhase::Stopping | ChildPhase::Stopped)
-                        {
-                            continue;
-                        }
-                        if entry.restart_type == RestartType::Temporary {
-                            temp_to_remove.push(target_name.clone());
-                            continue;
-                        }
                         let is_running = target_name != &child_name && !*entry.term_rx.borrow();
                         entry.restart_ticket = ticket;
                         let err = if target_name == &child_name {
@@ -2122,18 +2199,17 @@ impl Supervisor {
                             let _ = waiter.send(Err(err.clone()));
                         }
                         if is_running {
-                            let _ = Self::initiate_child_termination(
+                            termination_plans.push(TerminationPlan::take(
                                 self.name.clone(),
                                 target_name.clone(),
                                 entry,
-                            );
+                            ));
                         }
                     }
                 }
 
-                for temp_name in temp_to_remove {
-                    let terminate = temp_name != child_name;
-                    let _ = self.remove_child_slot(&temp_name, None, terminate);
+                if !termination_plans.is_empty() {
+                    tokio::spawn(TerminationPlan::execute_sequence(termination_plans));
                 }
                 Ok(())
             }

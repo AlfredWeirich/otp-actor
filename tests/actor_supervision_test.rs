@@ -4,7 +4,7 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use otp_actor::actor::{
-    ActorContext, ActorError, ActorScope, CacheState, CallMessage, ChildKind, ChildLifecycle,
+    ActorClient, ActorContext, ActorError, ActorScope, CacheState, CallMessage, ChildKind, ChildLifecycle,
     ChildSpec, ChildStatus, HealthState, LocalNodeMonitor, QueueStats, ResourceActor,
     ResourceError, RestartPolicy, RestartTracker, RestartType, ShutdownPolicy, StatefulActor,
     StatefulActorBuilder, StatusOptions, SupervisionStrategy, Supervisor, SupervisorError,
@@ -5928,6 +5928,462 @@ async fn test_try_cast_returns_unavailable_while_restarting_and_supervisor_error
         ),
         "Expected ChildNotFound after stop_child, got {after_stop:?}"
     );
+
+    root.shutdown().await.unwrap();
+}
+
+enum PipelineStageMsg {
+    Ping,
+    Flush(String),
+    FailNow,
+}
+
+struct PipelineStageActor {
+    name: &'static str,
+    instance_id: usize,
+    flushed: Vec<String>,
+    flush_target: Option<ActorClient<PipelineStageActor>>,
+    log: Arc<std::sync::Mutex<Vec<String>>>,
+    stop_notify: Option<Arc<tokio::sync::Notify>>,
+}
+
+impl StatefulActor for PipelineStageActor {
+    type Message = PipelineStageMsg;
+    type Response = usize;
+    type Error = &'static str;
+
+    async fn handle(
+        &mut self,
+        msg: Self::Message,
+        ctx: &mut ActorContext<Self>,
+    ) -> Result<Self::Response, Self::Error> {
+        match msg {
+            PipelineStageMsg::Ping => Ok(ctx.instance_id()),
+            PipelineStageMsg::Flush(item) => {
+                self.flushed.push(item);
+                Ok(self.flushed.len())
+            }
+            PipelineStageMsg::FailNow => {
+                ctx.fail("simulated pipeline failure");
+                Err("simulated pipeline failure")
+            }
+        }
+    }
+
+    async fn on_stop(&mut self, _ctx: &mut ActorContext<Self>) {
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("{}_i{}_begin", self.name, self.instance_id));
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        if let Some(target) = &self.flush_target {
+            let count = target
+                .call(PipelineStageMsg::Flush(format!(
+                    "from_{}_i{}",
+                    self.name, self.instance_id
+                )))
+                .await
+                .expect("Upstream sibling must remain open while downstream on_stop runs");
+            self.log.lock().unwrap().push(format!(
+                "{}_i{}_flushed_{count}",
+                self.name, self.instance_id
+            ));
+        }
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("{}_i{}_end", self.name, self.instance_id));
+        if let Some(notify) = &self.stop_notify {
+            notify.notify_waiters();
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_one_for_all_crash_and_restart_child_terminate_siblings_sequentially_in_reverse_order()
+{
+    let root = Supervisor::new("root");
+    let sup = Supervisor::builder("ofa-seq-stop-sup")
+        .strategy(SupervisionStrategy::OneForAll)
+        .spawn(&root)
+        .await
+        .unwrap();
+
+    let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut clients = Vec::new();
+    for name in ["child_1", "child_2", "child_3"] {
+        let l = log.clone();
+        let c = StatefulActorBuilder::new(name, move |inst| PipelineStageActor {
+            name,
+            instance_id: inst,
+            flushed: Vec::new(),
+            flush_target: None,
+            log: l.clone(),
+            stop_notify: None,
+        })
+        .restart_policy(RestartPolicy::default().initial_backoff(Duration::ZERO))
+        .spawn(&sup)
+        .await
+        .unwrap();
+        clients.push(c);
+    }
+
+    let mut w1 = sup.watch_child_status("child_1").await.unwrap();
+    let mut w3 = sup.watch_child_status("child_3").await.unwrap();
+
+    // Part A: Crash child_1; running siblings child_3 and child_2 must terminate strictly sequentially
+    // in reverse registration order before any replacement instance starts.
+    let err = clients[0].call(PipelineStageMsg::FailNow).await.unwrap_err();
+    assert!(matches!(err, ActorError::HandlerFailed("simulated pipeline failure")));
+
+    w1.wait_for(|s| matches!(s, ChildStatus::Running { instance_id: 2 }))
+        .await
+        .unwrap();
+    w3.wait_for(|s| matches!(s, ChildStatus::Running { instance_id: 2 }))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        *log.lock().unwrap(),
+        vec![
+            "child_3_i1_begin",
+            "child_3_i1_end",
+            "child_2_i1_begin",
+            "child_2_i1_end",
+        ],
+        "OneForAll crash must terminate running siblings strictly sequentially in reverse order"
+    );
+
+    // Part B: Manual restart_child("child_1") while all 3 children run must stop child_3 -> child_2 -> child_1.
+    log.lock().unwrap().clear();
+    sup.restart_child("child_1").await.unwrap();
+
+    assert_eq!(
+        *log.lock().unwrap(),
+        vec![
+            "child_3_i2_begin",
+            "child_3_i2_end",
+            "child_2_i2_begin",
+            "child_2_i2_end",
+            "child_1_i2_begin",
+            "child_1_i2_end",
+        ],
+        "Manual OneForAll restart_child must terminate all running targets strictly sequentially in reverse order"
+    );
+
+    root.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_rest_for_one_crash_and_max_restarts_terminate_downstream_sequentially_in_reverse_order()
+ {
+    let root = Supervisor::new("root");
+    let sup = Supervisor::builder("rfo-seq-stop-sup")
+        .strategy(SupervisionStrategy::RestForOne)
+        .spawn(&root)
+        .await
+        .unwrap();
+
+    let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let stage3_stop_notify = Arc::new(tokio::sync::Notify::new());
+
+    let l1 = log.clone();
+    let stage1 = StatefulActorBuilder::new("stage_1", move |inst| PipelineStageActor {
+        name: "stage_1",
+        instance_id: inst,
+        flushed: Vec::new(),
+        flush_target: None,
+        log: l1.clone(),
+        stop_notify: None,
+    })
+    .spawn(&sup)
+    .await
+    .unwrap();
+
+    let l2 = log.clone();
+    let stage2 = StatefulActorBuilder::new("stage_2", move |inst| PipelineStageActor {
+        name: "stage_2",
+        instance_id: inst,
+        flushed: Vec::new(),
+        flush_target: None,
+        log: l2.clone(),
+        stop_notify: None,
+    })
+    .restart_policy(RestartPolicy::new(1, Duration::from_secs(10)).initial_backoff(Duration::ZERO))
+    .spawn(&sup)
+    .await
+    .unwrap();
+
+    let l3 = log.clone();
+    let n3 = stage3_stop_notify.clone();
+    let stage3 = StatefulActorBuilder::new("stage_3", move |inst| PipelineStageActor {
+        name: "stage_3",
+        instance_id: inst,
+        flushed: Vec::new(),
+        flush_target: None,
+        log: l3.clone(),
+        stop_notify: Some(n3.clone()),
+    })
+    .spawn(&sup)
+    .await
+    .unwrap();
+
+    let l4 = log.clone();
+    let s3_for_flush = stage3.clone();
+    let _stage4 = StatefulActorBuilder::new("stage_4", move |inst| PipelineStageActor {
+        name: "stage_4",
+        instance_id: inst,
+        flushed: Vec::new(),
+        flush_target: Some(s3_for_flush.clone()),
+        log: l4.clone(),
+        stop_notify: None,
+    })
+    .spawn(&sup)
+    .await
+    .unwrap();
+
+    let mut w2 = sup.watch_child_status("stage_2").await.unwrap();
+    let mut w4 = sup.watch_child_status("stage_4").await.unwrap();
+
+    // Part A: Crash stage_2 -> stage_4 must run on_stop (and even flush a `call` into still-open
+    // stage_3!) and exit completely BEFORE stage_3 begins shutting down. stage_1 stays untouched.
+    let _ = stage2.call(PipelineStageMsg::FailNow).await;
+    w2.wait_for(|s| matches!(s, ChildStatus::Running { instance_id: 2 }))
+        .await
+        .unwrap();
+    w4.wait_for(|s| matches!(s, ChildStatus::Running { instance_id: 2 }))
+        .await
+        .unwrap();
+
+    assert_eq!(stage1.call(PipelineStageMsg::Ping).await.unwrap(), 1);
+    assert_eq!(
+        *log.lock().unwrap(),
+        vec![
+            "stage_4_i1_begin",
+            "stage_4_i1_flushed_1",
+            "stage_4_i1_end",
+            "stage_3_i1_begin",
+            "stage_3_i1_end",
+        ],
+        "Downstream stage_4 must finish on_stop (while stage_3 is still open) before stage_3 begins stopping"
+    );
+
+    // Warm `stage3` client on instance #2 (as in normal pipeline operation) before Part B crash.
+    assert_eq!(stage3.call(PipelineStageMsg::Ping).await.unwrap(), 2);
+
+    // Part B: Crash stage_2 again -> hits max_restarts = 1 -> permanent Failure path.
+    // Downstream stage_4 and stage_3 must still terminate sequentially in reverse order.
+    log.lock().unwrap().clear();
+    let notified = stage3_stop_notify.notified();
+    let _ = stage2.call(PipelineStageMsg::FailNow).await;
+    w4.wait_for(|s| matches!(s, ChildStatus::Failed(_)))
+        .await
+        .unwrap();
+    notified.await;
+
+    assert_eq!(stage1.call(PipelineStageMsg::Ping).await.unwrap(), 1);
+    assert_eq!(
+        *log.lock().unwrap(),
+        vec![
+            "stage_4_i2_begin",
+            "stage_4_i2_flushed_1",
+            "stage_4_i2_end",
+            "stage_3_i2_begin",
+            "stage_3_i2_end",
+        ],
+        "MaxRestartsExceeded under RestForOne must terminate running siblings sequentially in reverse order"
+    );
+
+    root.shutdown().await.unwrap();
+}
+
+/// Intentionally non-`Clone` message enum proving buffered payloads move untouched across crashes.
+enum BufferedNonCloneMsg {
+    BlockAndFail(tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<()>),
+    SleepAndTimeout(tokio::sync::oneshot::Sender<()>),
+    SlowGate(tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<()>),
+    ProcessValue(usize),
+}
+
+#[derive(Default)]
+struct BufferedFailActor;
+
+impl StatefulActor for BufferedFailActor {
+    type Message = BufferedNonCloneMsg;
+    type Response = usize;
+    type Error = &'static str;
+
+    async fn handle(
+        &mut self,
+        msg: Self::Message,
+        ctx: &mut ActorContext<Self>,
+    ) -> Result<Self::Response, Self::Error> {
+        match msg {
+            BufferedNonCloneMsg::BlockAndFail(entered_tx, release_rx) => {
+                let _ = entered_tx.send(());
+                let _ = release_rx.await;
+                ctx.fail("explicit handler fail");
+                Err("explicit handler fail")
+            }
+            BufferedNonCloneMsg::SleepAndTimeout(entered_tx) => {
+                let _ = entered_tx.send(());
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                Ok(0)
+            }
+            BufferedNonCloneMsg::SlowGate(entered_tx, release_rx) => {
+                let _ = entered_tx.send(());
+                let _ = release_rx.await;
+                Ok(ctx.instance_id())
+            }
+            BufferedNonCloneMsg::ProcessValue(v) => Ok(v * 100 + ctx.instance_id()),
+        }
+    }
+
+    async fn handle_cast(
+        &mut self,
+        msg: Self::Message,
+        ctx: &mut ActorContext<Self>,
+    ) -> Result<(), Self::Error> {
+        let _ = self.handle(msg, ctx).await?;
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn test_stateful_actor_ctx_fail_and_handler_timeout_rescue_buffered_non_clone_calls() {
+    let root = Supervisor::new("buffered-calls-sup");
+    let client = StatefulActorBuilder::from_default::<BufferedFailActor>("buffered-worker")
+        .handler_timeout(Duration::from_millis(30))
+        .restart_policy(RestartPolicy::new(10, Duration::from_secs(10)).initial_backoff(Duration::from_millis(10)))
+        .spawn(&root)
+        .await
+        .unwrap();
+
+    // 1. Trigger `ctx.fail(...)` from a `Call` while two non-Clone calls sit in the mailbox buffer.
+    let (e1_tx, e1_rx) = tokio::sync::oneshot::channel();
+    let (r1_tx, r1_rx) = tokio::sync::oneshot::channel();
+    let c_fail = client.clone();
+    let fail_call = tokio::spawn(async move {
+        c_fail
+            .call(BufferedNonCloneMsg::BlockAndFail(e1_tx, r1_rx))
+            .await
+    });
+    e1_rx.await.unwrap();
+
+    let c_b1 = client.clone();
+    let buffered_1 =
+        tokio::spawn(async move { c_b1.call(BufferedNonCloneMsg::ProcessValue(7)).await });
+    let c_b2 = client.clone();
+    let buffered_2 =
+        tokio::spawn(async move { c_b2.call(BufferedNonCloneMsg::ProcessValue(9)).await });
+    tokio::time::sleep(Duration::from_millis(15)).await;
+
+    let _ = r1_tx.send(());
+    assert!(matches!(
+        fail_call.await.unwrap(),
+        Err(ActorError::HandlerFailed("explicit handler fail"))
+    ));
+    assert_eq!(buffered_1.await.unwrap().unwrap(), 702);
+    assert_eq!(buffered_2.await.unwrap().unwrap(), 902);
+
+    // 2. Trigger `handler_timeout` while a non-Clone call sits in the mailbox buffer.
+    let (e2_tx, e2_rx) = tokio::sync::oneshot::channel();
+    let c_to = client.clone();
+    let timeout_call =
+        tokio::spawn(async move { c_to.call(BufferedNonCloneMsg::SleepAndTimeout(e2_tx)).await });
+    e2_rx.await.unwrap();
+
+    let c_b3 = client.clone();
+    let buffered_3 =
+        tokio::spawn(async move { c_b3.call(BufferedNonCloneMsg::ProcessValue(5)).await });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    assert!(matches!(
+        timeout_call.await.unwrap(),
+        Err(ActorError::Timeout(_))
+    ));
+    assert_eq!(buffered_3.await.unwrap().unwrap(), 503);
+
+    // 3. Trigger `ctx.fail(...)` from a `Cast` while a non-Clone call sits in the mailbox buffer.
+    let (e3_tx, e3_rx) = tokio::sync::oneshot::channel();
+    let (r3_tx, r3_rx) = tokio::sync::oneshot::channel();
+    client
+        .cast(BufferedNonCloneMsg::BlockAndFail(e3_tx, r3_rx))
+        .await
+        .unwrap();
+    e3_rx.await.unwrap();
+
+    let c_b4 = client.clone();
+    let buffered_4 =
+        tokio::spawn(async move { c_b4.call(BufferedNonCloneMsg::ProcessValue(3)).await });
+    tokio::time::sleep(Duration::from_millis(15)).await;
+
+    let _ = r3_tx.send(());
+    assert_eq!(buffered_4.await.unwrap().unwrap(), 304);
+
+    // 4. Trigger `ctx.fail(...)` inside `finish_graceful_shutdown` drain while another Call is queued.
+    let (e4_tx, e4_rx) = tokio::sync::oneshot::channel();
+    let (r4_tx, r4_rx) = tokio::sync::oneshot::channel();
+    let (e5_tx, e5_rx) = tokio::sync::oneshot::channel();
+    let (r5_tx, r5_rx) = tokio::sync::oneshot::channel();
+    let c_gate = client.clone();
+    let gate_call =
+        tokio::spawn(async move { c_gate.call(BufferedNonCloneMsg::SlowGate(e4_tx, r4_rx)).await });
+    e4_rx.await.unwrap();
+
+    let c_drain_fail = client.clone();
+    let drain_fail_call = tokio::spawn(async move {
+        c_drain_fail
+            .call(BufferedNonCloneMsg::BlockAndFail(e5_tx, r5_rx))
+            .await
+    });
+    let c_b5 = client.clone();
+    let buffered_5 =
+        tokio::spawn(async move { c_b5.call(BufferedNonCloneMsg::ProcessValue(8)).await });
+    tokio::time::sleep(Duration::from_millis(15)).await;
+
+    // Request actor shutdown via client (`ActorEnvelope::Shutdown` enters `finish_graceful_shutdown`).
+    client.shutdown().await.unwrap();
+    let _ = r4_tx.send(());
+    assert_eq!(gate_call.await.unwrap().unwrap(), 4);
+
+    e5_rx.await.unwrap();
+    let _ = r5_tx.send(());
+    assert!(matches!(
+        drain_fail_call.await.unwrap(),
+        Err(ActorError::HandlerFailed("explicit handler fail"))
+    ));
+    assert_eq!(buffered_5.await.unwrap().unwrap(), 805);
+
+    root.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_stateful_actor_simulate_crash_rescues_buffered_non_clone_calls() {
+    let root = Supervisor::new("sim-crash-buffered-sup");
+    let client = StatefulActorBuilder::from_default::<BufferedFailActor>("sim-crash-worker")
+        .restart_policy(RestartPolicy::default().initial_backoff(Duration::from_millis(10)))
+        .spawn(&root)
+        .await
+        .unwrap();
+
+    let (e_tx, e_rx) = tokio::sync::oneshot::channel();
+    let (r_tx, r_rx) = tokio::sync::oneshot::channel();
+    let c_gate = client.clone();
+    let gate_call =
+        tokio::spawn(async move { c_gate.call(BufferedNonCloneMsg::SlowGate(e_tx, r_rx)).await });
+    e_rx.await.unwrap();
+
+    // Enqueue SimulateCrash first, then a non-Clone Call right behind it in the same mailbox.
+    client.simulate_crash().await.unwrap();
+    let c_buffered = client.clone();
+    let buffered_call =
+        tokio::spawn(async move { c_buffered.call(BufferedNonCloneMsg::ProcessValue(11)).await });
+    tokio::time::sleep(Duration::from_millis(15)).await;
+
+    let _ = r_tx.send(());
+    assert_eq!(gate_call.await.unwrap().unwrap(), 1);
+    assert_eq!(buffered_call.await.unwrap().unwrap(), 1102);
 
     root.shutdown().await.unwrap();
 }
