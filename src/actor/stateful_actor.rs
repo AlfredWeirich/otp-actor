@@ -24,6 +24,7 @@ use tokio::sync::{
     oneshot, watch,
 };
 use tokio::time::{Instant, MissedTickBehavior, interval_at};
+use tracing::Instrument;
 
 use super::model::{RestartPolicy, RestartType, ShutdownPolicy, SupervisorError, TaskResult};
 use super::supervisor::{
@@ -149,6 +150,7 @@ pub struct ActorContext<A: StatefulActor> {
     weak_sender: WeakSender<ActorEnvelope<A>>,
     cancel_rx: watch::Receiver<bool>,
     supervisor: SupervisorHandle,
+    actor_span: tracing::Span,
 }
 
 impl<A: StatefulActor> Clone for ActorContext<A> {
@@ -160,6 +162,7 @@ impl<A: StatefulActor> Clone for ActorContext<A> {
             weak_sender: self.weak_sender.clone(),
             cancel_rx: self.cancel_rx.clone(),
             supervisor: self.supervisor.clone(),
+            actor_span: self.actor_span.clone(),
         }
     }
 }
@@ -175,13 +178,14 @@ impl<A: StatefulActor> std::fmt::Debug for ActorContext<A> {
 }
 
 impl<A: StatefulActor> ActorContext<A> {
-    /// Creates a new actor context for the given actor name, instance ID, weak self-sender, lifecycle signal, and parent supervisor handle.
+    /// Creates a new actor context for the given actor name, instance ID, weak self-sender, lifecycle signal, parent supervisor handle, and actor tracing span.
     pub(crate) fn new(
         name: impl Into<String>,
         instance_id: usize,
         weak_sender: WeakSender<ActorEnvelope<A>>,
         cancel_rx: watch::Receiver<bool>,
         supervisor: SupervisorHandle,
+        actor_span: tracing::Span,
     ) -> Self {
         Self {
             name: name.into(),
@@ -190,6 +194,7 @@ impl<A: StatefulActor> ActorContext<A> {
             weak_sender,
             cancel_rx,
             supervisor,
+            actor_span,
         }
     }
 
@@ -233,20 +238,24 @@ impl<A: StatefulActor> ActorContext<A> {
     pub fn send_after(&self, delay: Duration, msg: A::Message) -> tokio::task::AbortHandle {
         let weak_tx = self.weak_sender.clone();
         let mut cancel_rx = self.cancel_rx.clone();
-        tokio::spawn(async move {
-            tokio::select! {
-                biased;
-                _ = cancel_rx.wait_for(|&cancelled| cancelled) => return,
-                _ = tokio::time::sleep(delay) => {}
-            }
-            if let Some(tx) = weak_tx.upgrade() {
+        let span = self.actor_span.clone();
+        tokio::spawn(
+            async move {
                 tokio::select! {
                     biased;
-                    _ = cancel_rx.wait_for(|&cancelled| cancelled) => {}
-                    _ = tx.send(ActorEnvelope::Cast { msg }) => {}
+                    _ = cancel_rx.wait_for(|&cancelled| cancelled) => return,
+                    _ = tokio::time::sleep(delay) => {}
+                }
+                if let Some(tx) = weak_tx.upgrade() {
+                    tokio::select! {
+                        biased;
+                        _ = cancel_rx.wait_for(|&cancelled| cancelled) => {}
+                        _ = tx.send(ActorEnvelope::Cast { msg }) => {}
+                    }
                 }
             }
-        })
+            .instrument(span),
+        )
         .abort_handle()
     }
 
@@ -297,38 +306,42 @@ impl<A: StatefulActor> ActorContext<A> {
 
         let weak_tx = self.weak_sender.clone();
         let mut cancel_rx = self.cancel_rx.clone();
-        tokio::spawn(async move {
-            let Some(start) = Instant::now().checked_add(period) else {
-                let _ = cancel_rx.wait_for(|&cancelled| cancelled).await;
-                return;
-            };
-
-            let mut ticker = interval_at(start, period);
-            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = cancel_rx.wait_for(|&cancelled| cancelled) => break,
-                    _ = ticker.tick() => {}
-                }
-
-                let Some(tx) = weak_tx.upgrade() else {
-                    break;
+        let span = self.actor_span.clone();
+        tokio::spawn(
+            async move {
+                let Some(start) = Instant::now().checked_add(period) else {
+                    let _ = cancel_rx.wait_for(|&cancelled| cancelled).await;
+                    return;
                 };
 
-                let permit = tokio::select! {
-                    biased;
-                    _ = cancel_rx.wait_for(|&cancelled| cancelled) => break,
-                    res = tx.reserve() => match res {
-                        Ok(permit) => permit,
-                        Err(_) => break,
+                let mut ticker = interval_at(start, period);
+                ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = cancel_rx.wait_for(|&cancelled| cancelled) => break,
+                        _ = ticker.tick() => {}
                     }
-                };
 
-                permit.send(ActorEnvelope::Cast { msg: make_msg() });
+                    let Some(tx) = weak_tx.upgrade() else {
+                        break;
+                    };
+
+                    let permit = tokio::select! {
+                        biased;
+                        _ = cancel_rx.wait_for(|&cancelled| cancelled) => break,
+                        res = tx.reserve() => match res {
+                            Ok(permit) => permit,
+                            Err(_) => break,
+                        }
+                    };
+
+                    permit.send(ActorEnvelope::Cast { msg: make_msg() });
+                }
             }
-        })
+            .instrument(span),
+        )
         .abort_handle()
     }
 
@@ -350,7 +363,7 @@ impl<A: StatefulActor> ActorContext<A> {
             weak_sender: self.weak_sender.clone(),
             cancel_rx: self.cancel_rx.clone(),
         };
-        tokio::spawn(task(scope)).abort_handle()
+        tokio::spawn(task(scope).instrument(self.actor_span.clone())).abort_handle()
     }
 
     /// Forwards items from an [`mpsc::Receiver<T>`] into this actor as `cast` messages via `map_msg`.
@@ -370,33 +383,37 @@ impl<A: StatefulActor> ActorContext<A> {
     {
         let weak_tx = self.weak_sender.clone();
         let mut cancel_rx = self.cancel_rx.clone();
-        tokio::spawn(async move {
-            loop {
-                let item = tokio::select! {
-                    biased;
-                    _ = cancel_rx.wait_for(|&cancelled| cancelled) => break,
-                    maybe_item = rx.recv() => match maybe_item {
-                        Some(item) => item,
-                        None => break,
-                    }
-                };
+        let span = self.actor_span.clone();
+        tokio::spawn(
+            async move {
+                loop {
+                    let item = tokio::select! {
+                        biased;
+                        _ = cancel_rx.wait_for(|&cancelled| cancelled) => break,
+                        maybe_item = rx.recv() => match maybe_item {
+                            Some(item) => item,
+                            None => break,
+                        }
+                    };
 
-                let Some(tx) = weak_tx.upgrade() else {
-                    break;
-                };
+                    let Some(tx) = weak_tx.upgrade() else {
+                        break;
+                    };
 
-                let permit = tokio::select! {
-                    biased;
-                    _ = cancel_rx.wait_for(|&cancelled| cancelled) => break,
-                    res = tx.reserve() => match res {
-                        Ok(permit) => permit,
-                        Err(_) => break,
-                    }
-                };
+                    let permit = tokio::select! {
+                        biased;
+                        _ = cancel_rx.wait_for(|&cancelled| cancelled) => break,
+                        res = tx.reserve() => match res {
+                            Ok(permit) => permit,
+                            Err(_) => break,
+                        }
+                    };
 
-                permit.send(ActorEnvelope::Cast { msg: map_msg(item) });
+                    permit.send(ActorEnvelope::Cast { msg: map_msg(item) });
+                }
             }
-        })
+            .instrument(span),
+        )
         .abort_handle()
     }
 
@@ -653,20 +670,28 @@ where
             let factory = actor_factory.clone();
             let cfg = config.clone();
             let runner_metrics = metrics_for_factory.clone();
-            let task_handle = tokio::spawn(async move {
-                let actor = (factory)(spawn_ctx.instance_id);
-                let runner = StatefulActorRunner::new(
-                    cfg,
-                    actor,
-                    rx,
-                    weak_tx,
-                    spawn_ctx.shutdown_rx,
-                    spawn_ctx.supervisor,
-                    spawn_ctx.instance_id,
-                    runner_metrics,
-                );
-                runner.run().await
-            });
+            let actor_span = tracing::info_span!(
+                "stateful_actor",
+                actor = %cfg.name,
+                instance = spawn_ctx.instance_id,
+            );
+            let task_handle = tokio::spawn(
+                async move {
+                    let actor = (factory)(spawn_ctx.instance_id);
+                    let runner = StatefulActorRunner::new(
+                        cfg,
+                        actor,
+                        rx,
+                        weak_tx,
+                        spawn_ctx.shutdown_rx,
+                        spawn_ctx.supervisor,
+                        spawn_ctx.instance_id,
+                        runner_metrics,
+                    );
+                    runner.run().await
+                }
+                .instrument(actor_span),
+            );
             (sender_arc, task_handle)
         });
 
@@ -950,6 +975,7 @@ impl<A: StatefulActor> StatefulActorRunner<A> {
             self.weak_sender.clone(),
             cancel_rx,
             self.supervisor.clone(),
+            tracing::Span::current(),
         );
 
         if let Err(err) = self.actor.on_start(&mut ctx).await {

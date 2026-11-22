@@ -7069,3 +7069,111 @@ async fn test_resource_actor_zero_clones_on_prewarm_and_exact_waiter_clones() {
 
     root.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn test_format_prometheus_metrics_nested_supervisor_path_escaping() {
+    let root = Supervisor::new("root\"a\\b\nc");
+    let sub = Supervisor::builder("sub\"x\\y")
+        .spawn(&root)
+        .await
+        .unwrap();
+
+    let worker = StatefulActorBuilder::from_default::<TelemetryTestActor>("leaf\"1\n")
+        .channel_capacity(4)
+        .spawn(&sub)
+        .await
+        .unwrap();
+    let _res = ResourceActor::builder("cache\"2")
+        .worker(|_| async { Ok::<_, String>(TimedResource::perpetual("v".to_string())) })
+        .eager_prewarm(true)
+        .spawn(&sub)
+        .await
+        .unwrap();
+
+    assert_eq!(worker.call(TelemetryTestMsg::Ok).await.unwrap(), "ok");
+
+    let monitor = LocalNodeMonitor::new(root.clone());
+    let prom = monitor
+        .prometheus_metrics(StatusOptions::default())
+        .await
+        .unwrap();
+
+    let expected_path = "root\\\"a\\\\b\\nc/sub\\\"x\\\\y";
+    assert!(prom.contains(&format!(
+        "otp_actor_child_status{{supervisor=\"{expected_path}\",child=\"leaf\\\"1\\n\",kind=\"actor\"}} 0\n"
+    )));
+    assert!(prom.contains(&format!(
+        "otp_actor_calls_total{{supervisor=\"{expected_path}\",child=\"leaf\\\"1\\n\"}} 1\n"
+    )));
+    assert!(prom.contains(&format!(
+        "otp_actor_mailbox_capacity{{supervisor=\"{expected_path}\",child=\"leaf\\\"1\\n\"}} 4\n"
+    )));
+    assert!(prom.contains(&format!(
+        "otp_actor_resource_cache_state{{supervisor=\"{expected_path}\",child=\"cache\\\"2\"}} 1\n"
+    )));
+
+    root.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_tracing_spans_propagate_to_actors_workers_and_scoped_tasks() {
+    let _sub_guard = tracing::subscriber::set_default(tracing_subscriber::registry());
+    let root = Supervisor::new("f13-span-root");
+
+    // 1. ResourceActor worker inherits `resource_worker` span
+    let worker_span_name = Arc::new(std::sync::Mutex::new(None::<&'static str>));
+    let wsn = worker_span_name.clone();
+    let res_client = ResourceActor::builder("span-res")
+        .worker(move |_ctx: WorkerContext| {
+            let wsn = wsn.clone();
+            async move {
+                *wsn.lock().unwrap() = tracing::Span::current().metadata().map(|m| m.name());
+                Ok::<_, String>(TimedResource::perpetual("ok".to_string()))
+            }
+        })
+        .spawn(&root)
+        .await
+        .unwrap();
+    assert_eq!(res_client.get().await.unwrap(), "ok");
+    assert_eq!(*worker_span_name.lock().unwrap(), Some("resource_worker"));
+
+    // 2. StatefulActor handler and `ctx.spawn_scoped` tasks run inside `stateful_actor` span,
+    //    even if `spawn_scoped` is invoked inside a transient inner span.
+    struct SpanProbeActor;
+    impl StatefulActor for SpanProbeActor {
+        type Message = tokio::sync::oneshot::Sender<Option<&'static str>>;
+        type Response = Option<&'static str>;
+        type Error = &'static str;
+
+        async fn handle(
+            &mut self,
+            scoped_tx: Self::Message,
+            ctx: &mut ActorContext<Self>,
+        ) -> Result<Self::Response, Self::Error> {
+            let handler_span = tracing::Span::current().metadata().map(|m| m.name());
+            let transient = tracing::info_span!("transient_request_span");
+            let _entered = transient.enter();
+            ctx.spawn_scoped(move |_scope| async move {
+                let _ = scoped_tx.send(tracing::Span::current().metadata().map(|m| m.name()));
+            });
+            Ok(handler_span)
+        }
+    }
+
+    let actor_client = StatefulActorBuilder::new("span-actor", |_| SpanProbeActor)
+        .spawn(&root)
+        .await
+        .unwrap();
+    let (scoped_tx, scoped_rx) = tokio::sync::oneshot::channel();
+    let handler_span = actor_client.call(scoped_tx).await.unwrap();
+    let scoped_span = scoped_rx.await.unwrap();
+
+    assert_eq!(handler_span, Some("stateful_actor"));
+    assert_eq!(
+        scoped_span,
+        Some("stateful_actor"),
+        "ActorContext::spawn_scoped must inherit the actor instance span, not a transient request span"
+    );
+
+    root.shutdown().await.unwrap();
+}

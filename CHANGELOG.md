@@ -11,6 +11,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ## [0.3.4] - Unreleased
 
 ### Changed
+- **Structured Tracing Instrumentation & Span Propagation (`src/actor/{supervisor,stateful_actor,generic_actor}.rs`, Finding `F-13`):**
+  - Added `#[tracing::instrument(..., err)]` on `SupervisorHandle` control-plane methods (`start_child`, `restart_child`, `stop_child`, `delete_child`, `request_shutdown`, `shutdown`, `snapshot_timeout`, `snapshot_tree_timeout`, `watch_child_status`) without tightening generic trait bounds.
+  - Bound spawned `Supervisor`, `StatefulActor`, `ResourceActor`, background `Worker`, and `ActorContext` lifecycle tasks (`send_after`, `send_interval_with`, `spawn_scoped`, `forward_receiver`) to their respective actor/supervisor spans via `tracing::Instrument`.
+- **Pre-Escaped Prometheus Labels & Zero Intermediate Filter Vecs (`src/actor/telemetry.rs`, Finding `F-11`):**
+  - Pre-escape supervisor paths once per supervisor level (`Arc<str>`) and child names once per child in `collect_flat_children`, eliminating up to 28 redundant heap allocations per child per scrape and removing the 3 intermediate filter `Vec`s in `format_prometheus_metrics` with byte-identical output.
+- **Explicit Child Teardown on Supervisor Drop-Exit (`src/actor/supervisor.rs`, Finding `F-10` — SemVer-compatible part):**
+  - Explicitly call `self.children.clear()` before `self.join_set.abort_all()` when all `SupervisorHandle`s are dropped, making it explicit that `ActiveChild::drop` aborts the inner factory-spawned child tasks while `join_set.abort_all()` aborts the monitor wrapper tasks (full single-task `UntypedActorFactory` refactor remains planned for `v0.4.0`).
 - **Eliminate Redundant Resource Clones & Duplicate Cache Storage (`src/actor/generic_actor.rs`, Finding `F-09`):**
   - Removed redundant `current_resource` and `refresh_threshold` fields from `ResourceActor`, reading directly from the single `cache_tx` (`watch::Sender<Option<ResourceSnapshot<T>>>`) source of truth.
   - `ResourceActor::handle_refresh_complete` now performs zero clones of `T` when `waiters` is empty (e.g. `eager_prewarm` and proactive background refreshes) and exactly `N` clones for `N` parked waiters (down from `N + 2`).

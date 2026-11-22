@@ -30,6 +30,7 @@ use tokio::sync::{
 };
 use tokio::task::JoinSet;
 use tokio::time::Instant;
+use tracing::Instrument;
 
 use super::model::{
     EXPIRY_BUFFER, RestartPolicy, RestartType, ShutdownPolicy, SupervisorError, TaskResult,
@@ -556,18 +557,26 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
             });
             let w = worker.clone();
             let cfg = config.clone();
-            let task_handle = tokio::spawn(async move {
-                let actor = ResourceActor::with_channels(
-                    cfg,
-                    rx,
-                    cache_tx,
-                    invalidated,
-                    spawn_ctx.shutdown_rx,
-                    spawn_ctx.instance_id,
-                    w,
-                );
-                actor.run().await
-            });
+            let actor_span = tracing::info_span!(
+                "resource_actor",
+                actor = %cfg.name,
+                instance = spawn_ctx.instance_id,
+            );
+            let task_handle = tokio::spawn(
+                async move {
+                    let actor = ResourceActor::with_channels(
+                        cfg,
+                        rx,
+                        cache_tx,
+                        invalidated,
+                        spawn_ctx.shutdown_rx,
+                        spawn_ctx.instance_id,
+                        w,
+                    );
+                    actor.run().await
+                }
+                .instrument(actor_span),
+            );
             (endpoint, task_handle)
         });
 
@@ -1315,26 +1324,36 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
             generation: next_gen,
         };
 
-        let abort_handle = worker_tasks.spawn(async move {
-            let fut = worker.execute(ctx);
-            if let Some(timeout) = timeout_opt {
-                match tokio::time::timeout(timeout, fut).await {
-                    Ok(result) => WorkerOutcome::Completed {
+        let worker_span = tracing::info_span!(
+            "resource_worker",
+            actor = %actor_name,
+            instance = actor_id,
+            generation = next_gen,
+        );
+
+        let abort_handle = worker_tasks.spawn(
+            async move {
+                let fut = worker.execute(ctx);
+                if let Some(timeout) = timeout_opt {
+                    match tokio::time::timeout(timeout, fut).await {
+                        Ok(result) => WorkerOutcome::Completed {
+                            generation: next_gen,
+                            result,
+                        },
+                        Err(_) => WorkerOutcome::TimedOut {
+                            generation: next_gen,
+                            timeout,
+                        },
+                    }
+                } else {
+                    WorkerOutcome::Completed {
                         generation: next_gen,
-                        result,
-                    },
-                    Err(_) => WorkerOutcome::TimedOut {
-                        generation: next_gen,
-                        timeout,
-                    },
-                }
-            } else {
-                WorkerOutcome::Completed {
-                    generation: next_gen,
-                    result: fut.await,
+                        result: fut.await,
+                    }
                 }
             }
-        });
+            .instrument(worker_span),
+        );
         self.current_worker_abort = Some(abort_handle);
     }
 

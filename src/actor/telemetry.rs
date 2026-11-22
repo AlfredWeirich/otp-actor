@@ -764,31 +764,34 @@ fn cache_state_code(state: &CacheState) -> u8 {
 }
 
 struct FlatChildMetric<'a> {
-    path: String,
+    escaped_path: Arc<str>,
+    escaped_child: String,
     child: &'a ChildStatusEntry,
 }
 
 fn collect_flat_children<'a>(
     node: &'a SupervisorStatusNode,
-    prefix: &str,
+    escaped_prefix: &str,
     out: &mut Vec<FlatChildMetric<'a>>,
 ) {
-    let current_path = if prefix.is_empty() {
-        node.name.clone()
+    let escaped_name = escape_prom_label(&node.name);
+    let escaped_path: Arc<str> = if escaped_prefix.is_empty() {
+        Arc::from(escaped_name)
     } else {
-        format!("{prefix}/{}", node.name)
+        Arc::from(format!("{escaped_prefix}/{escaped_name}"))
     };
 
     for child in &node.children {
         out.push(FlatChildMetric {
-            path: current_path.clone(),
+            escaped_path: Arc::clone(&escaped_path),
+            escaped_child: escape_prom_label(&child.name),
             child,
         });
     }
 
     for sub in &node.subtrees {
         if let Ok(sub_node) = &sub.result {
-            collect_flat_children(sub_node, &current_path, out);
+            collect_flat_children(sub_node, &escaped_path, out);
         }
     }
 }
@@ -1013,8 +1016,8 @@ pub fn format_prometheus_metrics(status: &NodeStatus) -> String {
         let _ = writeln!(
             out,
             "otp_actor_child_status{{supervisor=\"{}\",child=\"{}\",kind=\"{}\"}} {}",
-            escape_prom_label(&item.path),
-            escape_prom_label(&item.child.name),
+            item.escaped_path,
+            item.escaped_child,
             item.child.kind.as_str(),
             item.child.status.metric_code()
         );
@@ -1030,9 +1033,7 @@ pub fn format_prometheus_metrics(status: &NodeStatus) -> String {
         let _ = writeln!(
             out,
             "otp_actor_child_instance_id{{supervisor=\"{}\",child=\"{}\"}} {}",
-            escape_prom_label(&item.path),
-            escape_prom_label(&item.child.name),
-            item.child.instance_id
+            item.escaped_path, item.escaped_child, item.child.instance_id
         );
     }
     out.push('\n');
@@ -1046,9 +1047,7 @@ pub fn format_prometheus_metrics(status: &NodeStatus) -> String {
         let _ = writeln!(
             out,
             "otp_actor_child_instance_uptime_seconds{{supervisor=\"{}\",child=\"{}\"}} {}",
-            escape_prom_label(&item.path),
-            escape_prom_label(&item.child.name),
-            item.child.instance_uptime_seconds
+            item.escaped_path, item.escaped_child, item.child.instance_uptime_seconds
         );
     }
     out.push('\n');
@@ -1062,9 +1061,7 @@ pub fn format_prometheus_metrics(status: &NodeStatus) -> String {
         let _ = writeln!(
             out,
             "otp_actor_child_restarts_in_window{{supervisor=\"{}\",child=\"{}\"}} {}",
-            escape_prom_label(&item.path),
-            escape_prom_label(&item.child.name),
-            item.child.restarts_in_window
+            item.escaped_path, item.escaped_child, item.child.restarts_in_window
         );
     }
     out.push('\n');
@@ -1078,29 +1075,23 @@ pub fn format_prometheus_metrics(status: &NodeStatus) -> String {
         let _ = writeln!(
             out,
             "otp_actor_child_restarts_total{{supervisor=\"{}\",child=\"{}\"}} {}",
-            escape_prom_label(&item.path),
-            escape_prom_label(&item.child.name),
-            item.child.restarts_total
+            item.escaped_path, item.escaped_child, item.child.restarts_total
         );
     }
     out.push('\n');
 
-    let with_queue: Vec<&FlatChildMetric<'_>> =
-        flat.iter().filter(|i| i.child.queue.is_some()).collect();
-    if !with_queue.is_empty() {
+    if flat.iter().any(|i| i.child.queue.is_some()) {
         let _ = writeln!(
             out,
             "# HELP otp_actor_mailbox_queued Approximate queued message count in each bounded mailbox."
         );
         let _ = writeln!(out, "# TYPE otp_actor_mailbox_queued gauge");
-        for item in &with_queue {
+        for item in &flat {
             if let Some(q) = &item.child.queue {
                 let _ = writeln!(
                     out,
                     "otp_actor_mailbox_queued{{supervisor=\"{}\",child=\"{}\"}} {}",
-                    escape_prom_label(&item.path),
-                    escape_prom_label(&item.child.name),
-                    q.queued
+                    item.escaped_path, item.escaped_child, q.queued
                 );
             }
         }
@@ -1111,36 +1102,30 @@ pub fn format_prometheus_metrics(status: &NodeStatus) -> String {
             "# HELP otp_actor_mailbox_capacity Configured bounded mailbox capacity per child."
         );
         let _ = writeln!(out, "# TYPE otp_actor_mailbox_capacity gauge");
-        for item in &with_queue {
+        for item in &flat {
             if let Some(q) = &item.child.queue {
                 let _ = writeln!(
                     out,
                     "otp_actor_mailbox_capacity{{supervisor=\"{}\",child=\"{}\"}} {}",
-                    escape_prom_label(&item.path),
-                    escape_prom_label(&item.child.name),
-                    q.max_capacity
+                    item.escaped_path, item.escaped_child, q.max_capacity
                 );
             }
         }
         out.push('\n');
     }
 
-    let with_metrics: Vec<&FlatChildMetric<'_>> =
-        flat.iter().filter(|i| i.child.metrics.is_some()).collect();
-    if !with_metrics.is_empty() {
+    if flat.iter().any(|i| i.child.metrics.is_some()) {
         let _ = writeln!(
             out,
             "# HELP otp_actor_in_flight Number of handlers currently executing on each actor."
         );
         let _ = writeln!(out, "# TYPE otp_actor_in_flight gauge");
-        for item in &with_metrics {
+        for item in &flat {
             if let Some(m) = &item.child.metrics {
                 let _ = writeln!(
                     out,
                     "otp_actor_in_flight{{supervisor=\"{}\",child=\"{}\"}} {}",
-                    escape_prom_label(&item.path),
-                    escape_prom_label(&item.child.name),
-                    m.in_flight
+                    item.escaped_path, item.escaped_child, m.in_flight
                 );
             }
         }
@@ -1151,14 +1136,12 @@ pub fn format_prometheus_metrics(status: &NodeStatus) -> String {
             "# HELP otp_actor_calls_total Total synchronous call invocations processed per actor."
         );
         let _ = writeln!(out, "# TYPE otp_actor_calls_total counter");
-        for item in &with_metrics {
+        for item in &flat {
             if let Some(m) = &item.child.metrics {
                 let _ = writeln!(
                     out,
                     "otp_actor_calls_total{{supervisor=\"{}\",child=\"{}\"}} {}",
-                    escape_prom_label(&item.path),
-                    escape_prom_label(&item.child.name),
-                    m.calls_total
+                    item.escaped_path, item.escaped_child, m.calls_total
                 );
             }
         }
@@ -1169,14 +1152,12 @@ pub fn format_prometheus_metrics(status: &NodeStatus) -> String {
             "# HELP otp_actor_casts_total Total fire-and-forget cast invocations processed per actor."
         );
         let _ = writeln!(out, "# TYPE otp_actor_casts_total counter");
-        for item in &with_metrics {
+        for item in &flat {
             if let Some(m) = &item.child.metrics {
                 let _ = writeln!(
                     out,
                     "otp_actor_casts_total{{supervisor=\"{}\",child=\"{}\"}} {}",
-                    escape_prom_label(&item.path),
-                    escape_prom_label(&item.child.name),
-                    m.casts_total
+                    item.escaped_path, item.escaped_child, m.casts_total
                 );
             }
         }
@@ -1187,14 +1168,12 @@ pub fn format_prometheus_metrics(status: &NodeStatus) -> String {
             "# HELP otp_actor_handler_errors_total Total domain errors returned by actor handlers."
         );
         let _ = writeln!(out, "# TYPE otp_actor_handler_errors_total counter");
-        for item in &with_metrics {
+        for item in &flat {
             if let Some(m) = &item.child.metrics {
                 let _ = writeln!(
                     out,
                     "otp_actor_handler_errors_total{{supervisor=\"{}\",child=\"{}\"}} {}",
-                    escape_prom_label(&item.path),
-                    escape_prom_label(&item.child.name),
-                    m.handler_errors_total
+                    item.escaped_path, item.escaped_child, m.handler_errors_total
                 );
             }
         }
@@ -1205,14 +1184,12 @@ pub fn format_prometheus_metrics(status: &NodeStatus) -> String {
             "# HELP otp_actor_timeouts_total Total handler executions that exceeded handler_timeout."
         );
         let _ = writeln!(out, "# TYPE otp_actor_timeouts_total counter");
-        for item in &with_metrics {
+        for item in &flat {
             if let Some(m) = &item.child.metrics {
                 let _ = writeln!(
                     out,
                     "otp_actor_timeouts_total{{supervisor=\"{}\",child=\"{}\"}} {}",
-                    escape_prom_label(&item.path),
-                    escape_prom_label(&item.child.name),
-                    m.timeouts_total
+                    item.escaped_path, item.escaped_child, m.timeouts_total
                 );
             }
         }
@@ -1223,14 +1200,12 @@ pub fn format_prometheus_metrics(status: &NodeStatus) -> String {
             "# HELP otp_actor_panics_total Total unwinding panics caught in actor tasks."
         );
         let _ = writeln!(out, "# TYPE otp_actor_panics_total counter");
-        for item in &with_metrics {
+        for item in &flat {
             if let Some(m) = &item.child.metrics {
                 let _ = writeln!(
                     out,
                     "otp_actor_panics_total{{supervisor=\"{}\",child=\"{}\"}} {}",
-                    escape_prom_label(&item.path),
-                    escape_prom_label(&item.child.name),
-                    m.panics_total
+                    item.escaped_path, item.escaped_child, m.panics_total
                 );
             }
         }
@@ -1241,37 +1216,31 @@ pub fn format_prometheus_metrics(status: &NodeStatus) -> String {
             "# HELP otp_actor_ema_latency_microseconds Exponential moving average handler latency in microseconds."
         );
         let _ = writeln!(out, "# TYPE otp_actor_ema_latency_microseconds gauge");
-        for item in &with_metrics {
+        for item in &flat {
             if let Some(m) = &item.child.metrics {
                 let _ = writeln!(
                     out,
                     "otp_actor_ema_latency_microseconds{{supervisor=\"{}\",child=\"{}\"}} {}",
-                    escape_prom_label(&item.path),
-                    escape_prom_label(&item.child.name),
-                    m.ema_latency_us
+                    item.escaped_path, item.escaped_child, m.ema_latency_us
                 );
             }
         }
         out.push('\n');
     }
 
-    let with_cache: Vec<&FlatChildMetric<'_>> = flat
-        .iter()
-        .filter(|i| i.child.cache_state.is_some())
-        .collect();
-    if !with_cache.is_empty() {
+    if flat.iter().any(|i| i.child.cache_state.is_some()) {
         let _ = writeln!(
             out,
             "# HELP otp_actor_resource_cache_state Cache state per ResourceActor (0=Empty, 1=Fresh, 2=RefreshDue, 3=StaleUsable, 4=Expired, 5=Invalidated)."
         );
         let _ = writeln!(out, "# TYPE otp_actor_resource_cache_state gauge");
-        for item in &with_cache {
+        for item in &flat {
             if let Some(cs) = &item.child.cache_state {
                 let _ = writeln!(
                     out,
                     "otp_actor_resource_cache_state{{supervisor=\"{}\",child=\"{}\"}} {}",
-                    escape_prom_label(&item.path),
-                    escape_prom_label(&item.child.name),
+                    item.escaped_path,
+                    item.escaped_child,
                     cache_state_code(cs)
                 );
             }

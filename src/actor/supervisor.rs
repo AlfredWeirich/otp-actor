@@ -23,6 +23,7 @@ use tokio::sync::{
     oneshot, watch,
 };
 use tokio::task::{JoinError, JoinHandle, JoinSet};
+use tracing::Instrument;
 
 use super::generic_actor::{CacheState, ResourceClient, ResourceEndpoint};
 use super::model::{
@@ -636,7 +637,12 @@ impl SupervisorBuilder {
                 ctx.shutdown_rx,
                 self_handle,
             );
-            let task_handle = tokio::spawn(supervisor.run(rx));
+            let sup_span = tracing::info_span!(
+                "supervisor",
+                supervisor = %supervisor.name,
+                instance = supervisor.instance_id,
+            );
+            let task_handle = tokio::spawn(supervisor.run(rx).instrument(sup_span));
             (sender_arc, task_handle)
         });
 
@@ -689,7 +695,12 @@ impl SupervisorBuilder {
             shutdown_rx,
             self_handle,
         );
-        tokio::spawn(supervisor.run(rx));
+        let sup_span = tracing::info_span!(
+            "supervisor",
+            supervisor = %supervisor.name,
+            instance = supervisor.instance_id,
+        );
+        tokio::spawn(supervisor.run(rx).instrument(sup_span));
         SupervisorHandle::new_root_handle(name, tx)
     }
 
@@ -1491,6 +1502,10 @@ impl Supervisor {
                             "All supervisor handles dropped. Aborting supervised child tasks."
                         );
                         scheduled_restart_rx.close();
+                        // Explicitly clear `children` so `ActiveChild::drop` aborts the inner
+                        // factory-spawned child tasks before `join_set.abort_all()` aborts only
+                        // the monitor wrapper tasks.
+                        self.children.clear();
                         self.join_set.abort_all();
                         return Ok(());
                     };
@@ -2632,22 +2647,25 @@ impl SupervisorHandle {
     }
 
     /// Starts and supervises a new child (leaf actor or nested [`SupervisorBuilder`]) from a [`ChildSpec`].
+    #[tracing::instrument(skip(self, spec), fields(supervisor = %self.name, child = tracing::field::Empty), err)]
     pub async fn start_child(&self, spec: impl Into<ChildSpec>) -> Result<(), SupervisorError> {
-        self.send_result(|respond_to| SupervisorCommand::StartChild {
-            spec: spec.into(),
-            respond_to,
-        })
-        .await
+        let spec = spec.into();
+        tracing::Span::current().record("child", spec.name.as_str());
+        self.send_result(|respond_to| SupervisorCommand::StartChild { spec, respond_to })
+            .await
     }
 
     /// Manually restarts or recovers a child, resetting its failed status and backoff counters.
     /// Under [`SupervisionStrategy::OneForAll`] or [`SupervisionStrategy::RestForOne`], also restarts coupled siblings.
+    #[tracing::instrument(skip(self, child_name), fields(supervisor = %self.name, child = tracing::field::Empty), err)]
     pub async fn restart_child(
         &self,
         child_name: impl Into<String>,
     ) -> Result<(), SupervisorError> {
+        let child_name = child_name.into();
+        tracing::Span::current().record("child", child_name.as_str());
         self.send_result(|respond_to| SupervisorCommand::RestartChild {
-            child_name: child_name.into(),
+            child_name,
             respond_to,
         })
         .await
@@ -2661,9 +2679,12 @@ impl SupervisorHandle {
     /// Do **not** `.await` `stop_child(self_name)` from inside that same child's message handler:
     /// the supervisor waits for the child to finish its current handler before acknowledging
     /// `stop_child`, which will deadlock until its [`ShutdownPolicy`] timeout expires.
+    #[tracing::instrument(skip(self, child_name), fields(supervisor = %self.name, child = tracing::field::Empty), err)]
     pub async fn stop_child(&self, child_name: impl Into<String>) -> Result<(), SupervisorError> {
+        let child_name = child_name.into();
+        tracing::Span::current().record("child", child_name.as_str());
         self.send_result(|respond_to| SupervisorCommand::StopChild {
-            child_name: child_name.into(),
+            child_name,
             respond_to,
         })
         .await
@@ -2676,9 +2697,12 @@ impl SupervisorHandle {
     /// Do **not** `.await` `delete_child(self_name)` from inside that same child's message handler:
     /// the supervisor waits for the child to finish its current handler before acknowledging
     /// `delete_child`, which will deadlock until its [`ShutdownPolicy`] timeout expires.
+    #[tracing::instrument(skip(self, child_name), fields(supervisor = %self.name, child = tracing::field::Empty), err)]
     pub async fn delete_child(&self, child_name: impl Into<String>) -> Result<(), SupervisorError> {
+        let child_name = child_name.into();
+        tracing::Span::current().record("child", child_name.as_str());
         self.send_result(|respond_to| SupervisorCommand::DeleteChild {
-            child_name: child_name.into(),
+            child_name,
             respond_to,
         })
         .await
@@ -2724,6 +2748,7 @@ impl SupervisorHandle {
     /// If this handle points to a child [`Supervisor`] that has restarted since the last command,
     /// transparently rebinds to the replacement instance; remains idempotent (`Ok(())`) if already
     /// stopped or permanently failed.
+    #[tracing::instrument(skip(self), fields(supervisor = %self.name), err)]
     pub async fn request_shutdown(&self) -> Result<(), SupervisorError> {
         let Some(current_tx) = self.resolve_sender_for_shutdown().await else {
             return Ok(());
@@ -2749,6 +2774,7 @@ impl SupervisorHandle {
     /// supervised children to finish processing their current messages before acknowledging
     /// `shutdown()`, which will deadlock until the child's [`ShutdownPolicy`] timeout expires.
     /// Use [`SupervisorHandle::request_shutdown`] when triggering shutdown from within a child actor.
+    #[tracing::instrument(skip(self), fields(supervisor = %self.name), err)]
     pub async fn shutdown(&self) -> Result<(), SupervisorError> {
         let Some(current_tx) = self.resolve_sender_for_shutdown().await else {
             return Ok(());
@@ -2793,6 +2819,7 @@ impl SupervisorHandle {
     /// Wraps handle rebinding, command dispatch, and snapshot collection in `timeout`, returning
     /// [`SupervisorError::Timeout`] rather than blocking a health probe if the supervisor is stalled
     /// inside shutdown or cascading restarts.
+    #[tracing::instrument(skip(self), fields(supervisor = %self.name), err)]
     pub async fn snapshot_timeout(
         &self,
         timeout: Duration,
@@ -2827,6 +2854,7 @@ impl SupervisorHandle {
     /// - Descends only through children registered as [`Supervisor`]s (`ChildSnapshot::is_supervisor`).
     /// - The recursion runs on the caller side, never inside a supervisor's event loop, so a
     ///   supervisor is never blocked waiting on its own children.
+    #[tracing::instrument(skip(self), fields(supervisor = %self.name), err)]
     pub async fn snapshot_tree_timeout(
         &self,
         timeout: Duration,
@@ -2863,15 +2891,23 @@ impl SupervisorHandle {
                 match &child.status {
                     ChildStatus::Running { .. } => {
                         let parent = self.clone();
-                        pending.spawn(async move {
-                            let result = tokio::time::timeout_at(
-                                deadline,
-                                Self::collect_child_tree(&parent, &child_name, deadline, timeout),
-                            )
-                            .await
-                            .unwrap_or(Err(SupervisorError::Timeout(timeout)));
-                            (idx, SubtreeSnapshot { child_name, result })
-                        });
+                        pending.spawn(
+                            async move {
+                                let result = tokio::time::timeout_at(
+                                    deadline,
+                                    Self::collect_child_tree(
+                                        &parent,
+                                        &child_name,
+                                        deadline,
+                                        timeout,
+                                    ),
+                                )
+                                .await
+                                .unwrap_or(Err(SupervisorError::Timeout(timeout)));
+                                (idx, SubtreeSnapshot { child_name, result })
+                            }
+                            .in_current_span(),
+                        );
                     }
                     other => {
                         let reason = match other {
