@@ -112,25 +112,32 @@ impl<T> TimedResource<T> {
         }
     }
 
+    /// Indicates whether the resource is still valid at timestamp `now`.
+    #[inline]
+    pub(crate) fn is_still_usable_at(&self, now: Instant) -> bool {
+        self.expires_at.is_none_or(|exp| now < exp)
+    }
+
+    /// Indicates whether the resource is usable within a stale-while-error grace window at `now`.
+    #[inline]
+    pub(crate) fn is_usable_stale_at(&self, now: Instant, stale_allowance: Duration) -> bool {
+        if self.is_still_usable_at(now) {
+            return true;
+        }
+        self.expires_at.is_none_or(|exp| {
+            exp.checked_add(stale_allowance)
+                .is_none_or(|deadline| now < deadline)
+        })
+    }
+
     /// Indicates whether the resource is still valid for immediate use.
     pub fn is_still_usable(&self) -> bool {
-        match self.expires_at {
-            Some(exp) => Instant::now() < exp,
-            None => true,
-        }
+        self.is_still_usable_at(Instant::now())
     }
 
     /// Indicates whether the resource is usable within a stale-while-error grace window.
     pub fn is_usable_stale(&self, stale_allowance: Duration) -> bool {
-        if self.is_still_usable() {
-            return true;
-        }
-        match self.expires_at {
-            Some(exp) => exp
-                .checked_add(stale_allowance)
-                .is_none_or(|deadline| Instant::now() < deadline),
-            None => true,
-        }
+        self.is_usable_stale_at(Instant::now(), stale_allowance)
     }
 
     /// Indicates whether the resource is fresh (outside the pre-expiration buffer).
@@ -182,10 +189,14 @@ impl<T, E> ResourceEndpoint<T, E> {
             return CacheState::Empty;
         };
 
-        let now = Instant::now();
         let resource = &snapshot.resource;
+        if resource.expires_at.is_none() && snapshot.refresh_threshold.is_none() {
+            return CacheState::Fresh { expires_in: None };
+        }
 
-        if resource.is_still_usable() {
+        let now = Instant::now();
+
+        if resource.is_still_usable_at(now) {
             let expires_in = resource
                 .expires_at
                 .map(|exp| exp.saturating_duration_since(now));
@@ -201,7 +212,7 @@ impl<T, E> ResourceEndpoint<T, E> {
             .expires_at
             .map_or(Duration::ZERO, |exp| now.saturating_duration_since(exp));
         if self.stale_while_error > Duration::ZERO
-            && resource.is_usable_stale(self.stale_while_error)
+            && resource.is_usable_stale_at(now, self.stale_while_error)
         {
             CacheState::StaleUsable { expired_for }
         } else {
@@ -658,7 +669,6 @@ pub struct ResourceActor<T = (), E = (), W = ()> {
     cache_tx: watch::Sender<Option<ResourceSnapshot<T>>>,
     invalidated: Arc<AtomicBool>,
     shutdown_rx: watch::Receiver<bool>,
-    current_resource: Option<TimedResource<T>>,
     refresh_in_flight: bool,
     waiters: Vec<oneshot::Sender<Result<T, ResourceError<E>>>>,
     max_waiters: usize,
@@ -676,7 +686,6 @@ pub struct ResourceActor<T = (), E = (), W = ()> {
     last_failure: Option<(Instant, FailureKind<E>)>,
     failure_count: usize,
     zero_ttl_streak: usize,
-    refresh_threshold: Option<Instant>,
     next_proactive_target: Option<Instant>,
     current_worker_abort: Option<tokio::task::AbortHandle>,
 }
@@ -712,7 +721,6 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
             cache_tx,
             invalidated,
             shutdown_rx,
-            current_resource: None,
             refresh_in_flight: false,
             waiters: Vec::new(),
             max_waiters: config.max_waiters,
@@ -730,7 +738,6 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
             last_failure: None,
             failure_count: 0,
             zero_ttl_streak: 0,
-            refresh_threshold: None,
             next_proactive_target: None,
             current_worker_abort: None,
         }
@@ -1076,12 +1083,23 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
         // 2. Drain any requests already buffered in the channel
         while let Ok(cmd) = self.receiver.try_recv() {
             if let ResourceCommand::GetResource { respond_to } = cmd {
-                if let Some(res) = &self.current_resource
-                    && (res.is_still_usable()
-                        || (self.stale_while_error > Duration::ZERO
-                            && res.is_usable_stale(self.stale_while_error)))
-                {
-                    let _ = respond_to.send(Ok(res.value.clone()));
+                let cached_val = {
+                    let cached = self.cache_tx.borrow();
+                    cached.as_ref().and_then(|snap| {
+                        let now = Instant::now();
+                        let res = &snap.resource;
+                        if res.is_still_usable_at(now)
+                            || (self.stale_while_error > Duration::ZERO
+                                && res.is_usable_stale_at(now, self.stale_while_error))
+                        {
+                            Some(res.value.clone())
+                        } else {
+                            None
+                        }
+                    })
+                };
+                if let Some(val) = cached_val {
+                    let _ = respond_to.send(Ok(val));
                     continue;
                 }
 
@@ -1140,18 +1158,48 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
         respond_to: oneshot::Sender<Result<T, ResourceError<E>>>,
         worker_tasks: &mut JoinSet<WorkerOutcome<T, E>>,
     ) {
+        enum CacheLookup<T> {
+            Usable { value: T, should_refresh: bool },
+            Stale { value: T },
+            Miss { had_cached: bool },
+        }
+
         let in_cooldown = self.is_in_failure_cooldown();
         let bg_throttled = self.is_background_refresh_throttled();
 
-        // 1. Fresh or still usable resource
-        if let Some(res) = &self.current_resource {
-            if res.is_still_usable() {
-                let _ = respond_to.send(Ok(res.value.clone()));
+        let lookup = {
+            let cached = self.cache_tx.borrow();
+            match cached.as_ref() {
+                Some(snap) => {
+                    let now = Instant::now();
+                    let res = &snap.resource;
+                    if res.is_still_usable_at(now) {
+                        let should_refresh = snap.refresh_threshold.is_some_and(|t| now >= t);
+                        CacheLookup::Usable {
+                            value: res.value.clone(),
+                            should_refresh,
+                        }
+                    } else if self.stale_while_error > Duration::ZERO
+                        && res.is_usable_stale_at(now, self.stale_while_error)
+                    {
+                        CacheLookup::Stale {
+                            value: res.value.clone(),
+                        }
+                    } else {
+                        CacheLookup::Miss { had_cached: true }
+                    }
+                }
+                None => CacheLookup::Miss { had_cached: false },
+            }
+        };
 
-                let should_refresh = match self.refresh_threshold {
-                    Some(threshold) => Instant::now() >= threshold,
-                    None => false,
-                };
+        let had_cached = match lookup {
+            // 1. Fresh or still usable resource
+            CacheLookup::Usable {
+                value,
+                should_refresh,
+            } => {
+                let _ = respond_to.send(Ok(value));
 
                 if should_refresh && !self.refresh_in_flight {
                     if bg_throttled {
@@ -1171,18 +1219,15 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
                 }
                 return;
             }
-
             // 2. Expired, but within stale-while-error allowance
-            if self.stale_while_error > Duration::ZERO
-                && res.is_usable_stale(self.stale_while_error)
-            {
+            CacheLookup::Stale { value } => {
                 tracing::warn!(
                     actor = %self.name,
                     instance = self.instance_id,
                     allowance = ?self.stale_while_error,
                     "⚠️ Resource expired! Serving STALE cache within stale_while_error window."
                 );
-                let _ = respond_to.send(Ok(res.value.clone()));
+                let _ = respond_to.send(Ok(value));
 
                 if !self.refresh_in_flight && !bg_throttled {
                     tracing::info!(
@@ -1194,7 +1239,8 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
                 }
                 return;
             }
-        }
+            CacheLookup::Miss { had_cached } => had_cached,
+        };
 
         // 3. No usable resource (cold start or expired beyond stale allowance)
         if in_cooldown && let Some((t, f)) = &self.last_failure {
@@ -1227,10 +1273,10 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
             return;
         }
 
-        let reason = if self.current_resource.is_none() {
-            "Cold Start (no resource in cache)"
-        } else {
+        let reason = if had_cached {
             "Hard Expiry (cached resource expired!)"
+        } else {
+            "Cold Start (no resource in cache)"
         };
         tracing::debug!(
             actor = %self.name,
@@ -1382,7 +1428,6 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
                 self.last_failure = None;
                 self.failure_count = 0;
 
-                let val = new_resource.value.clone();
                 let expires_at = new_resource.expires_at;
                 let now = Instant::now();
                 let threshold = expires_at.map(|exp| {
@@ -1394,8 +1439,6 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
                         exp.checked_sub(effective_buffer).unwrap_or(now)
                     }
                 });
-                self.refresh_threshold = threshold;
-                self.current_resource = Some(new_resource.clone());
                 self.cache_tx.send_replace(Some(ResourceSnapshot {
                     resource: new_resource,
                     refresh_threshold: threshold,
@@ -1412,8 +1455,11 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
                         waiters = self.waiters.len(),
                         "📢 Broadcasting value to waiting tasks."
                     );
-                    for waiter in self.waiters.drain(..) {
-                        let _ = waiter.send(Ok(val.clone()));
+                    let cached = self.cache_tx.borrow();
+                    if let Some(snapshot) = cached.as_ref() {
+                        for waiter in self.waiters.drain(..) {
+                            let _ = waiter.send(Ok(snapshot.resource.value.clone()));
+                        }
                     }
                 }
             }
@@ -1515,7 +1561,10 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static> Resourc
         failed_sender: &Sender<ResourceCommand<T, E>>,
     ) -> Result<(), ResourceError<E>> {
         {
-            let current = self.current_endpoint();
+            let current = self
+                .endpoint
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if !current.invalidated.load(Ordering::Acquire)
                 && !current.sender.is_closed()
                 && !current.sender.same_channel(failed_sender)
@@ -1620,18 +1669,29 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static> Resourc
     /// - **1-Hop Coalesced Path**: On cold start, pre-expiration refresh window, or stale-while-error recovery,
     ///   sends a direct request to the [`ResourceActor`] and transparently rebinds via [`SlotState`] on crash/restart.
     pub async fn get(&self) -> Result<T, ResourceError<E>> {
-        // 0-hop fast path via watch::Receiver
+        // 0-hop fast path via watch::Receiver (read directly under RwLockReadGuard with zero
+        // ResourceEndpoint atomic refcount clones and at most one `Instant::now()` syscall).
         {
-            let current_ep = self.current_endpoint();
+            let current_ep = self
+                .endpoint
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if !current_ep.invalidated.load(Ordering::Acquire)
                 && !current_ep.sender.is_closed()
                 && let Some(snapshot) = current_ep.cache_rx.borrow().as_ref()
-                && snapshot.resource.is_still_usable()
             {
-                let needs_refresh = snapshot
-                    .refresh_threshold
-                    .is_some_and(|threshold| Instant::now() >= threshold);
-                if !needs_refresh {
+                let usable_and_fresh =
+                    match (snapshot.resource.expires_at, snapshot.refresh_threshold) {
+                        (None, None) => true,
+                        _ => {
+                            let now = Instant::now();
+                            snapshot.resource.is_still_usable_at(now)
+                                && !snapshot
+                                    .refresh_threshold
+                                    .is_some_and(|threshold| now >= threshold)
+                        }
+                    };
+                if usable_and_fresh {
                     return Ok(snapshot.resource.value.clone());
                 }
             }

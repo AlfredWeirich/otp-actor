@@ -10,6 +10,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [0.3.4] - Unreleased
 
+### Changed
+- **Eliminate Redundant Resource Clones & Duplicate Cache Storage (`src/actor/generic_actor.rs`, Finding `F-09`):**
+  - Removed redundant `current_resource` and `refresh_threshold` fields from `ResourceActor`, reading directly from the single `cache_tx` (`watch::Sender<Option<ResourceSnapshot<T>>>`) source of truth.
+  - `ResourceActor::handle_refresh_complete` now performs zero clones of `T` when `waiters` is empty (e.g. `eager_prewarm` and proactive background refreshes) and exactly `N` clones for `N` parked waiters (down from `N + 2`).
+- **Zero-Clone 0-Hop Hot Path & Single-Timestamp Cache Checks (`src/actor/generic_actor.rs`, `src/actor/stateful_actor.rs`, Finding `F-08`):**
+  - Eliminated `ResourceEndpoint::clone()` (3 atomic increments + 3 decrements) on the 0-hop fast path of `ResourceClient::get()` and in `ResourceClient::rebind_channel()`, and eliminated `Sender::clone()` in `ActorClient::queue_stats()` and `ActorClient::rebind_channel()`.
+  - Added `TimedResource::{is_still_usable_at, is_usable_stale_at}` so `ResourceClient::get()` and `ResourceEndpoint::cache_state()` perform at most one `Instant::now()` call (and zero clock calls for perpetual resources with no refresh threshold).
+
 ### Fixed
 - **Abort Dependent Restarts on Factory Panic & Cancel Backoff Tasks on Shutdown (`src/actor/supervisor.rs`, Finding `F-07`):**
   - Under `SupervisionStrategy::OneForAll` / `RestForOne`, when a predecessor's child factory panics during a manual `restart_child`, `Supervisor::execute_restart` now aborts spawning subsequent dependent siblings and transitions their slots to `Failed(FactoryPanicked(...))` so clients fail fast and a follow-up `restart_child` can recover the entire group.

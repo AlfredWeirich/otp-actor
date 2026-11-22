@@ -6875,3 +6875,197 @@ async fn test_backoff_sleep_task_exits_promptly_on_supervisor_shutdown() {
     tokio::task::yield_now().await;
     assert_eq!(factory_calls.load(Ordering::SeqCst), 1);
 }
+
+#[tokio::test(start_paused = true)]
+async fn test_resource_fast_path_single_timestamp_boundary_and_perpetual_get() {
+    let root = Supervisor::new("f08-fast-path-root");
+
+    // 1. Perpetual resource: 0-hop fast path serves repeated gets with zero extra worker runs
+    let perp_calls = Arc::new(AtomicUsize::new(0));
+    let pc = perp_calls.clone();
+    let perp_client = ResourceActor::builder("perp-res")
+        .worker(move |_ctx: WorkerContext| {
+            let pc = pc.clone();
+            async move {
+                let n = pc.fetch_add(1, Ordering::SeqCst) + 1;
+                Ok::<_, String>(TimedResource::perpetual(format!("perp-{n}")))
+            }
+        })
+        .spawn(&root)
+        .await
+        .unwrap();
+
+    assert_eq!(perp_client.get().await.unwrap(), "perp-1");
+    assert_eq!(
+        perp_client.cache_state(),
+        CacheState::Fresh { expires_in: None }
+    );
+    for _ in 0..5 {
+        assert_eq!(perp_client.get().await.unwrap(), "perp-1");
+    }
+    assert_eq!(perp_calls.load(Ordering::SeqCst), 1);
+
+    // 2. Expiring resource with exact single-timestamp boundary checks
+    let fail_refresh = Arc::new(AtomicBool::new(false));
+    let fr = fail_refresh.clone();
+    let exp_client = ResourceActor::builder("exp-res")
+        .worker(move |_ctx: WorkerContext| {
+            let fr = fr.clone();
+            async move {
+                if fr.load(Ordering::SeqCst) {
+                    Err("upstream down".to_string())
+                } else {
+                    Ok(TimedResource::with_ttl(
+                        "v1".to_string(),
+                        Duration::from_secs(10),
+                    ))
+                }
+            }
+        })
+        .expiry_buffer(Duration::from_secs(2))
+        .stale_while_error(Duration::from_secs(5))
+        .proactive_refresh(false)
+        .spawn(&root)
+        .await
+        .unwrap();
+
+    assert_eq!(exp_client.get().await.unwrap(), "v1");
+    assert!(matches!(
+        exp_client.cache_state(),
+        CacheState::Fresh {
+            expires_in: Some(_)
+        }
+    ));
+
+    // Exact refresh_threshold boundary (8s elapsed of 10s TTL with 2s buffer) -> RefreshDue
+    tokio::time::advance(Duration::from_secs(8)).await;
+    assert!(matches!(
+        exp_client.cache_state(),
+        CacheState::RefreshDue { .. }
+    ));
+
+    // Exact expiry boundary (10s elapsed) -> StaleUsable (not Fresh!)
+    fail_refresh.store(true, Ordering::SeqCst);
+    tokio::time::advance(Duration::from_secs(2)).await;
+    assert!(matches!(
+        exp_client.cache_state(),
+        CacheState::StaleUsable { .. }
+    ));
+    assert_eq!(exp_client.get().await.unwrap(), "v1");
+
+    // Exact stale_while_error deadline (15s elapsed) -> Expired
+    tokio::time::advance(Duration::from_secs(5)).await;
+    assert!(matches!(
+        exp_client.cache_state(),
+        CacheState::Expired { .. }
+    ));
+
+    root.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_resource_actor_zero_clones_on_prewarm_and_exact_waiter_clones() {
+    #[derive(Debug)]
+    struct CloneCountingValue {
+        id: usize,
+        clones: Arc<AtomicUsize>,
+    }
+
+    impl Clone for CloneCountingValue {
+        fn clone(&self) -> Self {
+            self.clones.fetch_add(1, Ordering::SeqCst);
+            Self {
+                id: self.id,
+                clones: self.clones.clone(),
+            }
+        }
+    }
+
+    let root = Supervisor::new("f09-clone-count-root");
+
+    // 1. Eager prewarm with no waiters must perform ZERO clones of T
+    let prewarm_clones = Arc::new(AtomicUsize::new(0));
+    let pc = prewarm_clones.clone();
+    let prewarm_client = ResourceActor::builder("prewarm-zero-clone")
+        .worker(move |_ctx: WorkerContext| {
+            let pc = pc.clone();
+            async move {
+                Ok::<_, String>(TimedResource::perpetual(CloneCountingValue {
+                    id: 1,
+                    clones: pc,
+                }))
+            }
+        })
+        .eager_prewarm(true)
+        .spawn(&root)
+        .await
+        .unwrap();
+
+    for _ in 0..40 {
+        if matches!(prewarm_client.cache_state(), CacheState::Fresh { .. }) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(matches!(
+        prewarm_client.cache_state(),
+        CacheState::Fresh { expires_in: None }
+    ));
+    assert_eq!(
+        prewarm_clones.load(Ordering::SeqCst),
+        0,
+        "eager_prewarm with no waiters must not clone T"
+    );
+
+    // 2. Single-flight refresh with 2 parked waiters must clone T exactly 2 times (once per waiter)
+    let waiter_clones = Arc::new(AtomicUsize::new(0));
+    let wc = waiter_clones.clone();
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let entered_slot = Arc::new(std::sync::Mutex::new(Some(entered_tx)));
+    let release_slot = Arc::new(std::sync::Mutex::new(Some(release_rx)));
+
+    let waiter_client = ResourceActor::builder("waiter-exact-clone")
+        .worker(move |_ctx: WorkerContext| {
+            let wc = wc.clone();
+            let entered = entered_slot.lock().unwrap().take();
+            let release = release_slot.lock().unwrap().take();
+            async move {
+                if let Some(tx) = entered {
+                    let _ = tx.send(());
+                }
+                if let Some(rx) = release {
+                    let _ = rx.await;
+                }
+                Ok::<_, String>(TimedResource::perpetual(CloneCountingValue {
+                    id: 2,
+                    clones: wc,
+                }))
+            }
+        })
+        .spawn(&root)
+        .await
+        .unwrap();
+
+    let w1 = tokio::spawn({
+        let c = waiter_client.clone();
+        async move { c.get().await }
+    });
+    entered_rx.await.unwrap();
+    let w2 = tokio::spawn({
+        let c = waiter_client.clone();
+        async move { c.get().await }
+    });
+    tokio::time::sleep(Duration::from_millis(15)).await;
+
+    let _ = release_tx.send(());
+    assert_eq!(w1.await.unwrap().unwrap().id, 2);
+    assert_eq!(w2.await.unwrap().unwrap().id, 2);
+    assert_eq!(
+        waiter_clones.load(Ordering::SeqCst),
+        2,
+        "Broadcasting to 2 waiters must perform exactly 2 clones of T (no extra cache/temp clones)"
+    );
+
+    root.shutdown().await.unwrap();
+}

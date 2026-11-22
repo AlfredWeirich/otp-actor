@@ -1198,7 +1198,10 @@ impl<A: StatefulActor> ActorClient<A> {
     /// immediately after return, and after an actor crash (before the next `call` / `cast` / `try_cast`
     /// triggers rebinding) this reflects the closed mailbox of the exited instance (`is_closed == true`).
     pub fn queue_stats(&self) -> QueueStats {
-        let tx = self.current_sender();
+        let tx = self
+            .sender
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         queue_stats_from_sender(&tx)
     }
 
@@ -1209,7 +1212,10 @@ impl<A: StatefulActor> ActorClient<A> {
         failed_sender: &Sender<ActorEnvelope<A>>,
     ) -> Result<(), ActorError<A::Error>> {
         {
-            let current = self.current_sender();
+            let current = self
+                .sender
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if !current.is_closed() && !current.same_channel(failed_sender) {
                 return Ok(());
             }
