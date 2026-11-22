@@ -1075,9 +1075,9 @@ impl<A: StatefulActor> StatefulActorRunner<A> {
 /// or triggering channel rebinding:
 ///
 /// - `queued` and `available` are approximate point-in-time snapshots under concurrent sends/receives.
-/// - Immediately after an actor crash or restart (and *before* the next `call` / `cast` rebinds the
-///   client), `queue_stats()` still inspects the previous instance's dead mailbox, reporting
-///   `is_closed == true`.
+/// - Immediately after an actor crash or restart (and *before* the next `call` / `cast` / `try_cast`
+///   rebinds the client), `queue_stats()` still inspects the previous instance's dead mailbox,
+///   reporting `is_closed == true`.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "remote", derive(serde::Serialize, serde::Deserialize))]
@@ -1187,8 +1187,8 @@ impl<A: StatefulActor> ActorClient<A> {
     ///
     /// Reads only the locally cached sender (`current_sender()`) without contacting the supervisor
     /// or waiting on locks/channels. As a result, concurrent senders/receivers may shift counts
-    /// immediately after return, and after an actor crash (before the next `call`/`cast` triggers
-    /// rebinding) this reflects the closed mailbox of the exited instance (`is_closed == true`).
+    /// immediately after return, and after an actor crash (before the next `call` / `cast` / `try_cast`
+    /// triggers rebinding) this reflects the closed mailbox of the exited instance (`is_closed == true`).
     pub fn queue_stats(&self) -> QueueStats {
         let tx = self.current_sender();
         queue_stats_from_sender(&tx)
@@ -1423,16 +1423,106 @@ impl<A: StatefulActor> ActorClient<A> {
         Err(ActorError::ActorUnavailable)
     }
 
+    /// Attempts a synchronous, non-blocking rebind of `self.sender` via `self.slot_rx`.
+    ///
+    /// Returns `Ok(Some(tx))` if `slot_rx` already holds a live `SlotState::Running` sender,
+    /// `Ok(None)` if the slot is currently restarting or `slot_rx` is not yet subscribed
+    /// (`ActorContext::client`), or `Err(err)` for terminal slot states (`Failed`, `Stopped`,
+    /// or `ChildTypeMismatch`).
+    fn try_rebind_sync(&self) -> Result<Option<Sender<ActorEnvelope<A>>>, ActorError<A::Error>> {
+        enum SlotSnapshot<A: StatefulActor> {
+            Running(Sender<ActorEnvelope<A>>),
+            Pending,
+            Terminal(ActorError<A::Error>),
+        }
+
+        let snapshot = {
+            let slot_guard = self
+                .slot_rx
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(rx) = slot_guard.as_ref() else {
+                return Ok(None);
+            };
+            match &*rx.borrow() {
+                SlotState::Running { endpoint, .. } => {
+                    match endpoint.downcast_ref::<Sender<ActorEnvelope<A>>>() {
+                        Some(new_tx) if !new_tx.is_closed() => {
+                            SlotSnapshot::Running(new_tx.clone())
+                        }
+                        Some(_) => SlotSnapshot::Pending,
+                        None => SlotSnapshot::Terminal(ActorError::Supervisor(
+                            SupervisorError::ChildTypeMismatch(self.name.clone()),
+                        )),
+                    }
+                }
+                SlotState::Restarting { .. } => SlotSnapshot::Pending,
+                SlotState::Failed(err) => {
+                    SlotSnapshot::Terminal(ActorError::Supervisor(err.clone()))
+                }
+                SlotState::Stopped => SlotSnapshot::Terminal(ActorError::Supervisor(
+                    SupervisorError::ChildNotFound(self.name.clone()),
+                )),
+            }
+        };
+
+        match snapshot {
+            SlotSnapshot::Running(cloned) => {
+                let mut rebound = false;
+                let tx = {
+                    let mut sender_guard = self
+                        .sender
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if sender_guard.is_closed() {
+                        *sender_guard = cloned.clone();
+                        rebound = true;
+                        cloned
+                    } else {
+                        sender_guard.clone()
+                    }
+                };
+                if rebound {
+                    tracing::info!(
+                        actor = %self.name,
+                        "🔄 ActorClient channel synchronously re-established via try_cast!"
+                    );
+                }
+                Ok(Some(tx))
+            }
+            SlotSnapshot::Pending => Ok(None),
+            SlotSnapshot::Terminal(err) => Err(err),
+        }
+    }
+
     /// Attempts to enqueue a fire-and-forget notification (`try_cast`) without blocking.
     ///
-    /// Returns [`ActorError::MailboxFull`] immediately if the actor's bounded mailbox has reached capacity,
-    /// or [`ActorError::ActorUnavailable`] if the mailbox is currently closed.
+    /// Returns [`ActorError::MailboxFull`] immediately if the actor's bounded mailbox has reached
+    /// capacity. If the cached mailbox channel was closed due to a prior restart, synchronously
+    /// checks the local [`SlotState`] watch channel to rebind to a live replacement instance and
+    /// retry once without blocking; returns [`ActorError::ActorUnavailable`] while the replacement
+    /// is still starting, or [`ActorError::Supervisor`] if the actor has permanently failed or
+    /// stopped.
     pub fn try_cast(&self, msg: A::Message) -> Result<(), ActorError<A::Error>> {
-        let current_sender = self.current_sender();
-        match current_sender.try_send(ActorEnvelope::Cast { msg }) {
+        let first_attempt = {
+            let guard = self
+                .sender
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.try_send(ActorEnvelope::Cast { msg })
+        };
+
+        match first_attempt {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(_)) => Err(ActorError::MailboxFull),
-            Err(mpsc::error::TrySendError::Closed(_)) => Err(ActorError::ActorUnavailable),
+            Err(mpsc::error::TrySendError::Closed(env)) => match self.try_rebind_sync()? {
+                Some(new_tx) => match new_tx.try_send(env) {
+                    Ok(()) => Ok(()),
+                    Err(mpsc::error::TrySendError::Full(_)) => Err(ActorError::MailboxFull),
+                    Err(mpsc::error::TrySendError::Closed(_)) => Err(ActorError::ActorUnavailable),
+                },
+                None => Err(ActorError::ActorUnavailable),
+            },
         }
     }
 

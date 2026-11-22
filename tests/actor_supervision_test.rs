@@ -5780,3 +5780,154 @@ async fn test_format_prometheus_metrics_exposition_and_label_escaping() {
 
     root.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn test_try_cast_rebinds_synchronously_after_restart() {
+    let root = Supervisor::new("try-cast-rebind-sup");
+
+    let client = StatefulActorBuilder::from_default::<StreamActor>("try-cast-worker")
+        .channel_capacity(1)
+        .restart_type(RestartType::Permanent)
+        .restart_policy(RestartPolicy::default().initial_backoff(Duration::from_millis(10)))
+        .spawn(&root)
+        .await
+        .unwrap();
+
+    let mut watcher = root.watch_child_status("try-cast-worker").await.unwrap();
+
+    // Crash instance #1 and wait until replacement instance #2 is running.
+    let _ = client.call(StreamMsg::PanicNow).await;
+    watcher
+        .wait_for(|s| matches!(s, ChildStatus::Running { instance_id: 2 }))
+        .await
+        .unwrap();
+
+    // Before any call/cast, cached sender is still closed, so queue_stats sees is_closed == true.
+    assert!(client.queue_stats().is_closed);
+
+    // `try_cast` must synchronously rebind via `slot_rx` and deliver to instance #2 immediately.
+    client
+        .try_cast(StreamMsg::Item(NonCloneItem(42)))
+        .expect("try_cast must synchronously rebind after actor restart");
+
+    assert!(
+        !client.queue_stats().is_closed,
+        "queue_stats must reflect the newly rebound channel immediately after try_cast"
+    );
+    assert_eq!(
+        client.call(StreamMsg::GetState).await.unwrap(),
+        (2, vec![42])
+    );
+
+    // Verify bounded capacity = 1 backpressure also holds on the rebound instance #2.
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    client
+        .cast(StreamMsg::Hold(entered_tx, release_rx))
+        .await
+        .unwrap();
+    entered_rx.await.unwrap();
+
+    client
+        .try_cast(StreamMsg::Item(NonCloneItem(43)))
+        .expect("First queued item in capacity=1 mailbox must fit");
+    assert!(
+        matches!(
+            client.try_cast(StreamMsg::Item(NonCloneItem(44))),
+            Err(ActorError::MailboxFull)
+        ),
+        "Second queued item must shed with ActorError::MailboxFull"
+    );
+
+    let _ = release_tx.send(());
+    assert_eq!(
+        client.call(StreamMsg::GetState).await.unwrap(),
+        (2, vec![42, 43])
+    );
+
+    root.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_try_cast_returns_unavailable_while_restarting_and_supervisor_error_on_terminal_states() {
+    let root = Supervisor::new("try-cast-states-sup");
+
+    // 1. Actor allowed 1 restart with an 80ms backoff so `Restarting` and `Failed` are observable.
+    let client = StatefulActorBuilder::from_default::<StreamActor>("flapping-try-cast")
+        .channel_capacity(2)
+        .restart_type(RestartType::Transient)
+        .restart_policy(
+            RestartPolicy::new(1, Duration::from_secs(10)).initial_backoff(Duration::from_millis(80)),
+        )
+        .spawn(&root)
+        .await
+        .unwrap();
+
+    let mut watcher = root.watch_child_status("flapping-try-cast").await.unwrap();
+
+    // Crash #1 -> enters `Restarting` backoff window.
+    let _ = client.call(StreamMsg::PanicNow).await;
+    watcher
+        .wait_for(|s| matches!(s, ChildStatus::Restarting { .. }))
+        .await
+        .unwrap();
+
+    let during_restart = client.try_cast(StreamMsg::Item(NonCloneItem(1)));
+    assert!(
+        matches!(during_restart, Err(ActorError::ActorUnavailable)),
+        "Expected ActorError::ActorUnavailable while slot is Restarting, got {during_restart:?}"
+    );
+
+    // Once instance #2 starts running, `try_cast` succeeds again.
+    watcher
+        .wait_for(|s| matches!(s, ChildStatus::Running { instance_id: 2 }))
+        .await
+        .unwrap();
+    client
+        .try_cast(StreamMsg::Item(NonCloneItem(2)))
+        .expect("try_cast must succeed after instance #2 boots");
+    assert_eq!(
+        client.call(StreamMsg::GetState).await.unwrap(),
+        (2, vec![2])
+    );
+
+    // Crash #2 -> exhausts `max_restarts = 1` -> `SlotState::Failed(MaxRestartsExceeded)`.
+    let _ = client.call(StreamMsg::PanicNow).await;
+    watcher
+        .wait_for(|s| matches!(s, ChildStatus::Failed(_)))
+        .await
+        .unwrap();
+
+    let after_max_restarts = client.try_cast(StreamMsg::Item(NonCloneItem(3)));
+    assert!(
+        matches!(
+            after_max_restarts,
+            Err(ActorError::Supervisor(SupervisorError::MaxRestartsExceeded(
+                ref name,
+                _,
+                _
+            ))) if name == "flapping-try-cast"
+        ),
+        "Expected MaxRestartsExceeded on permanently failed actor, got {after_max_restarts:?}"
+    );
+
+    // 2. Explicit `stop_child` transitions the slot to `Stopped` -> `ChildNotFound`.
+    let stoppable = StatefulActorBuilder::from_default::<StreamActor>("stoppable-try-cast")
+        .channel_capacity(2)
+        .spawn(&root)
+        .await
+        .unwrap();
+    root.stop_child("stoppable-try-cast").await.unwrap();
+
+    let after_stop = stoppable.try_cast(StreamMsg::Item(NonCloneItem(4)));
+    assert!(
+        matches!(
+            after_stop,
+            Err(ActorError::Supervisor(SupervisorError::ChildNotFound(ref name)))
+                if name == "stoppable-try-cast"
+        ),
+        "Expected ChildNotFound after stop_child, got {after_stop:?}"
+    );
+
+    root.shutdown().await.unwrap();
+}

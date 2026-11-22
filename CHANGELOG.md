@@ -8,6 +8,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [0.3.4] - Unreleased
+
+### Fixed
+- **Synchronous `ActorClient::try_cast` Rebinding (`src/actor/stateful_actor.rs`, Finding `F-01`):**
+  - When `try_cast` encounters a closed cached mailbox (`TrySendError::Closed`), it now synchronously inspects the local `SlotState` watch channel (`try_rebind_sync`) without blocking or contacting the supervisor.
+  - If a replacement instance is already `SlotState::Running`, `ActorClient` immediately updates its cached sender (so `queue_stats()` also reflects the live channel) and retries `try_send` on the new instance.
+  - Returns `Err(ActorError::ActorUnavailable)` while the slot is `Restarting`, and propagates `Err(ActorError::Supervisor(SupervisorError::MaxRestartsExceeded | ChildNotFound | ChildTypeMismatch))` when the slot has entered a terminal `Failed` or `Stopped` state.
+  - Happy-path `try_cast` also checks `sender.read()` directly without cloning the `mpsc::Sender`.
+
+---
+
 ## [0.3.3] - 2026-11-16
 
 `otp-actor` **0.3.3** is a non-breaking observability and remote-telemetry release on top of `0.3.2`.
