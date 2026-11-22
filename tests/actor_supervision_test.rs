@@ -6387,3 +6387,235 @@ async fn test_stateful_actor_simulate_crash_rescues_buffered_non_clone_calls() {
 
     root.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn test_child_supervisor_shutdown_and_request_shutdown_rebind_after_supervisor_restart() {
+    let root = Supervisor::new("shutdown-rebind-root");
+
+    // Part A: Strong `SupervisorHandle::shutdown()` after a child supervisor restarts
+    let sub1 = Supervisor::builder("sub-shutdown-rebind")
+        .restart_policy(RestartPolicy::default().initial_backoff(Duration::from_millis(10)))
+        .spawn(&root)
+        .await
+        .unwrap();
+    let _worker1 = StatefulActorBuilder::from_default::<CounterActor>("worker-1")
+        .spawn(&sub1)
+        .await
+        .unwrap();
+
+    let mut watcher1 = root
+        .watch_child_status("sub-shutdown-rebind")
+        .await
+        .unwrap();
+    sub1.simulate_crash().await.unwrap();
+    watcher1
+        .wait_for(|s| matches!(s, ChildStatus::Running { instance_id: 2 }))
+        .await
+        .unwrap();
+
+    // Cached command sender in `sub1` still points to dead instance #1 (`is_alive() == false`).
+    assert!(!sub1.is_alive());
+
+    // `shutdown()` must rebind to instance #2 and shut it down cleanly instead of being a no-op.
+    sub1.shutdown().await.unwrap();
+    let stopped1 = tokio::time::timeout(
+        Duration::from_secs(1),
+        watcher1.wait_for(|s| matches!(s, ChildStatus::Stopped)),
+    )
+    .await
+    .expect("shutdown() must rebind and terminate restarted child supervisor instance #2")
+    .unwrap();
+    assert_eq!(stopped1, ChildStatus::Stopped);
+
+    // Calling shutdown() / request_shutdown() again on an already stopped supervisor is idempotent.
+    sub1.shutdown().await.unwrap();
+    sub1.request_shutdown().await.unwrap();
+
+    // Part B: Weak `SupervisorHandle::request_shutdown()` (via `ctx.supervisor()`) after restart
+    struct SupHandleSpy;
+    impl StatefulActor for SupHandleSpy {
+        type Message = ();
+        type Response = otp_actor::actor::SupervisorHandle;
+        type Error = &'static str;
+
+        async fn handle(
+            &mut self,
+            _msg: Self::Message,
+            ctx: &mut ActorContext<Self>,
+        ) -> Result<Self::Response, Self::Error> {
+            Ok(ctx.supervisor().clone())
+        }
+    }
+
+    let sub2 = Supervisor::builder("sub-req-shutdown-rebind")
+        .restart_policy(RestartPolicy::default().initial_backoff(Duration::from_millis(10)))
+        .spawn(&root)
+        .await
+        .unwrap();
+    let spy = StatefulActorBuilder::new("sup-spy", |_| SupHandleSpy)
+        .spawn(&sub2)
+        .await
+        .unwrap();
+    let weak_sub2 = spy.call(()).await.unwrap();
+
+    let mut watcher2 = root
+        .watch_child_status("sub-req-shutdown-rebind")
+        .await
+        .unwrap();
+    sub2.simulate_crash().await.unwrap();
+    watcher2
+        .wait_for(|s| matches!(s, ChildStatus::Running { instance_id: 2 }))
+        .await
+        .unwrap();
+
+    assert!(!weak_sub2.is_alive());
+    weak_sub2.request_shutdown().await.unwrap();
+    let stopped2 = tokio::time::timeout(
+        Duration::from_secs(1),
+        watcher2.wait_for(|s| matches!(s, ChildStatus::Stopped)),
+    )
+    .await
+    .expect("request_shutdown() via weak handle must rebind and stop restarted child supervisor")
+    .unwrap();
+    assert_eq!(stopped2, ChildStatus::Stopped);
+
+    // Shutting down root (and calling shutdown() twice on root) remains idempotent.
+    root.shutdown().await.unwrap();
+    root.shutdown().await.unwrap();
+    sub2.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_actor_client_returns_max_restarts_exceeded_on_third_attempt() {
+    let root = Supervisor::new("f05-actor-sup");
+
+    // Part A: `call_retry` exhausting `max_restarts = 2` exactly on attempt #3 (`MAX_ATTEMPTS`)
+    struct AlwaysPanicActor;
+    impl StatefulActor for AlwaysPanicActor {
+        type Message = usize;
+        type Response = usize;
+        type Error = &'static str;
+
+        async fn handle(
+            &mut self,
+            _msg: Self::Message,
+            _ctx: &mut ActorContext<Self>,
+        ) -> Result<Self::Response, Self::Error> {
+            panic!("always panic on handle");
+        }
+    }
+
+    let retry_client = StatefulActorBuilder::new("retry-3-actor", |_| AlwaysPanicActor)
+        .restart_policy(
+            RestartPolicy::new(2, Duration::from_secs(10))
+                .initial_backoff(Duration::from_millis(5)),
+        )
+        .spawn(&root)
+        .await
+        .unwrap();
+
+    let retry_err = retry_client.call_retry(1).await.unwrap_err();
+    assert!(
+        matches!(
+            retry_err,
+            ActorError::Supervisor(SupervisorError::MaxRestartsExceeded(ref name, 2, _))
+                if name == "retry-3-actor"
+        ),
+        "Expected MaxRestartsExceeded on 3rd attempt of call_retry, got {retry_err:?}"
+    );
+
+    // Part B: `call` with non-Clone message returned as Unprocessed during `on_start` failure on attempt #3
+    struct AlwaysFailOnStartActor {
+        release_rx: Option<tokio::sync::oneshot::Receiver<()>>,
+    }
+    impl StatefulActor for AlwaysFailOnStartActor {
+        type Message = NonCloneMsg;
+        type Response = usize;
+        type Error = &'static str;
+
+        async fn on_start(&mut self, _ctx: &mut ActorContext<Self>) -> Result<(), Self::Error> {
+            if let Some(rx) = self.release_rx.take() {
+                let _ = rx.await;
+            }
+            Err("always fail on_start")
+        }
+
+        async fn handle(
+            &mut self,
+            msg: Self::Message,
+            _ctx: &mut ActorContext<Self>,
+        ) -> Result<Self::Response, Self::Error> {
+            Ok(msg.0)
+        }
+    }
+
+    let (rel_tx, rel_rx) = tokio::sync::oneshot::channel();
+    let rel_slot = Arc::new(std::sync::Mutex::new(Some(rel_rx)));
+    let call_client = StatefulActorBuilder::new("on-start-3-actor", move |inst| {
+        let rx = if inst == 1 {
+            rel_slot.lock().unwrap().take()
+        } else {
+            None
+        };
+        AlwaysFailOnStartActor { release_rx: rx }
+    })
+    .restart_policy(
+        RestartPolicy::new(2, Duration::from_secs(10)).initial_backoff(Duration::from_millis(5)),
+    )
+    .spawn(&root)
+    .await
+    .unwrap();
+
+    let call_task = tokio::spawn({
+        let c = call_client.clone();
+        async move { c.call(NonCloneMsg(99)).await }
+    });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let _ = rel_tx.send(());
+
+    let call_err = call_task.await.unwrap().unwrap_err();
+    assert!(
+        matches!(
+            call_err,
+            ActorError::Supervisor(SupervisorError::MaxRestartsExceeded(ref name, 2, _))
+                if name == "on-start-3-actor"
+        ),
+        "Expected MaxRestartsExceeded on 3rd attempt of call(), got {call_err:?}"
+    );
+
+    root.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_resource_client_returns_max_restarts_exceeded_on_third_attempt() {
+    let root = Supervisor::new("f05-resource-sup");
+
+    let client = ResourceActor::builder("retry-3-res")
+        .worker(|_ctx: WorkerContext| async move {
+            panic!("always panic in worker");
+            #[allow(unreachable_code)]
+            Ok::<TimedResource<String>, String>(TimedResource::perpetual(String::new()))
+        })
+        .restart_policy(
+            RestartPolicy::new(2, Duration::from_secs(10))
+                .initial_backoff(Duration::from_millis(5)),
+        )
+        .spawn(&root)
+        .await
+        .unwrap();
+
+    let res = client.get().await;
+    assert!(
+        matches!(
+            res,
+            Err(ResourceError::Supervisor(SupervisorError::MaxRestartsExceeded(
+                ref name,
+                2,
+                _
+            ))) if name == "retry-3-res"
+        ),
+        "Expected MaxRestartsExceeded on 3rd attempt of ResourceClient::get(), got {res:?}"
+    );
+
+    root.shutdown().await.unwrap();
+}

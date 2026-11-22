@@ -2666,14 +2666,27 @@ impl SupervisorHandle {
         }
     }
 
+    /// Returns a live command sender for shutdown operations, rebinding via the parent
+    /// [`SlotState`] watch channel if the supervisor restarted, or `None` if already stopped/failed.
+    async fn resolve_sender_for_shutdown(&self) -> Option<Sender<SupervisorCommand>> {
+        if let Some(tx) = self.current_command_sender() {
+            return Some(tx);
+        }
+        self.get_sender().await.ok()
+    }
+
     /// Requests graceful shutdown of this [`Supervisor`] without waiting for completion.
     ///
     /// Unlike [`SupervisorHandle::shutdown`], this method enqueues the shutdown command and
     /// returns immediately once accepted, making it safe to invoke from inside a supervised child
     /// actor's message handler (e.g. `ctx.supervisor().request_shutdown().await`) without
     /// deadlocking the child's own graceful shutdown sequence.
+    ///
+    /// If this handle points to a child [`Supervisor`] that has restarted since the last command,
+    /// transparently rebinds to the replacement instance; remains idempotent (`Ok(())`) if already
+    /// stopped or permanently failed.
     pub async fn request_shutdown(&self) -> Result<(), SupervisorError> {
-        let Some(current_tx) = self.current_command_sender() else {
+        let Some(current_tx) = self.resolve_sender_for_shutdown().await else {
             return Ok(());
         };
 
@@ -2686,6 +2699,10 @@ impl SupervisorHandle {
 
     /// Gracefully shuts down all supervised children in reverse registration order and terminates this [`Supervisor`].
     ///
+    /// If this handle points to a child [`Supervisor`] that has restarted since the last command,
+    /// transparently rebinds to the replacement instance before shutting it down; remains idempotent
+    /// (`Ok(())`) if already stopped or permanently failed.
+    ///
     /// # Deadlock Warning
     ///
     /// Do **not** `.await` `shutdown()` from inside a supervised child actor's message handler
@@ -2694,7 +2711,7 @@ impl SupervisorHandle {
     /// `shutdown()`, which will deadlock until the child's [`ShutdownPolicy`] timeout expires.
     /// Use [`SupervisorHandle::request_shutdown`] when triggering shutdown from within a child actor.
     pub async fn shutdown(&self) -> Result<(), SupervisorError> {
-        let Some(current_tx) = self.current_command_sender() else {
+        let Some(current_tx) = self.resolve_sender_for_shutdown().await else {
             return Ok(());
         };
 

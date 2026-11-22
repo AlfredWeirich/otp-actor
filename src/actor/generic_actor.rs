@@ -1598,7 +1598,7 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static> Resourc
     ) -> Result<(), ResourceError<E>> {
         const MAX_ATTEMPTS: usize = 3;
 
-        for attempt in 1..=MAX_ATTEMPTS {
+        for _attempt in 1..=MAX_ATTEMPTS {
             let current_ep = self.current_endpoint();
             if invalidate_cache {
                 current_ep.invalidated.store(true, Ordering::Release);
@@ -1608,9 +1608,7 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static> Resourc
                 return Ok(());
             }
 
-            if attempt < MAX_ATTEMPTS {
-                self.rebind_channel(&current_ep.sender).await?;
-            }
+            self.rebind_channel(&current_ep.sender).await?;
         }
 
         Err(ResourceError::ActorUnavailable)
@@ -1657,16 +1655,14 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static> Resourc
                 return item_res;
             }
 
-            if attempt < MAX_ATTEMPTS {
-                tracing::warn!(
-                    actor = %self.name,
-                    attempt,
-                    max_attempts = MAX_ATTEMPTS,
-                    "⚠️ Direct channel broken or actor restarting. Rebinding via reactive watch slot..."
-                );
+            tracing::warn!(
+                actor = %self.name,
+                attempt,
+                max_attempts = MAX_ATTEMPTS,
+                "⚠️ Direct channel broken or actor restarting. Rebinding via reactive watch slot..."
+            );
 
-                self.rebind_channel(&current_ep.sender).await?;
-            }
+            self.rebind_channel(&current_ep.sender).await?;
         }
 
         Err(ResourceError::ActorUnavailable)

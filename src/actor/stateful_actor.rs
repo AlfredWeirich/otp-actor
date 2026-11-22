@@ -1302,7 +1302,7 @@ impl<A: StatefulActor> ActorClient<A> {
     pub async fn call(&self, mut msg: A::Message) -> Result<A::Response, ActorError<A::Error>> {
         const MAX_ATTEMPTS: usize = 3;
 
-        for attempt in 1..=MAX_ATTEMPTS {
+        for _attempt in 1..=MAX_ATTEMPTS {
             let current_sender = self.current_sender();
 
             let (tx, rx) = oneshot::channel();
@@ -1317,9 +1317,7 @@ impl<A: StatefulActor> ActorClient<A> {
                     Ok(CallOutcome::Processed(res)) => return res,
                     Ok(CallOutcome::Unprocessed(returned_msg)) => {
                         msg = returned_msg;
-                        if attempt < MAX_ATTEMPTS {
-                            self.rebind_channel(&current_sender).await?;
-                        }
+                        self.rebind_channel(&current_sender).await?;
                     }
                     Err(_) => {
                         // The actor crashed mid-flight while processing the message (`msg` was consumed).
@@ -1330,9 +1328,7 @@ impl<A: StatefulActor> ActorClient<A> {
                     msg: returned_msg, ..
                 })) => {
                     msg = returned_msg;
-                    if attempt < MAX_ATTEMPTS {
-                        self.rebind_channel(&current_sender).await?;
-                    }
+                    self.rebind_channel(&current_sender).await?;
                 }
                 Err(_) => unreachable!(),
             }
@@ -1358,7 +1354,7 @@ impl<A: StatefulActor> ActorClient<A> {
     {
         const MAX_ATTEMPTS: usize = 3;
 
-        for attempt in 1..=MAX_ATTEMPTS {
+        for _attempt in 1..=MAX_ATTEMPTS {
             let current_sender = self.current_sender();
 
             let (tx, rx) = oneshot::channel();
@@ -1375,9 +1371,7 @@ impl<A: StatefulActor> ActorClient<A> {
                 return res;
             }
 
-            if attempt < MAX_ATTEMPTS {
-                self.rebind_channel(&current_sender).await?;
-            }
+            self.rebind_channel(&current_sender).await?;
         }
 
         Err(ActorError::ActorUnavailable)
@@ -1413,16 +1407,14 @@ impl<A: StatefulActor> ActorClient<A> {
     pub async fn cast(&self, mut msg: A::Message) -> Result<(), ActorError<A::Error>> {
         const MAX_ATTEMPTS: usize = 3;
 
-        for attempt in 1..=MAX_ATTEMPTS {
+        for _attempt in 1..=MAX_ATTEMPTS {
             let current_sender = self.current_sender();
 
             match current_sender.send(ActorEnvelope::Cast { msg }).await {
                 Ok(()) => return Ok(()),
                 Err(mpsc::error::SendError(ActorEnvelope::Cast { msg: returned_msg })) => {
                     msg = returned_msg;
-                    if attempt < MAX_ATTEMPTS {
-                        self.rebind_channel(&current_sender).await?;
-                    }
+                    self.rebind_channel(&current_sender).await?;
                 }
                 Err(_) => unreachable!(),
             }
@@ -1552,16 +1544,14 @@ impl<A: StatefulActor> ActorClient<A> {
     ) -> Result<(), ActorError<A::Error>> {
         const MAX_ATTEMPTS: usize = 3;
 
-        for attempt in 1..=MAX_ATTEMPTS {
+        for _attempt in 1..=MAX_ATTEMPTS {
             let current_sender = self.current_sender();
 
             if current_sender.send(make_env()).await.is_ok() {
                 return Ok(());
             }
 
-            if attempt < MAX_ATTEMPTS {
-                self.rebind_channel(&current_sender).await?;
-            }
+            self.rebind_channel(&current_sender).await?;
         }
 
         Err(ActorError::ActorUnavailable)

@@ -11,6 +11,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ## [0.3.4] - Unreleased
 
 ### Fixed
+- **Preserve `SupervisorError` on Final Client Retry Attempt (`src/actor/stateful_actor.rs`, `src/actor/generic_actor.rs`, Finding `F-05`):**
+  - Updated all retry loops in `ActorClient` (`call`, `call_retry`, `cast`, `send_control`) and `ResourceClient` (`get`, `send_control`) to also invoke `rebind_channel(...).await?` after `attempt == MAX_ATTEMPTS` (`3`).
+  - Prevents terminal `SupervisorError::MaxRestartsExceeded` / `ChildNotFound` states reached on the 3rd crash from being masked as `ActorUnavailable` (both locally and via gRPC `RemoteError`).
+- **Idempotent Rebinding in `SupervisorHandle::shutdown` & `request_shutdown` (`src/actor/supervisor.rs`, Finding `F-04`):**
+  - Added `SupervisorHandle::resolve_sender_for_shutdown` so both `shutdown()` and `request_shutdown()` transparently rebind via `get_sender().await` when a child supervisor has restarted since the last command, instead of silently returning `Ok(())` against a closed instance `#1` sender.
+  - Preserves idempotent `Ok(())` returns when the supervisor (or its parent) is already `Stopped` or `Failed`.
 - **Rescue Buffered Non-`Clone` `Call` Messages on `StatefulActor` Failure Exits (`src/actor/stateful_actor.rs`, Finding `F-03`):**
   - Added `StatefulActorRunner::return_unprocessed_calls` and `escalate_failure` so all buffered `ActorEnvelope::Call` messages remaining in the mailbox are returned via `CallOutcome::Unprocessed(msg)` across `on_start` failure, `ActorControl::Fail` (from `handle`, `handle_cast`, or `finish_graceful_shutdown`), `handler_timeout`, and `ActorEnvelope::SimulateCrash`, letting `ActorClient::call` transparently rebind and deliver them to the replacement instance without losing non-`Clone` payloads.
 - **Sequential Reverse-Order Sibling Termination for `OneForAll` & `RestForOne` (`src/actor/supervisor.rs`, Finding `F-02`):**
