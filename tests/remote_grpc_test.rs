@@ -562,7 +562,7 @@ async fn test_remote_trailing_bytes_and_drain_timeout_and_error_symmetry()
         .call(CallRequest {
             service_name: "hardening-service".into(),
             actor_name: "calc-hardened".into(),
-            payload,
+            payload: payload.into(),
             timeout_ms: None,
             protocol_version: otp_actor::remote::REMOTE_PROTOCOL_VERSION,
         })
@@ -642,7 +642,7 @@ async fn test_service_protocol_version_and_unknown_error_mapping() {
         .call(tonic::Request::new(CallRequest {
             service_name: "svc".into(),
             actor_name: "act".into(),
-            payload: Vec::new(),
+            payload: Default::default(),
             timeout_ms: None,
             protocol_version: REMOTE_PROTOCOL_VERSION + 42,
         }))
@@ -667,7 +667,7 @@ async fn test_service_protocol_version_and_unknown_error_mapping() {
         .cast(tonic::Request::new(CastRequest {
             service_name: "svc".into(),
             actor_name: "act".into(),
-            payload: Vec::new(),
+            payload: Default::default(),
             timeout_ms: None,
             protocol_version: 0,
         }))
@@ -720,7 +720,8 @@ async fn test_service_authorizer_label_sanitization_and_timeout_clamping() {
             }
         }));
 
-    let get_payload = postcard::to_stdvec(&CalcMsg::Get).unwrap();
+    let get_payload =
+        otp_actor::remote::proto::Bytes::from(postcard::to_stdvec(&CalcMsg::Get).unwrap());
 
     // 1. Unauthenticated request is rejected before routing
     let unauth_err = service
@@ -747,14 +748,18 @@ async fn test_service_authorizer_label_sanitization_and_timeout_clamping() {
         .metadata_mut()
         .insert("authorization", "Bearer secret-token".parse().unwrap());
     let ok_resp = service.call(auth_req).await.unwrap().into_inner();
-    assert!(matches!(ok_resp.result, Some(CallResult::OkPayload(_))));
+    let ok_bytes: otp_actor::remote::proto::Bytes = match ok_resp.result {
+        Some(CallResult::OkPayload(b)) => b,
+        other => panic!("Expected OkPayload, got {other:?}"),
+    };
+    assert_eq!(postcard::from_bytes::<i64>(&ok_bytes).unwrap(), 0);
 
     // 3. Control characters & long untrusted names are sanitized in ServiceNotFound/ActorNotFound
     let long_evil_service = format!("evil\n\r\x1b[31m{}", "x".repeat(200));
     let mut evil_req = tonic::Request::new(CallRequest {
         service_name: long_evil_service,
         actor_name: "calc".into(),
-        payload: Vec::new(),
+        payload: Default::default(),
         timeout_ms: None,
         protocol_version: REMOTE_PROTOCOL_VERSION,
     });
@@ -778,7 +783,7 @@ async fn test_service_authorizer_label_sanitization_and_timeout_clamping() {
     let mut slow_req = tonic::Request::new(CallRequest {
         service_name: "auth-svc".into(),
         actor_name: "calc".into(),
-        payload: delay_payload,
+        payload: delay_payload.into(),
         timeout_ms: Some(60_000),
         protocol_version: REMOTE_PROTOCOL_VERSION,
     });

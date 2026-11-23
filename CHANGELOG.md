@@ -11,6 +11,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ## [0.4.0] - Unreleased
 
 ### Breaking Changes
+- **Zero-Copy `prost::bytes::Bytes` Payloads in `proto::v1` (`build.rs`, `src/remote/{proto,endpoint}.rs`, Finding `F-18`):**
+  - Enabled `.bytes(".")` on `tonic_prost_build::configure()` so Prost generates zero-copy `prost::bytes::Bytes` instead of `Vec<u8>` for all `proto::v1` payload fields (`CallRequest.payload`, `CastRequest.payload`, `CallResponse.{ok_payload, actor_error_payload}`, `StatusResponse.status_payload`).
+  - Re-exported `otp_actor::remote::proto::Bytes` and updated internal `BoundedVec` / `encode_payload` to return `prost::bytes::Bytes` without extra copies.
+  - *Migration:* Callers constructing `proto::v1::{CallRequest, CastRequest, CallResponse, StatusResponse}` directly should pass `otp_actor::remote::proto::Bytes` (e.g., `.into()`, `Bytes::from(...)`, or `Default::default()`). High-level `RemoteActorClient` and `AnyActorClient` callers are unaffected.
 - **Single-Task `Supervisor` `JoinSet` Architecture (`src/actor/{supervisor,generic_actor,stateful_actor,mod}.rs`, Finding `F-10`):**
   - Added public type alias `ChildFuture = Pin<Box<dyn Future<Output = TaskResult> + Send + 'static>>` and updated `UntypedActorFactory` to return `(UntypedSender, ChildFuture)` instead of `(UntypedSender, JoinHandle<TaskResult>)`.
   - `Supervisor` now spawns each child future directly into its `JoinSet<TaskResult>` and maps `tokio::task::Id` via `join_next_with_id()`, eliminating the second monitor wrapper task per supervised child and letting `JoinSet::abort_all()` abort child tasks directly.
@@ -32,7 +36,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   - Replaced `let _ = ...` on `AccountMsg::SimulateCrash` with explicit `assert!(matches!(..., Err(RemoteActorError::Actor(_))))` checks and removed the unnecessary `sleep(50ms)` in `all_in_one.rs`, documenting the deterministic `receiver.close()`-before-reply guarantee.
 - **Zero-Allocation Label Sanitization & Pre-Sized `BoundedVec` in Remote gRPC Hot Path (`src/remote/{registry,server,endpoint}.rs`, Finding `F-18` — SemVer-compatible part):**
   - Switched `sanitize_label` to return `Cow<'_, str>` with a zero-allocation `Cow::Borrowed` fast path for clean labels (`<= MAX_LABEL_CHARS` chars, no control chars), and guarded `span.record(...)` in `ActorNodeService::{call, cast}` with `if !span.is_disabled()`.
-  - Pre-allocated `BoundedVec` with `Vec::with_capacity(64)` in `encode_payload` and removed the redundant exact-size `self.buf.reserve(...)` call in `BoundedVec::try_extend` so `Vec::extend_from_slice` uses amortized growth within the 4 MiB cap (Prost `bytes::Bytes` migration remains planned for `v0.4.0`).
+  - Pre-allocated `BoundedVec` with `Vec::with_capacity(64)` in `encode_payload` and removed the redundant exact-size `self.buf.reserve(...)` call in `BoundedVec::try_extend` so `Vec::extend_from_slice` uses amortized growth within the 4 MiB cap.
 - **`#[must_use]` Annotations & Allocation-Free Secret Masking (`src/actor/*`, `examples/{simple,otp_actor}.rs`, Finding `F-15`):**
   - Added `#[must_use]` to pure getters, predicates, snapshots, and builder/constructor methods across `src/actor/*` (0 `clippy::must_use_candidate` warnings on `--lib`).
   - Rewrote `mask_secret` in `examples/simple.rs` and `examples/otp_actor.rs` using `str::char_indices()` without intermediate `Vec<char>` or temporary prefix/suffix `String` allocations.

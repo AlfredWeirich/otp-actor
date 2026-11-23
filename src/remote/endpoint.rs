@@ -40,7 +40,7 @@ struct BoundedVec {
 }
 
 impl postcard::ser_flavors::Flavor for BoundedVec {
-    type Output = Vec<u8>;
+    type Output = prost::bytes::Bytes;
 
     fn try_extend(&mut self, data: &[u8]) -> postcard::Result<()> {
         let next_len = self
@@ -63,12 +63,15 @@ impl postcard::ser_flavors::Flavor for BoundedVec {
     }
 
     fn finalize(self) -> postcard::Result<Self::Output> {
-        Ok(self.buf)
+        Ok(prost::bytes::Bytes::from(self.buf))
     }
 }
 
-/// Encodes a value with `postcard`, aborting before allocating beyond [`MAX_REMOTE_PAYLOAD_BYTES`].
-pub(crate) fn encode_payload<T: serde::Serialize>(val: &T) -> Result<Vec<u8>, PayloadCodecError> {
+/// Encodes a value with `postcard` into a zero-copy [`prost::bytes::Bytes`] buffer,
+/// aborting before allocating beyond [`MAX_REMOTE_PAYLOAD_BYTES`].
+pub(crate) fn encode_payload<T: serde::Serialize>(
+    val: &T,
+) -> Result<prost::bytes::Bytes, PayloadCodecError> {
     let max_len = MAX_REMOTE_PAYLOAD_BYTES as usize;
     let bytes = postcard::serialize_with_flavor(
         val,
@@ -256,13 +259,13 @@ mod tests {
     #[test]
     fn test_postcard_payload_roundtrip_and_bounds() {
         let input = ("hello".to_string(), 42_u64, vec![1_u8, 2, 3]);
-        let encoded = encode_payload(&input).expect("encode should succeed");
+        let encoded: prost::bytes::Bytes = encode_payload(&input).expect("encode should succeed");
         let decoded: (String, u64, Vec<u8>) =
             decode_payload(&encoded).expect("decode should succeed");
         assert_eq!(decoded, input);
 
         // Trailing bytes must be rejected
-        let mut with_trailing = encoded.clone();
+        let mut with_trailing = encoded.to_vec();
         with_trailing.push(0xFF);
         let trailing_err = decode_payload::<(String, u64, Vec<u8>)>(&with_trailing).unwrap_err();
         assert!(

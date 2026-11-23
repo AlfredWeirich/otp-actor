@@ -5,6 +5,7 @@ pub mod v1 {
     tonic::include_proto!("otp_actor.remote.v1");
 }
 
+pub use prost::bytes::Bytes;
 pub use v1::actor_node_admin_client::ActorNodeAdminClient;
 pub use v1::actor_node_admin_server::{ActorNodeAdmin, ActorNodeAdminServer};
 pub use v1::actor_node_client::ActorNodeClient;

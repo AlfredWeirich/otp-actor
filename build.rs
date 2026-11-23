@@ -8,7 +8,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "remote")]
     {
         println!("cargo:rerun-if-changed=proto/actor_node.proto");
-        tonic_prost_build::configure().compile_protos(&["proto/actor_node.proto"], &["proto"])?;
+        tonic_prost_build::configure()
+            .bytes(".")
+            .compile_protos(&["proto/actor_node.proto"], &["proto"])?;
     }
     Ok(())
 }
