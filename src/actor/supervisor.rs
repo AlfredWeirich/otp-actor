@@ -47,6 +47,8 @@ pub struct SpawnContext {
     pub instance_id: usize,
     /// Watch receiver that transitions to `true` when the supervisor initiates a graceful shutdown of this child.
     pub shutdown_rx: watch::Receiver<bool>,
+    /// Pre-subscribed lifecycle watch channel for this child's supervision slot.
+    pub(crate) slot_rx: watch::Receiver<SlotState>,
     /// Weak-backed handle to the parent [`Supervisor`] managing this child (prevents reference cycles).
     pub supervisor: SupervisorHandle,
 }
@@ -960,16 +962,15 @@ struct TerminationPlan {
 }
 
 impl TerminationPlan {
-    /// Captures termination inputs from an active slot while clearing `entry.sender`.
+    /// Captures termination inputs from an active slot without clearing `entry.sender` prematurely.
     fn take(supervisor_name: String, child_name: String, entry: &mut ActiveChild) -> Self {
-        let sender = std::mem::replace(&mut entry.sender, Arc::new(()));
         Self {
             supervisor_name,
             child_name,
             policy: entry.shutdown_policy,
             shutdown_tx: entry.shutdown_tx.clone(),
             shutdown_signal: entry.shutdown_signal.clone(),
-            sender,
+            sender: entry.sender.clone(),
             abort_handle: entry.abort_handle.clone(),
             term_rx: entry.term_rx.clone(),
             removed_entry: None,
@@ -1223,9 +1224,18 @@ impl Supervisor {
         );
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (slot_tx, slot_rx) = if let Some(existing) = self.children.get(name) {
+            (existing.slot_tx.clone(), existing.slot_tx.subscribe())
+        } else {
+            let (tx, rx) = watch::channel(SlotState::Restarting {
+                instance_id: inst_id,
+            });
+            (tx, rx)
+        };
         let spawn_ctx = SpawnContext {
             instance_id: inst_id,
             shutdown_rx,
+            slot_rx,
             supervisor: self.self_handle.clone(),
         };
 
@@ -1258,13 +1268,8 @@ impl Supervisor {
         if existing.is_none() {
             self.child_order.push(name.clone());
         }
-        let (slot_tx, prev_restarts_total) = if let Some(existing) = existing {
-            existing.slot_tx.send_replace(initial_state);
-            (existing.slot_tx.clone(), existing.restarts_total)
-        } else {
-            let (tx, _rx) = watch::channel(initial_state);
-            (tx, 0)
-        };
+        slot_tx.send_replace(initial_state);
+        let prev_restarts_total = existing.map_or(0, |e| e.restarts_total);
 
         self.children.insert(
             name.clone(),
@@ -1500,27 +1505,40 @@ impl Supervisor {
         let ordered_children: Vec<String> = self.child_order.iter().rev().cloned().collect();
         for child_name in ordered_children {
             let ticket = self.allocate_restart_ticket();
-            let maybe_rx = if let Some(entry) = self.children.get_mut(&child_name)
-                && matches!(
-                    entry.phase,
-                    ChildPhase::Running | ChildPhase::Restarting
-                )
-            {
-                let (tx, rx) = oneshot::channel();
-                Self::trigger_child_shutdown(
-                    sup_name.clone(),
-                    child_name,
-                    entry,
-                    ticket,
-                    false,
-                    Some(tx),
-                );
-                Some(rx)
+            enum ShutdownWait {
+                Oneshot(oneshot::Receiver<Result<(), SupervisorError>>),
+                TermRx(watch::Receiver<bool>),
+            }
+            let wait = if let Some(entry) = self.children.get_mut(&child_name) {
+                match entry.phase {
+                    ChildPhase::Running | ChildPhase::Restarting => {
+                        let (tx, rx) = oneshot::channel();
+                        Self::trigger_child_shutdown(
+                            sup_name.clone(),
+                            child_name,
+                            entry,
+                            ticket,
+                            false,
+                            Some(tx),
+                        );
+                        Some(ShutdownWait::Oneshot(rx))
+                    }
+                    ChildPhase::Stopping if !*entry.term_rx.borrow() => {
+                        Some(ShutdownWait::TermRx(entry.term_rx.clone()))
+                    }
+                    _ => None,
+                }
             } else {
                 None
             };
-            if let Some(rx) = maybe_rx {
-                let _ = rx.await;
+            match wait {
+                Some(ShutdownWait::Oneshot(rx)) => {
+                    let _ = rx.await;
+                }
+                Some(ShutdownWait::TermRx(mut term_rx)) => {
+                    let _ = term_rx.wait_for(|&done| done).await;
+                }
+                None => {}
             }
         }
 
@@ -1630,6 +1648,9 @@ impl Supervisor {
                             }
                         }
                         RestartOutcome::Escalate(msg) => {
+                            receiver.close();
+                            scheduled_restart_rx.close();
+                            self.graceful_shutdown_all().await;
                             return Err(msg);
                         }
                     }
@@ -1667,13 +1688,18 @@ impl Supervisor {
                         Ok((id, res)) => (id, Ok(res)),
                         Err(join_err) => (join_err.id(), Err(join_err)),
                     };
-                    if let Some((child_name, spawn_id)) = self.task_index.remove(&task_id) {
-                        self.handle_child_exit(
+                    if let Some((child_name, spawn_id)) = self.task_index.remove(&task_id)
+                        && let Err(msg) = self.handle_child_exit(
                             child_name,
                             spawn_id,
                             task_result,
                             &scheduled_restart_tx,
-                        )?;
+                        )
+                    {
+                        receiver.close();
+                        scheduled_restart_rx.close();
+                        self.graceful_shutdown_all().await;
+                        return Err(msg);
                     }
                 }
             }
@@ -1820,6 +1846,9 @@ impl Supervisor {
                 if let Err(msg) =
                     self.handle_restart_child(child_name, respond_to, scheduled_restart_tx)
                 {
+                    receiver.close();
+                    scheduled_restart_rx.close();
+                    self.graceful_shutdown_all().await;
                     return Some(Err(msg));
                 }
             }
@@ -2070,6 +2099,8 @@ impl Supervisor {
             Some(entry) => match &entry.phase {
                 ChildPhase::Stopping => {
                     entry.phase = ChildPhase::Stopped;
+                    entry.abort_handle = None;
+                    entry.sender = Arc::new(());
                     tracing::debug!(
                         supervisor = %self.name,
                         child = %child_name,
@@ -2079,6 +2110,8 @@ impl Supervisor {
                     return Ok(());
                 }
                 ChildPhase::Stopped | ChildPhase::Restarting | ChildPhase::Failed(_) => {
+                    entry.abort_handle = None;
+                    entry.sender = Arc::new(());
                     tracing::debug!(
                         supervisor = %self.name,
                         child = %child_name,
@@ -2374,6 +2407,9 @@ impl Supervisor {
                                 target_name.clone(),
                                 entry,
                             ));
+                        } else {
+                            entry.abort_handle = None;
+                            entry.sender = Arc::new(());
                         }
                     }
                 }
@@ -2458,6 +2494,7 @@ impl Supervisor {
                 let spawn_ctx = SpawnContext {
                     instance_id: new_inst,
                     shutdown_rx,
+                    slot_rx: entry.slot_tx.subscribe(),
                     supervisor: self.self_handle.clone(),
                 };
 

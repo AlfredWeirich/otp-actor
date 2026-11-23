@@ -7891,3 +7891,318 @@ async fn test_resource_client_refresh_due_serves_zero_hop_without_mailbox_stampe
 
     root.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn test_one_for_all_termination_preserves_sibling_telemetry_and_escalate_on_failure_runs_graceful_shutdown() {
+    struct StopHookActor {
+        name: &'static str,
+        log: Option<Arc<std::sync::Mutex<Vec<&'static str>>>>,
+        entered: Option<Arc<tokio::sync::Notify>>,
+        release: Option<Arc<tokio::sync::Notify>>,
+    }
+
+    impl StatefulActor for StopHookActor {
+        type Message = ();
+        type Response = ();
+        type Error = String;
+
+        async fn handle(
+            &mut self,
+            _msg: Self::Message,
+            _ctx: &mut ActorContext<Self>,
+        ) -> Result<Self::Response, Self::Error> {
+            Ok(())
+        }
+
+        async fn on_stop(&mut self, _ctx: &mut ActorContext<Self>) {
+            if let Some(entered) = &self.entered {
+                entered.notify_one();
+            }
+            if let Some(release) = &self.release {
+                release.notified().await;
+            }
+            if let Some(log) = &self.log {
+                log.lock().unwrap().push(self.name);
+            }
+        }
+    }
+
+    let root = Supervisor::new("f03-f10-root");
+
+    // 1. F-03: While "beta" is blocked inside `on_stop` during a `OneForAll` restart wave,
+    // still-running sibling "alpha" keeps its `sender` and reports `Some(QueueStats)` in `snapshot()`.
+    let beta_entered = Arc::new(tokio::sync::Notify::new());
+    let beta_release = Arc::new(tokio::sync::Notify::new());
+    let sup_f03 = Supervisor::builder("f03-one-for-all")
+        .strategy(SupervisionStrategy::OneForAll)
+        .restart_policy(RestartPolicy::default().initial_backoff(Duration::from_millis(5)))
+        .spawn(&root)
+        .await
+        .unwrap();
+
+    let alpha = StatefulActorBuilder::from_default::<CounterActor>("alpha")
+        .restart_type(RestartType::Permanent)
+        .spawn(&sup_f03)
+        .await
+        .unwrap();
+    let _beta = StatefulActorBuilder::new("beta", {
+        let entered = beta_entered.clone();
+        let release = beta_release.clone();
+        move |_| StopHookActor {
+            name: "beta",
+            log: None,
+            entered: Some(entered.clone()),
+            release: Some(release.clone()),
+        }
+    })
+    .restart_type(RestartType::Permanent)
+    .spawn(&sup_f03)
+    .await
+    .unwrap();
+    let gamma = StatefulActorBuilder::from_default::<CounterActor>("gamma")
+        .restart_type(RestartType::Permanent)
+        .spawn(&sup_f03)
+        .await
+        .unwrap();
+
+    gamma.cast(CounterMsg::TriggerFatalError).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), beta_entered.notified())
+        .await
+        .expect("Timed out waiting for beta to enter on_stop");
+
+    let snap = sup_f03.snapshot().await.unwrap();
+    let alpha_snap = snap.child("alpha").expect("alpha present in snapshot");
+    assert!(
+        alpha_snap.queue_stats.is_some(),
+        "Still-running sibling alpha must keep QueueStats telemetry during beta's drain (F-03)"
+    );
+
+    beta_release.notify_one();
+    let (sum, _) = alpha.call(CounterMsg::Add(3)).await.unwrap();
+    assert_eq!(sum, 3);
+    sup_f03.shutdown().await.unwrap();
+
+    // 2. F-10 (part 1): `graceful_shutdown_all()` awaits children already in `ChildPhase::Stopping`
+    // before shutting down earlier siblings in reverse registration order.
+    let stop_log_race = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let second_entered = Arc::new(tokio::sync::Notify::new());
+    let second_release = Arc::new(tokio::sync::Notify::new());
+    let sup_race = Supervisor::builder("f10-stopping-order")
+        .spawn(&root)
+        .await
+        .unwrap();
+
+    let _first = StatefulActorBuilder::new("first", {
+        let log = stop_log_race.clone();
+        move |_| StopHookActor {
+            name: "first",
+            log: Some(log.clone()),
+            entered: None,
+            release: None,
+        }
+    })
+    .spawn(&sup_race)
+    .await
+    .unwrap();
+    let _second = StatefulActorBuilder::new("second", {
+        let log = stop_log_race.clone();
+        let entered = second_entered.clone();
+        let release = second_release.clone();
+        move |_| StopHookActor {
+            name: "second",
+            log: Some(log.clone()),
+            entered: Some(entered.clone()),
+            release: Some(release.clone()),
+        }
+    })
+    .spawn(&sup_race)
+    .await
+    .unwrap();
+
+    let stop_handle = tokio::spawn({
+        let s = sup_race.clone();
+        async move { s.stop_child("second").await }
+    });
+    tokio::time::timeout(Duration::from_secs(2), second_entered.notified())
+        .await
+        .expect("Timed out waiting for second to enter on_stop");
+
+    let shutdown_handle = tokio::spawn({
+        let s = sup_race.clone();
+        async move { s.shutdown().await }
+    });
+
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        stop_log_race.lock().unwrap().is_empty(),
+        "first must not stop while second is still completing ChildPhase::Stopping (F-10)"
+    );
+
+    second_release.notify_one();
+    stop_handle.await.unwrap().unwrap();
+    shutdown_handle.await.unwrap().unwrap();
+    assert_eq!(
+        *stop_log_race.lock().unwrap(),
+        vec!["second", "first"]
+    );
+
+    // 3. F-10 (part 2): With `.escalate_on_failure(true)`, exceeding max_restarts gracefully
+    // shuts down remaining siblings in reverse registration order before escalating.
+    let esc_stop_log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sup_esc = Supervisor::builder("f10-escalate-graceful")
+        .escalate_on_failure(true)
+        .restart_policy(RestartPolicy::new(0, Duration::from_secs(10)))
+        .spawn(&root)
+        .await
+        .unwrap();
+    let mut esc_watch = root
+        .watch_child_status("f10-escalate-graceful")
+        .await
+        .unwrap();
+
+    let _sib_a = StatefulActorBuilder::new("sib-a", {
+        let log = esc_stop_log.clone();
+        move |_| StopHookActor {
+            name: "sib-a",
+            log: Some(log.clone()),
+            entered: None,
+            release: None,
+        }
+    })
+    .spawn(&sup_esc)
+    .await
+    .unwrap();
+    let _sib_b = StatefulActorBuilder::new("sib-b", {
+        let log = esc_stop_log.clone();
+        move |_| StopHookActor {
+            name: "sib-b",
+            log: Some(log.clone()),
+            entered: None,
+            release: None,
+        }
+    })
+    .spawn(&sup_esc)
+    .await
+    .unwrap();
+    let failing_c = StatefulActorBuilder::from_default::<CounterActor>("failing-c")
+        .restart_policy(RestartPolicy::new(0, Duration::from_secs(10)))
+        .spawn(&sup_esc)
+        .await
+        .unwrap();
+
+    failing_c.cast(CounterMsg::TriggerFatalError).await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        esc_watch.wait_for(|s| matches!(s, ChildStatus::Failed(_))),
+    )
+    .await
+    .expect("Timed out waiting for escalating supervisor failure")
+    .expect("Watch closed");
+
+    assert_eq!(
+        *esc_stop_log.lock().unwrap(),
+        vec!["sib-b", "sib-a"],
+        "Escalating supervisor must invoke sibling on_stop in reverse registration order"
+    );
+
+    root.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_actor_context_client_try_cast_rebinds_synchronously_after_actor_restart() {
+    #[derive(Clone, Debug)]
+    enum SelfMsg {
+        GetClient,
+        Record(i64),
+        Crash,
+    }
+
+    #[derive(Clone, Debug)]
+    enum SelfResp {
+        Client(ActorClient<SelfClientActor>),
+        Ack,
+    }
+
+    struct SelfClientActor {
+        recorded: Arc<std::sync::Mutex<Vec<(i64, usize)>>>,
+        cast_notify: Arc<tokio::sync::Notify>,
+    }
+
+    impl StatefulActor for SelfClientActor {
+        type Message = SelfMsg;
+        type Response = SelfResp;
+        type Error = String;
+
+        async fn handle(
+            &mut self,
+            msg: Self::Message,
+            ctx: &mut ActorContext<Self>,
+        ) -> Result<Self::Response, Self::Error> {
+            match msg {
+                SelfMsg::GetClient => Ok(SelfResp::Client(ctx.client())),
+                SelfMsg::Record(val) => {
+                    self.recorded.lock().unwrap().push((val, ctx.instance_id()));
+                    self.cast_notify.notify_one();
+                    Ok(SelfResp::Ack)
+                }
+                SelfMsg::Crash => {
+                    ctx.fail("trigger restart for ctx.client try_cast rebind");
+                    Err("crashed".to_string())
+                }
+            }
+        }
+    }
+
+    let root = Supervisor::new("f04-root");
+    let sup = Supervisor::builder("f04-svc")
+        .restart_policy(RestartPolicy::default().initial_backoff(Duration::from_millis(10)))
+        .spawn(&root)
+        .await
+        .unwrap();
+
+    let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let cast_notify = Arc::new(tokio::sync::Notify::new());
+    let ext_client = StatefulActorBuilder::new("self-rebind", {
+        let recorded = recorded.clone();
+        let cast_notify = cast_notify.clone();
+        move |_| SelfClientActor {
+            recorded: recorded.clone(),
+            cast_notify: cast_notify.clone(),
+        }
+    })
+    .restart_type(RestartType::Permanent)
+    .spawn(&sup)
+    .await
+    .unwrap();
+
+    let self_client = match ext_client.call(SelfMsg::GetClient).await.unwrap() {
+        SelfResp::Client(c) => c,
+        SelfResp::Ack => unreachable!(),
+    };
+
+    let mut watch = sup.watch_child_status("self-rebind").await.unwrap();
+    let _ = ext_client.call(SelfMsg::Crash).await;
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        watch.wait_for(|s| matches!(s, ChildStatus::Running { instance_id: 2 })),
+    )
+    .await
+    .expect("Timed out waiting for instance 2")
+    .expect("Watch closed");
+
+    // Without calling any `.await` method on `self_client`, `try_cast()` must rebind
+    // synchronously via the pre-subscribed `slot_rx` provided through `SpawnContext`.
+    self_client
+        .try_cast(SelfMsg::Record(99))
+        .expect("ctx.client().try_cast() must rebind synchronously after restart");
+    tokio::time::timeout(Duration::from_secs(2), cast_notify.notified())
+        .await
+        .expect("Timed out waiting for instance 2 to process synchronous try_cast");
+
+    assert_eq!(recorded.lock().unwrap().as_slice(), &[(99, 2)]);
+    assert!(!self_client.queue_stats().is_closed);
+
+    root.shutdown().await.unwrap();
+}

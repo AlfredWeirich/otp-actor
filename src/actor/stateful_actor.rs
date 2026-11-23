@@ -161,6 +161,7 @@ pub struct ActorContext<A: StatefulActor> {
     control: ActorControl,
     weak_sender: WeakSender<ActorEnvelope<A>>,
     cancel_rx: watch::Receiver<bool>,
+    slot_rx: watch::Receiver<SlotState>,
     supervisor: SupervisorHandle,
     actor_span: tracing::Span,
 }
@@ -173,6 +174,7 @@ impl<A: StatefulActor> Clone for ActorContext<A> {
             control: self.control.clone(),
             weak_sender: self.weak_sender.clone(),
             cancel_rx: self.cancel_rx.clone(),
+            slot_rx: self.slot_rx.clone(),
             supervisor: self.supervisor.clone(),
             actor_span: self.actor_span.clone(),
         }
@@ -190,12 +192,14 @@ impl<A: StatefulActor> std::fmt::Debug for ActorContext<A> {
 }
 
 impl<A: StatefulActor> ActorContext<A> {
-    /// Creates a new actor context for the given actor name, instance ID, weak self-sender, lifecycle signal, parent supervisor handle, and actor tracing span.
+    /// Creates a new actor context for the given actor name, instance ID, weak self-sender, lifecycle signal, slot watcher, parent supervisor handle, and actor tracing span.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         name: impl Into<String>,
         instance_id: usize,
         weak_sender: WeakSender<ActorEnvelope<A>>,
         cancel_rx: watch::Receiver<bool>,
+        slot_rx: watch::Receiver<SlotState>,
         supervisor: SupervisorHandle,
         actor_span: tracing::Span,
     ) -> Self {
@@ -205,6 +209,7 @@ impl<A: StatefulActor> ActorContext<A> {
             control: ActorControl::Continue,
             weak_sender,
             cancel_rx,
+            slot_rx,
             supervisor,
             actor_span,
         }
@@ -240,11 +245,22 @@ impl<A: StatefulActor> ActorContext<A> {
     /// Returns a self-healing [`ActorClient<A>`] pointing to this actor.
     #[must_use]
     pub fn client(&self) -> ActorClient<A> {
-        let sender = self.weak_sender.upgrade().unwrap_or_else(|| {
-            let (tx, _rx) = mpsc::channel(1);
-            tx
-        });
-        ActorClient::new_unsubscribed(self.name.clone(), sender, self.supervisor.clone())
+        let sender = self
+            .weak_sender
+            .upgrade()
+            .or_else(|| match &*self.slot_rx.borrow() {
+                SlotState::Running { endpoint, .. } => {
+                    endpoint.downcast_ref::<Sender<ActorEnvelope<A>>>().cloned()
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| mpsc::channel(1).0);
+        ActorClient::new(
+            self.name.clone(),
+            sender,
+            self.slot_rx.clone(),
+            self.supervisor.clone(),
+        )
     }
 
     /// Schedules `msg` to be delivered to this actor via `cast` after `delay`.
@@ -745,6 +761,7 @@ where
                         rx,
                         weak_tx,
                         spawn_ctx.shutdown_rx,
+                        spawn_ctx.slot_rx,
                         spawn_ctx.supervisor,
                         spawn_ctx.instance_id,
                         runner_metrics,
@@ -822,6 +839,7 @@ pub(crate) struct StatefulActorRunner<A: StatefulActor> {
     receiver: Receiver<ActorEnvelope<A>>,
     weak_sender: WeakSender<ActorEnvelope<A>>,
     shutdown_rx: watch::Receiver<bool>,
+    slot_rx: watch::Receiver<SlotState>,
     supervisor: SupervisorHandle,
     instance_id: usize,
     metrics: ActorMetrics,
@@ -850,6 +868,7 @@ impl<A: StatefulActor> StatefulActorRunner<A> {
         receiver: Receiver<ActorEnvelope<A>>,
         weak_sender: WeakSender<ActorEnvelope<A>>,
         shutdown_rx: watch::Receiver<bool>,
+        slot_rx: watch::Receiver<SlotState>,
         supervisor: SupervisorHandle,
         instance_id: usize,
         metrics: ActorMetrics,
@@ -860,6 +879,7 @@ impl<A: StatefulActor> StatefulActorRunner<A> {
             receiver,
             weak_sender,
             shutdown_rx,
+            slot_rx,
             supervisor,
             instance_id,
             metrics,
@@ -1035,6 +1055,7 @@ impl<A: StatefulActor> StatefulActorRunner<A> {
             self.instance_id,
             self.weak_sender.clone(),
             cancel_rx,
+            self.slot_rx.clone(),
             self.supervisor.clone(),
             tracing::Span::current(),
         );
@@ -1211,7 +1232,7 @@ pub(crate) fn queue_stats_from_sender<T>(tx: &Sender<T>) -> QueueStats {
 pub struct ActorClient<A: StatefulActor> {
     name: String,
     sender: Arc<RwLock<Sender<ActorEnvelope<A>>>>,
-    slot_rx: Arc<RwLock<Option<watch::Receiver<SlotState>>>>,
+    slot_rx: Arc<RwLock<watch::Receiver<SlotState>>>,
     supervisor: SupervisorHandle,
 }
 
@@ -1252,21 +1273,7 @@ impl<A: StatefulActor> ActorClient<A> {
         Self {
             name: name.into(),
             sender: Arc::new(RwLock::new(sender)),
-            slot_rx: Arc::new(RwLock::new(Some(slot_rx))),
-            supervisor,
-        }
-    }
-
-    /// Creates a direct client handle (used by [`ActorContext::client`]) that lazily subscribes to [`SlotState`] on first rebind.
-    pub(crate) fn new_unsubscribed(
-        name: impl Into<String>,
-        sender: Sender<ActorEnvelope<A>>,
-        supervisor: SupervisorHandle,
-    ) -> Self {
-        Self {
-            name: name.into(),
-            sender: Arc::new(RwLock::new(sender)),
-            slot_rx: Arc::new(RwLock::new(None)),
+            slot_rx: Arc::new(RwLock::new(slot_rx)),
             supervisor,
         }
     }
@@ -1328,28 +1335,11 @@ impl<A: StatefulActor> ActorClient<A> {
         }
 
         loop {
-            let maybe_rx = self
+            let mut rx = self
                 .slot_rx
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
-
-            let mut rx = match maybe_rx {
-                Some(rx) => rx,
-                None => {
-                    let resolved = self
-                        .supervisor
-                        .resolve_child_slot(&self.name)
-                        .await
-                        .map_err(ActorError::Supervisor)?;
-                    *self
-                        .slot_rx
-                        .write()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                        Some(resolved.clone());
-                    resolved
-                }
-            };
 
             let wait_state = rx
                 .wait_for(|state| match state {
@@ -1402,7 +1392,7 @@ impl<A: StatefulActor> ActorClient<A> {
             *self
                 .slot_rx
                 .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(new_rx);
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = new_rx;
         }
     }
 
@@ -1538,9 +1528,8 @@ impl<A: StatefulActor> ActorClient<A> {
     /// Attempts a synchronous, non-blocking rebind of `self.sender` via `self.slot_rx`.
     ///
     /// Returns `Ok(Some(tx))` if `slot_rx` already holds a live `SlotState::Running` sender,
-    /// `Ok(None)` if the slot is currently restarting or `slot_rx` is not yet subscribed
-    /// (`ActorContext::client`), or `Err(err)` for terminal slot states (`Failed`, `Stopped`,
-    /// or `ChildTypeMismatch`).
+    /// `Ok(None)` if the slot is currently restarting, or `Err(err)` for terminal slot states
+    /// (`Failed`, `Stopped`, or `ChildTypeMismatch`).
     fn try_rebind_sync(&self) -> Result<Option<Sender<ActorEnvelope<A>>>, ActorError<A::Error>> {
         enum SlotSnapshot<A: StatefulActor> {
             Running(Sender<ActorEnvelope<A>>),
@@ -1549,13 +1538,10 @@ impl<A: StatefulActor> ActorClient<A> {
         }
 
         let snapshot = {
-            let slot_guard = self
+            let rx = self
                 .slot_rx
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let Some(rx) = slot_guard.as_ref() else {
-                return Ok(None);
-            };
             match &*rx.borrow() {
                 SlotState::Running { endpoint, .. } => {
                     match endpoint.downcast_ref::<Sender<ActorEnvelope<A>>>() {

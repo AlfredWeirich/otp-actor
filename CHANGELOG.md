@@ -58,6 +58,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   - Added `TimedResource::{is_still_usable_at, is_usable_stale_at}` so `ResourceClient::get()` and `ResourceEndpoint::cache_state()` perform at most one `Instant::now()` call (and zero clock calls for perpetual resources with no refresh threshold).
 
 ### Fixed
+- **Preserve Sibling `sender` During Sequential Restarts, Wait on `Stopping` Children & Graceful Shutdown on Escalation (`src/actor/supervisor.rs`, Findings `F-03`, `F-10`):**
+  - Updated `TerminationPlan::take` to clone `entry.sender` instead of replacing it prematurely with `Arc::new(())` (clearing `entry.sender` and `entry.abort_handle` only once the exited task is reaped in `handle_child_exit` / `handle_child_failure`), keeping `queue_probe` / `cache_probe` telemetry and shutdown signals intact for siblings still running during `OneForAll` / `RestForOne` sequential drains.
+  - Updated `Supervisor::graceful_shutdown_all` to wait on children already in `ChildPhase::Stopping` (`term_rx.wait_for(|&done| done)`) so reverse-registration shutdown ordering holds even when racing with `stop_child`.
+  - Updated `Supervisor::run` and `Supervisor::handle_command` so `.escalate_on_failure(true)` runs `graceful_shutdown_all()` before returning `Err(msg)` rather than hard-aborting remaining children.
+  - Verified with new regression test `test_one_for_all_termination_preserves_sibling_telemetry_and_escalate_on_failure_runs_graceful_shutdown`.
+- **Pre-Subscribed `SlotState` Channel for `ActorContext::client()` (`src/actor/supervisor.rs`, `src/actor/stateful_actor.rs`, Finding `F-04`):**
+  - Propagated `slot_rx: watch::Receiver<SlotState>` through `SpawnContext`, `StatefulActorRunner`, and `ActorContext` (reusing existing slot channels on restarts without mutating state if the factory panics).
+  - Removed `ActorClient::new_unsubscribed` and simplified `ActorClient.slot_rx` to a non-optional `Arc<RwLock<watch::Receiver<SlotState>>>`, enabling clients obtained via `ctx.client()` to rebind synchronously on `try_cast()` after an actor restart.
+  - Verified with new regression test `test_actor_context_client_try_cast_rebinds_synchronously_after_actor_restart`.
 - **Zero-Hop `ResourceClient::get()` & Single-Flight Trigger During `RefreshDue` (`src/actor/generic_actor.rs`, Finding `F-06`):**
   - Kept `ResourceClient::get()` on the 0-hop `watch` cache fast path for usable `CacheState::RefreshDue` entries instead of falling back to 1-hop `oneshot` + mailbox roundtrips for the entire `expiry_buffer` window.
   - Added lock-free `refresh_pending` (`AtomicBool`) and `throttle_until_ns` (`AtomicU64`) endpoint state with a fire-and-forget `ResourceCommand::TriggerBackgroundRefresh`, eliminating mailbox stampedes while a background refresh is in flight or throttled by `failure_cooldown`, `failure_backoff_delay`, or retry delay.

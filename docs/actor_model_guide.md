@@ -951,7 +951,7 @@ Without protective guardrails, a supervisor will restart the actor within a mill
 1. **Exponential Backoff:**  
    Consecutive crashes scale the restart delay exponentially ($100\,\text{ms} \to 200\,\text{ms} \to 400\,\text{ms} \dots$). This shields external systems from thundering herds and allows transient network blips to heal.
 2. **Sliding Time Window Rate Limiting & Escalation:**  
-   If an actor exceeds `max_restarts` within `time_window`, the supervisor gives up on local recovery, stops its children, and **escalates the failure to its parent supervisor** in the tree.
+   If an actor exceeds `max_restarts` within `time_window`, the supervisor gives up on local recovery. When `.escalate_on_failure(true)` is enabled, it first runs a sequential graceful shutdown of remaining children in reverse registration order (preserving `on_stop` cleanup and mailbox draining) before **escalating the failure to its parent supervisor** in the tree.
 
 ---
 
