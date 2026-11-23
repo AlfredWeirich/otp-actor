@@ -306,6 +306,20 @@ async fn test_location_transparency_any_client()
         85
     );
 
+    // Ergonomic AnyActorClient constructors and metadata getters (F-14)
+    let connected_any = AnyActorClient::<CalculatorActor>::connect(
+        format!("http://{node_addr}"),
+        "transparency-service",
+        "calc-local",
+    )
+    .await?;
+    assert_eq!(connected_any.service_name(), "transparency-service");
+    assert_eq!(connected_any.name(), "calc-local");
+    assert_eq!(connected_any.actor_name(), "calc-local");
+    assert_eq!(client_a.service_name(), "transparency-service");
+    assert_eq!(client_a.name(), "calc-local");
+    assert_eq!(connected_any.ask(AddTyped(1)).await?, 86);
+
     // Debug formatting on public remote types (F-20)
     assert!(format!("{client_a:?}").contains("AnyActorClient::Local"));
     assert!(format!("{client_b:?}").contains("AnyActorClient::Remote"));
@@ -936,6 +950,9 @@ async fn test_admin_service_health_status_authorizer_and_registry_only_mode() {
     assert!(prom.contains("# HELP otp_actor_remote_incompatible_protocol_total "));
     assert!(prom.contains("# TYPE otp_actor_remote_incompatible_protocol_total counter\n"));
     assert!(prom.contains("otp_actor_remote_incompatible_protocol_total 1\n"));
+    assert!(prom.contains("otp_actor_summary_calls_total 0\n"));
+    assert!(prom.contains("otp_actor_registered_endpoint_mailbox_queued{service=\"admin-svc\",actor=\"calc\"} 0\n"));
+    assert!(prom.contains("otp_actor_registered_endpoint_mailbox_capacity{service=\"admin-svc\",actor=\"calc\"} 12\n"));
 
     // 4. Stopping the sole registered actor degrades registry-only health and updates summary counts (F-12)
     svc.stop_child("calc").await.unwrap();
@@ -1252,4 +1269,210 @@ async fn test_remote_cast_zero_timeout_try_cast_and_draining_rejects_new_request
     assert_eq!(inflight.await??, 1);
     shutdown_task.await??;
     Ok(())
+}
+
+#[tokio::test]
+async fn test_admin_status_skips_endpoint_snapshot_without_details_and_remote_client_arc_str() {
+    use otp_actor::actor::{NodeStatus, QueueStats};
+    use otp_actor::remote::proto::call_response::Result as CallResult;
+    use otp_actor::remote::proto::remote_error::Kind;
+    use otp_actor::remote::proto::status_response::Result as StatusResult;
+    use otp_actor::remote::proto::{
+        ActorNodeAdmin, CallResponse, CastResponse, RemoteError, StatusRequest,
+    };
+    use otp_actor::remote::{ActorNodeAdminService, ByteEndpoint, REMOTE_PROTOCOL_VERSION};
+    use std::future::Future;
+    use std::pin::Pin;
+
+    struct CountingByteEndpoint {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ByteEndpoint for CountingByteEndpoint {
+        fn call_bytes<'a>(
+            &'a self,
+            _payload: &'a [u8],
+            _timeout: Option<Duration>,
+        ) -> Pin<Box<dyn Future<Output = CallResponse> + Send + 'a>> {
+            Box::pin(async move {
+                CallResponse {
+                    result: Some(CallResult::FrameworkError(RemoteError {
+                        kind: Kind::ActorUnavailable as i32,
+                        message: "unused".into(),
+                    })),
+                }
+            })
+        }
+
+        fn cast_bytes<'a>(
+            &'a self,
+            _payload: &'a [u8],
+            _timeout: Option<Duration>,
+        ) -> Pin<Box<dyn Future<Output = CastResponse> + Send + 'a>> {
+            Box::pin(async move {
+                CastResponse {
+                    framework_error: Some(RemoteError {
+                        kind: Kind::ActorUnavailable as i32,
+                        message: "unused".into(),
+                    }),
+                }
+            })
+        }
+
+        fn queue_stats(&self) -> Option<QueueStats> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            None
+        }
+    }
+
+    let root = Supervisor::new("f08-unit-root");
+    let svc = Supervisor::builder("a-svc").spawn(&root).await.unwrap();
+    let calc = StatefulActorBuilder::from_default::<CalculatorActor>("calc")
+        .spawn(&svc)
+        .await
+        .unwrap();
+
+    let queue_stats_calls = Arc::new(AtomicUsize::new(0));
+    let registry = ActorNodeRegistry::new();
+    registry.register("a-svc", "calc", calc);
+    registry.register_endpoint(
+        "z-svc",
+        "counting",
+        Arc::new(CountingByteEndpoint {
+            calls: queue_stats_calls.clone(),
+        }),
+    );
+
+    let admin_svc = ActorNodeAdminService::new(registry, Some(root.clone()));
+
+    // 1. Compact status (`include_child_details = false`) skips `snapshot_endpoints()` completely.
+    let compact_resp = admin_svc
+        .status(tonic::Request::new(StatusRequest {
+            protocol_version: REMOTE_PROTOCOL_VERSION,
+            timeout_ms: Some(1000),
+            include_tree: false,
+            include_child_details: false,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    let StatusResult::StatusPayload(compact_bytes) = compact_resp.result.unwrap() else {
+        panic!("Expected StatusPayload");
+    };
+    let compact_status: NodeStatus = postcard::from_bytes(&compact_bytes).unwrap();
+    assert_eq!(queue_stats_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(compact_status.remote.unwrap().registered_endpoints, 2);
+    assert!(compact_status.registered_endpoints.is_empty());
+
+    // 2. Full status (`include_child_details = true`) calls `snapshot_endpoints()` once and sorts deterministically.
+    let full_resp = admin_svc
+        .status(tonic::Request::new(StatusRequest {
+            protocol_version: REMOTE_PROTOCOL_VERSION,
+            timeout_ms: Some(1000),
+            include_tree: false,
+            include_child_details: true,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    let StatusResult::StatusPayload(full_bytes) = full_resp.result.unwrap() else {
+        panic!("Expected StatusPayload");
+    };
+    let full_status: NodeStatus = postcard::from_bytes(&full_bytes).unwrap();
+    assert_eq!(queue_stats_calls.load(Ordering::SeqCst), 1);
+    let pairs: Vec<(&str, &str)> = full_status
+        .registered_endpoints
+        .iter()
+        .map(|ep| (ep.service_name.as_str(), ep.actor_name.as_str()))
+        .collect();
+    assert_eq!(pairs, vec![("a-svc", "calc"), ("z-svc", "counting")]);
+
+    root.shutdown().await.unwrap();
+
+    // 3. F-09 & F-13: RemoteActorClient clones names zero-alloc via Arc<str> and instruments with err(Debug)
+    //    without requiring Display on StatefulActor::Error.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    struct DebugOnlyRemoteErr(String);
+
+    #[derive(Clone)]
+    struct DebugOnlyRemoteActor;
+    impl StatefulActor for DebugOnlyRemoteActor {
+        type Message = bool;
+        type Response = ();
+        type Error = DebugOnlyRemoteErr;
+
+        async fn handle(
+            &mut self,
+            fail: Self::Message,
+            _ctx: &mut ActorContext<Self>,
+        ) -> Result<Self::Response, Self::Error> {
+            if fail {
+                Err(DebugOnlyRemoteErr("remote-debug-err".into()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn assert_future<F: Future>(_fut: F) {}
+
+    let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+    let client = RemoteActorClient::<DebugOnlyRemoteActor>::new(channel, "my-svc", "my-actor");
+    let cloned = client.clone();
+    assert!(std::ptr::eq(
+        client.service_name().as_ptr(),
+        cloned.service_name().as_ptr()
+    ));
+    assert!(std::ptr::eq(
+        client.actor_name().as_ptr(),
+        cloned.actor_name().as_ptr()
+    ));
+    assert_eq!(client.name(), "my-actor");
+
+    assert_future(client.call(false));
+    assert_future(client.call_timeout(true, Duration::from_millis(10)));
+    assert_future(client.cast(false));
+    assert_future(client.cast_timeout(false, Duration::from_millis(10)));
+
+    // F-14: AnyActorClient::from / from_local / from_remote / getters require NO Serde bounds
+    struct NonSerdeActor;
+    struct NonSerdeMsg;
+    #[derive(Debug)]
+    struct NonSerdeErr(&'static str);
+    impl StatefulActor for NonSerdeActor {
+        type Message = NonSerdeMsg;
+        type Response = &'static str;
+        type Error = NonSerdeErr;
+
+        async fn handle(
+            &mut self,
+            _msg: Self::Message,
+            _ctx: &mut ActorContext<Self>,
+        ) -> Result<Self::Response, Self::Error> {
+            Err(NonSerdeErr("unused"))
+        }
+    }
+
+    let any_remote = AnyActorClient::from_remote(client.clone());
+    let any_from_remote: AnyActorClient<DebugOnlyRemoteActor> = client.into();
+    assert_eq!(any_remote.service_name(), "my-svc");
+    assert_eq!(any_from_remote.name(), "my-actor");
+
+    let non_serde_root = Supervisor::new("non-serde-root");
+    let local_non_serde = StatefulActorBuilder::new("non-serde-actor", |_| NonSerdeActor)
+        .spawn(&non_serde_root)
+        .await
+        .unwrap();
+    let any_local = AnyActorClient::from_local(local_non_serde.clone());
+    let any_from_local: AnyActorClient<NonSerdeActor> = local_non_serde.into();
+    assert_eq!(any_local.service_name(), "non-serde-root");
+    assert_eq!(any_from_local.actor_name(), "non-serde-actor");
+    assert!(matches!(
+        any_from_local,
+        AnyActorClient::Local(c) if match c.call(NonSerdeMsg).await {
+            Err(otp_actor::ActorError::HandlerFailed(err)) => err.0 == "unused",
+            _ => false,
+        }
+    ));
+    non_serde_root.shutdown().await.unwrap();
 }

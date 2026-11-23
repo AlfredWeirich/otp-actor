@@ -5783,6 +5783,12 @@ async fn test_format_prometheus_metrics_exposition_and_label_escaping() {
         .unwrap();
     let compact_prom = format_prometheus_metrics(&compact);
     assert!(compact_prom.contains("otp_actor_node_alive 1\n"));
+    assert!(compact_prom.contains("otp_actor_summary_full_mailboxes 0\n"));
+    assert!(compact_prom.contains("otp_actor_summary_calls_total 1\n"));
+    assert!(compact_prom.contains("otp_actor_summary_casts_total 0\n"));
+    assert!(compact_prom.contains("otp_actor_summary_handler_errors_total 0\n"));
+    assert!(compact_prom.contains("otp_actor_summary_timeouts_total 0\n"));
+    assert!(compact_prom.contains("otp_actor_summary_panics_total 0\n"));
     assert!(!compact_prom.contains("otp_actor_child_status"));
 
     root.shutdown().await.unwrap();
@@ -8333,6 +8339,398 @@ async fn test_consecutive_failures_ages_out_and_child_supervisor_started_at_and_
         tree.subtree("slow-sup").unwrap().result,
         Err(SupervisorError::SupervisorUnavailable)
     );
+
+    root.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_client_handles_arc_str_zero_alloc_clone_and_tracing_instrument_preserves_trait_bounds() {
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct DebugOnlyErr(&'static str);
+
+    #[derive(Clone)]
+    enum DebugOnlyMsg {
+        GetClient,
+        InspectScope,
+        Ping(bool),
+    }
+
+    enum DebugOnlyResp {
+        Client(ActorClient<DebugOnlyActor>),
+        Ok,
+    }
+
+    struct DebugOnlyActor {
+        scope_ptrs: Arc<std::sync::Mutex<Option<(usize, usize)>>>,
+        scope_notify: Arc<tokio::sync::Notify>,
+    }
+
+    impl StatefulActor for DebugOnlyActor {
+        type Message = DebugOnlyMsg;
+        type Response = DebugOnlyResp;
+        type Error = DebugOnlyErr;
+
+        async fn handle(
+            &mut self,
+            msg: Self::Message,
+            ctx: &mut ActorContext<Self>,
+        ) -> Result<Self::Response, Self::Error> {
+            match msg {
+                DebugOnlyMsg::GetClient => Ok(DebugOnlyResp::Client(ctx.client())),
+                DebugOnlyMsg::InspectScope => {
+                    let ptrs = self.scope_ptrs.clone();
+                    let notify = self.scope_notify.clone();
+                    let ctx_ptr = ctx.name().as_ptr() as usize;
+                    ctx.spawn_scoped(move |scope| async move {
+                        let cloned = scope.clone();
+                        let scope_ptr = scope.name().as_ptr() as usize;
+                        assert_eq!(scope_ptr, ctx_ptr);
+                        *ptrs.lock().unwrap() = Some((scope_ptr, cloned.name().as_ptr() as usize));
+                        notify.notify_one();
+                    });
+                    Ok(DebugOnlyResp::Ok)
+                }
+                DebugOnlyMsg::Ping(true) => Err(DebugOnlyErr("debug-only-err")),
+                DebugOnlyMsg::Ping(false) => Ok(DebugOnlyResp::Ok),
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct OpaqueErr(&'static str);
+
+    let root = Supervisor::new("f08-f09-f13-root");
+    let child_sup = Supervisor::builder("arc-str-sup")
+        .spawn(&root)
+        .await
+        .unwrap();
+    let sup_clone = child_sup.clone();
+    assert!(std::ptr::eq(
+        child_sup.name().as_ptr(),
+        sup_clone.name().as_ptr()
+    ));
+
+    let scope_ptrs = Arc::new(std::sync::Mutex::new(None));
+    let scope_notify = Arc::new(tokio::sync::Notify::new());
+    let actor_client = StatefulActorBuilder::new("debug-only-actor", {
+        let scope_ptrs = scope_ptrs.clone();
+        let scope_notify = scope_notify.clone();
+        move |_| DebugOnlyActor {
+            scope_ptrs: scope_ptrs.clone(),
+            scope_notify: scope_notify.clone(),
+        }
+    })
+    .restart_type(RestartType::Permanent)
+    .restart_policy(RestartPolicy::default().initial_backoff(Duration::from_millis(5)))
+    .spawn(&child_sup)
+    .await
+    .unwrap();
+
+    // Verify Arc<str> pointer identity across clones, ctx.client(), and ActorScope::clone()
+    let cloned_actor_client = actor_client.clone();
+    assert!(std::ptr::eq(
+        actor_client.name().as_ptr(),
+        cloned_actor_client.name().as_ptr()
+    ));
+    let ctx_client = match actor_client.call(DebugOnlyMsg::GetClient).await {
+        Ok(DebugOnlyResp::Client(c)) => c,
+        _ => panic!("Expected ActorClient from GetClient"),
+    };
+    let cloned_ctx_client = ctx_client.clone();
+    assert!(std::ptr::eq(
+        ctx_client.name().as_ptr(),
+        cloned_ctx_client.name().as_ptr()
+    ));
+
+    let _ = actor_client
+        .call(DebugOnlyMsg::InspectScope)
+        .await
+        .expect("InspectScope call should succeed");
+    tokio::time::timeout(Duration::from_secs(2), scope_notify.notified())
+        .await
+        .expect("Timed out waiting for scoped task");
+    let (p1, p2) = scope_ptrs.lock().unwrap().unwrap();
+    assert_eq!(p1, p2);
+    assert_eq!(p1, ctx_client.name().as_ptr() as usize);
+
+    // Exercise instrumented ActorClient methods with Debug-only (non-Display) error type
+    assert!(matches!(
+        actor_client.call(DebugOnlyMsg::Ping(false)).await,
+        Ok(DebugOnlyResp::Ok)
+    ));
+    assert_eq!(
+        actor_client.call(DebugOnlyMsg::Ping(true)).await.err(),
+        Some(ActorError::HandlerFailed(DebugOnlyErr("debug-only-err")))
+    );
+    assert!(matches!(
+        actor_client
+            .call_timeout(DebugOnlyMsg::Ping(false), Duration::from_secs(1))
+            .await,
+        Ok(DebugOnlyResp::Ok)
+    ));
+    assert!(matches!(
+        actor_client.call_retry(DebugOnlyMsg::Ping(false)).await,
+        Ok(DebugOnlyResp::Ok)
+    ));
+    assert_eq!(
+        actor_client
+            .call_retry_timeout(DebugOnlyMsg::Ping(true), Duration::from_secs(1))
+            .await
+            .err(),
+        Some(ActorError::HandlerFailed(DebugOnlyErr("debug-only-err")))
+    );
+    actor_client.cast(DebugOnlyMsg::Ping(false)).await.unwrap();
+    actor_client
+        .cast_timeout(DebugOnlyMsg::Ping(false), Duration::from_secs(1))
+        .await
+        .unwrap();
+    child_sup.stop_child("debug-only-actor").await.unwrap();
+    assert!(matches!(
+        actor_client.shutdown().await,
+        Err(ActorError::Supervisor(SupervisorError::ChildNotFound(_)))
+    ));
+
+    // Exercise ResourceClient with Clone-only opaque error (neither Debug nor Display) + Arc<str>
+    let fail_res = Arc::new(AtomicBool::new(true));
+    let fail_flag = fail_res.clone();
+    let res_client = ResourceActor::builder("opaque-res")
+        .worker(move |ctx: WorkerContext| {
+            let fail = fail_flag.clone();
+            async move {
+                if fail.load(Ordering::SeqCst) {
+                    Err(OpaqueErr("opaque-err"))
+                } else {
+                    Ok(TimedResource::with_ttl(
+                        format!("val-{}", ctx.generation),
+                        Duration::from_secs(30),
+                    ))
+                }
+            }
+        })
+        .failure_cooldown(Duration::ZERO)
+        .spawn(&child_sup)
+        .await
+        .unwrap();
+
+    let cloned_res = res_client.clone();
+    assert!(std::ptr::eq(
+        res_client.name().as_ptr(),
+        cloned_res.name().as_ptr()
+    ));
+
+    match res_client.get().await {
+        Err(ResourceError::WorkerFailed(err)) => assert_eq!(err.0, "opaque-err"),
+        Ok(v) => panic!("Expected WorkerFailed(OpaqueErr), got Ok({v})"),
+        Err(_) => panic!("Expected WorkerFailed(OpaqueErr), got other ResourceError"),
+    }
+
+    fail_res.store(false, Ordering::SeqCst);
+    assert_eq!(
+        res_client
+            .get_timeout(Duration::from_secs(1))
+            .await
+            .ok()
+            .as_deref(),
+        Some("val-2")
+    );
+    res_client.force_refresh().await.ok().unwrap();
+    let _ = res_client.simulate_crash().await;
+    assert!(matches!(res_client.get().await.ok(), Some(ref s) if s.starts_with("val-")));
+    res_client.shutdown().await.ok().unwrap();
+
+    root.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_f11_prometheus_registered_endpoints_and_f14_api_symmetry_and_clamping() {
+    use otp_actor::actor::ActorMetrics;
+
+    // 1. F-11: ActorMetrics starts with ema_latency_us == 0 before any latency sample
+    let metrics = ActorMetrics::new();
+    assert_eq!(metrics.snapshot().ema_latency_us, 0);
+
+    // 2. F-14: RestartTracker::record_crash floors max_backoff at initial_backoff and clamps bad multipliers
+    let mismatched_policy = RestartPolicy::new(5, Duration::from_secs(60))
+        .initial_backoff(Duration::from_secs(5))
+        .max_backoff(Duration::from_secs(2))
+        .backoff_multiplier(2.0);
+    let mut mismatched_tracker = RestartTracker::new(mismatched_policy);
+    assert_eq!(mismatched_tracker.record_crash(), Some(Duration::from_secs(5)));
+    assert_eq!(mismatched_tracker.record_crash(), Some(Duration::from_secs(5)));
+
+    for bad_mult in [0.5_f64, f64::NAN, f64::INFINITY] {
+        let clamped_policy = RestartPolicy::new(5, Duration::from_secs(60))
+            .initial_backoff(Duration::from_millis(75))
+            .max_backoff(Duration::from_secs(1))
+            .backoff_multiplier(bad_mult);
+        let mut clamped_tracker = RestartTracker::new(clamped_policy);
+        assert_eq!(
+            clamped_tracker.record_crash(),
+            Some(Duration::from_millis(75))
+        );
+        assert_eq!(
+            clamped_tracker.record_crash(),
+            Some(Duration::from_millis(75))
+        );
+    }
+
+    // 3. F-14: ActorClient::ask_timeout succeeds on fast calls and returns ActorError::Timeout on slow calls
+    #[cfg_attr(feature = "remote", derive(serde::Deserialize))]
+    enum SlowAskMsg {
+        Fast(u64),
+        Slow(Duration),
+    }
+    struct FastQuery(u64);
+    impl From<FastQuery> for SlowAskMsg {
+        fn from(q: FastQuery) -> Self {
+            Self::Fast(q.0)
+        }
+    }
+    impl CallMessage<AskTimeoutActor> for FastQuery {
+        type Reply = u64;
+        fn extract_reply(resp: u64) -> Result<Self::Reply, String> {
+            Ok(resp)
+        }
+    }
+    struct SlowQuery(Duration);
+    impl From<SlowQuery> for SlowAskMsg {
+        fn from(q: SlowQuery) -> Self {
+            Self::Slow(q.0)
+        }
+    }
+    impl CallMessage<AskTimeoutActor> for SlowQuery {
+        type Reply = u64;
+        fn extract_reply(resp: u64) -> Result<Self::Reply, String> {
+            Ok(resp)
+        }
+    }
+    struct AskTimeoutActor;
+    impl StatefulActor for AskTimeoutActor {
+        type Message = SlowAskMsg;
+        type Response = u64;
+        type Error = String;
+
+        async fn handle(
+            &mut self,
+            msg: Self::Message,
+            _ctx: &mut ActorContext<Self>,
+        ) -> Result<Self::Response, Self::Error> {
+            match msg {
+                SlowAskMsg::Fast(v) => Ok(v * 2),
+                SlowAskMsg::Slow(d) => {
+                    tokio::time::sleep(d).await;
+                    Ok(0)
+                }
+            }
+        }
+    }
+
+    let root = Supervisor::new("f11-f14-root");
+    let svc = Supervisor::builder("f14-svc").spawn(&root).await.unwrap();
+    let ask_client = StatefulActorBuilder::new("ask-actor", |_| AskTimeoutActor)
+        .restart_policy(RestartPolicy::new(2, Duration::from_secs(10)).initial_backoff(Duration::from_millis(5)))
+        .spawn(&svc)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        ask_client
+            .ask_timeout(FastQuery(21), Duration::from_secs(1))
+            .await
+            .unwrap(),
+        42
+    );
+    assert!(matches!(
+        ask_client
+            .ask_timeout(SlowQuery(Duration::from_millis(150)), Duration::from_millis(20))
+            .await,
+        Err(ActorError::Timeout(_))
+    ));
+
+    // 4. F-11 (registered_endpoints escaping in registry-only NodeStatus) & F-14 (ResourceClient::{service_name, queue_stats} + shutdown waiter pruning)
+    #[cfg(feature = "remote")]
+    {
+        use otp_actor::remote::ActorNodeRegistry;
+
+        let mut compact = LocalNodeMonitor::new(svc.clone())
+            .status(StatusOptions::new().include_tree(false))
+            .await
+            .unwrap();
+        let registry = ActorNodeRegistry::new();
+        registry.register("svc\"line\n", "act\\name", ask_client.clone());
+        compact.registered_endpoints = registry.snapshot_endpoints();
+        let prom = format_prometheus_metrics(&compact);
+        assert!(prom.contains("otp_actor_summary_calls_total "));
+        assert!(prom.contains(
+            "otp_actor_registered_endpoint_mailbox_queued{service=\"svc\\\"line\\n\",actor=\"act\\\\name\"} "
+        ));
+        assert!(prom.contains(
+            "otp_actor_registered_endpoint_mailbox_capacity{service=\"svc\\\"line\\n\",actor=\"act\\\\name\"} "
+        ));
+    }
+
+    let worker_entered = Arc::new(tokio::sync::Notify::new());
+    let worker_release = Arc::new(tokio::sync::Notify::new());
+    let res_client = ResourceActor::builder("sym-res")
+        .worker({
+            let entered = worker_entered.clone();
+            let release = worker_release.clone();
+            move |ctx: WorkerContext| {
+                let entered = entered.clone();
+                let release = release.clone();
+                async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    Ok::<_, String>(TimedResource::with_ttl(
+                        format!("val-{}", ctx.generation),
+                        Duration::from_secs(30),
+                    ))
+                }
+            }
+        })
+        .channel_capacity(8)
+        .max_waiters(1)
+        .spawn(&svc)
+        .await
+        .unwrap();
+
+    assert_eq!(res_client.service_name(), "f14-svc");
+    assert_eq!(res_client.queue_stats().max_capacity, 8);
+    assert!(!res_client.queue_stats().is_closed);
+
+    // Park Waiter A inside `self.waiters` (max_waiters = 1), then drop Waiter A so it becomes closed.
+    let waiter_a = tokio::spawn({
+        let c = res_client.clone();
+        async move { c.get().await }
+    });
+    worker_entered.notified().await;
+    waiter_a.abort();
+    let _ = waiter_a.await;
+
+    // Enqueue Shutdown and Waiter B together before ResourceActor pops Shutdown; closed Waiter A
+    // must be pruned so Waiter B still fits inside max_waiters = 1 and receives the worker output.
+    let join_fut = async {
+        tokio::join!(
+            res_client.shutdown(),
+            res_client.get(),
+            async {
+                tokio::task::yield_now().await;
+                worker_release.notify_one();
+            }
+        )
+    };
+    let (shutdown_res, waiter_b_res, ()) = tokio::time::timeout(Duration::from_secs(2), join_fut)
+        .await
+        .expect("Timed out waiting for shutdown + waiter_b drain");
+    shutdown_res.unwrap();
+    assert_eq!(waiter_b_res.unwrap(), "val-1");
+
+    let mut res_watch = svc.watch_child_status("sym-res").await.unwrap();
+    res_watch
+        .wait_for(|s| *s == ChildStatus::Stopped)
+        .await
+        .unwrap();
+    assert!(res_client.queue_stats().is_closed);
 
     root.shutdown().await.unwrap();
 }

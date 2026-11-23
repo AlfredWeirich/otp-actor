@@ -46,8 +46,8 @@ pub(crate) fn server_budget_for_deadline(deadline: Duration) -> Duration {
 /// Client handle for invoking a remote `StatefulActor` over a gRPC connection.
 #[derive(Clone)]
 pub struct RemoteActorClient<A: StatefulActor> {
-    service_name: String,
-    actor_name: String,
+    service_name: Arc<str>,
+    actor_name: Arc<str>,
     channel: Channel,
     client: ActorNodeClient<Channel>,
     metadata_injector: Option<MetadataInjector>,
@@ -75,8 +75,8 @@ impl<A: StatefulActor> RemoteActorClient<A> {
             .max_decoding_message_size(MAX_GRPC_FRAME_BYTES)
             .max_encoding_message_size(MAX_GRPC_FRAME_BYTES);
         Self {
-            service_name: service_name.into(),
-            actor_name: actor_name.into(),
+            service_name: Arc::from(service_name.into()),
+            actor_name: Arc::from(actor_name.into()),
             channel,
             client,
             metadata_injector: None,
@@ -130,7 +130,14 @@ impl<A: StatefulActor> RemoteActorClient<A> {
         &self.actor_name
     }
 
+    /// Alias for [`Self::actor_name`], matching [`ActorClient::name`].
+    #[must_use]
+    pub fn name(&self) -> &str {
+        self.actor_name()
+    }
+
     /// Sends a request message (`call`) to the remote actor and awaits its typed response.
+    #[tracing::instrument(skip(self, msg), fields(service = %self.service_name, actor = %self.actor_name), err(Debug))]
     pub async fn call(&self, msg: A::Message) -> Result<A::Response, RemoteActorError<A::Error>>
     where
         A::Message: serde::Serialize,
@@ -141,6 +148,7 @@ impl<A: StatefulActor> RemoteActorClient<A> {
     }
 
     /// Sends a request message (`call`) with a client-side timeout deadline.
+    #[tracing::instrument(skip(self, msg), fields(service = %self.service_name, actor = %self.actor_name), err(Debug))]
     pub async fn call_timeout(
         &self,
         msg: A::Message,
@@ -172,8 +180,8 @@ impl<A: StatefulActor> RemoteActorClient<A> {
             encode_payload(&msg).map_err(|e| RemoteActorError::Serialization(e.to_string()))?;
 
         let mut request = tonic::Request::new(CallRequest {
-            service_name: self.service_name.clone(),
-            actor_name: self.actor_name.clone(),
+            service_name: self.service_name.to_string(),
+            actor_name: self.actor_name.to_string(),
             payload,
             timeout_ms: server_timeout.map(duration_to_wire_ms),
             protocol_version: REMOTE_PROTOCOL_VERSION,
@@ -202,6 +210,7 @@ impl<A: StatefulActor> RemoteActorClient<A> {
     }
 
     /// Sends an asynchronous fire-and-forget notification (`cast`) to the remote actor.
+    #[tracing::instrument(skip(self, msg), fields(service = %self.service_name, actor = %self.actor_name), err(Debug))]
     pub async fn cast(&self, msg: A::Message) -> Result<(), RemoteActorError<A::Error>>
     where
         A::Message: serde::Serialize,
@@ -213,6 +222,7 @@ impl<A: StatefulActor> RemoteActorClient<A> {
     ///
     /// Passing [`Duration::ZERO`] performs a non-blocking `try_cast` on the remote actor, returning
     /// [`RemoteActorError::MailboxFull`] immediately if its bounded mailbox is saturated.
+    #[tracing::instrument(skip(self, msg), fields(service = %self.service_name, actor = %self.actor_name), err(Debug))]
     pub async fn cast_timeout(
         &self,
         msg: A::Message,
@@ -242,8 +252,8 @@ impl<A: StatefulActor> RemoteActorClient<A> {
             encode_payload(&msg).map_err(|e| RemoteActorError::Serialization(e.to_string()))?;
 
         let mut request = tonic::Request::new(CastRequest {
-            service_name: self.service_name.clone(),
-            actor_name: self.actor_name.clone(),
+            service_name: self.service_name.to_string(),
+            actor_name: self.actor_name.to_string(),
             payload,
             timeout_ms: server_timeout.map(duration_to_wire_ms),
             protocol_version: REMOTE_PROTOCOL_VERSION,
@@ -314,7 +324,80 @@ impl<A: StatefulActor> std::fmt::Debug for AnyActorClient<A> {
     }
 }
 
+impl<A: StatefulActor> From<ActorClient<A>> for AnyActorClient<A> {
+    fn from(client: ActorClient<A>) -> Self {
+        Self::Local(client)
+    }
+}
+
+impl<A: StatefulActor> From<RemoteActorClient<A>> for AnyActorClient<A> {
+    fn from(client: RemoteActorClient<A>) -> Self {
+        Self::Remote(client)
+    }
+}
+
 impl<A: StatefulActor> AnyActorClient<A> {
+    /// Wraps a local [`ActorClient<A>`] into [`AnyActorClient::Local`].
+    #[must_use]
+    pub fn from_local(client: ActorClient<A>) -> Self {
+        Self::Local(client)
+    }
+
+    /// Wraps a remote [`RemoteActorClient<A>`] into [`AnyActorClient::Remote`].
+    #[must_use]
+    pub fn from_remote(client: RemoteActorClient<A>) -> Self {
+        Self::Remote(client)
+    }
+
+    /// Connects to a remote node endpoint URL and wraps the client in [`AnyActorClient::Remote`].
+    pub async fn connect(
+        endpoint: impl Into<String>,
+        service_name: impl Into<String>,
+        actor_name: impl Into<String>,
+    ) -> Result<Self, tonic::transport::Error> {
+        Ok(Self::Remote(
+            RemoteActorClient::connect(endpoint, service_name, actor_name).await?,
+        ))
+    }
+
+    /// Connects using a pre-configured Tonic [`Endpoint`] and wraps the client in [`AnyActorClient::Remote`].
+    pub async fn connect_with(
+        endpoint: Endpoint,
+        service_name: impl Into<String>,
+        actor_name: impl Into<String>,
+    ) -> Result<Self, tonic::transport::Error> {
+        Ok(Self::Remote(
+            RemoteActorClient::connect_with(endpoint, service_name, actor_name).await?,
+        ))
+    }
+
+    /// Returns the name of the target actor.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Local(client) => client.name(),
+            Self::Remote(client) => client.name(),
+        }
+    }
+
+    /// Returns the name of the target actor (`actor_name`).
+    #[must_use]
+    pub fn actor_name(&self) -> &str {
+        match self {
+            Self::Local(client) => client.name(),
+            Self::Remote(client) => client.actor_name(),
+        }
+    }
+
+    /// Returns the name of the service domain managing the target actor.
+    #[must_use]
+    pub fn service_name(&self) -> &str {
+        match self {
+            Self::Local(client) => client.service_name(),
+            Self::Remote(client) => client.service_name(),
+        }
+    }
+
     fn map_local_error(err: crate::actor::ActorError<A::Error>) -> RemoteActorError<A::Error> {
         match err {
             crate::actor::ActorError::HandlerFailed(e) => RemoteActorError::Actor(e),

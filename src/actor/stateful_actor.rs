@@ -61,7 +61,7 @@ pub(crate) enum ActorControl {
 /// [`Self::cancelled`] completes immediately and [`Self::cast`] / [`Self::try_cast`] return
 /// [`ActorError::ActorUnavailable`] instead of rebinding onto a restarted replacement instance.
 pub struct ActorScope<A: StatefulActor> {
-    name: String,
+    name: Arc<str>,
     instance_id: usize,
     weak_sender: WeakSender<ActorEnvelope<A>>,
     cancel_rx: watch::Receiver<bool>,
@@ -70,7 +70,7 @@ pub struct ActorScope<A: StatefulActor> {
 impl<A: StatefulActor> Clone for ActorScope<A> {
     fn clone(&self) -> Self {
         Self {
-            name: self.name.clone(),
+            name: Arc::clone(&self.name),
             instance_id: self.instance_id,
             weak_sender: self.weak_sender.clone(),
             cancel_rx: self.cancel_rx.clone(),
@@ -156,7 +156,7 @@ impl<A: StatefulActor> ActorScope<A> {
 
 /// Execution and lifecycle context provided to [`StatefulActor`] callbacks.
 pub struct ActorContext<A: StatefulActor> {
-    name: String,
+    name: Arc<str>,
     instance_id: usize,
     control: ActorControl,
     weak_sender: WeakSender<ActorEnvelope<A>>,
@@ -169,7 +169,7 @@ pub struct ActorContext<A: StatefulActor> {
 impl<A: StatefulActor> Clone for ActorContext<A> {
     fn clone(&self) -> Self {
         Self {
-            name: self.name.clone(),
+            name: Arc::clone(&self.name),
             instance_id: self.instance_id,
             control: self.control.clone(),
             weak_sender: self.weak_sender.clone(),
@@ -195,7 +195,7 @@ impl<A: StatefulActor> ActorContext<A> {
     /// Creates a new actor context for the given actor name, instance ID, weak self-sender, lifecycle signal, slot watcher, parent supervisor handle, and actor tracing span.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        name: impl Into<String>,
+        name: impl Into<Arc<str>>,
         instance_id: usize,
         weak_sender: WeakSender<ActorEnvelope<A>>,
         cancel_rx: watch::Receiver<bool>,
@@ -256,7 +256,7 @@ impl<A: StatefulActor> ActorContext<A> {
             })
             .unwrap_or_else(|| mpsc::channel(1).0);
         ActorClient::new(
-            self.name.clone(),
+            Arc::clone(&self.name),
             sender,
             self.slot_rx.clone(),
             self.supervisor.clone(),
@@ -390,7 +390,7 @@ impl<A: StatefulActor> ActorContext<A> {
         Fut: Future<Output = ()> + Send + 'static,
     {
         let scope = ActorScope {
-            name: self.name.clone(),
+            name: Arc::clone(&self.name),
             instance_id: self.instance_id,
             weak_sender: self.weak_sender.clone(),
             cancel_rx: self.cancel_rx.clone(),
@@ -1051,7 +1051,7 @@ impl<A: StatefulActor> StatefulActorRunner<A> {
         let cancel_guard = InstanceCancelGuard(cancel_tx);
 
         let mut ctx = ActorContext::new(
-            self.config.name.clone(),
+            self.config.name.as_str(),
             self.instance_id,
             self.weak_sender.clone(),
             cancel_rx,
@@ -1230,7 +1230,7 @@ pub(crate) fn queue_stats_from_sender<T>(tx: &Sender<T>) -> QueueStats {
 
 /// High-performance, self-healing 1-hop Data Plane client for a [`StatefulActor`].
 pub struct ActorClient<A: StatefulActor> {
-    name: String,
+    name: Arc<str>,
     sender: Arc<RwLock<Sender<ActorEnvelope<A>>>>,
     slot_rx: Arc<RwLock<watch::Receiver<SlotState>>>,
     supervisor: SupervisorHandle,
@@ -1239,7 +1239,7 @@ pub struct ActorClient<A: StatefulActor> {
 impl<A: StatefulActor> Clone for ActorClient<A> {
     fn clone(&self) -> Self {
         Self {
-            name: self.name.clone(),
+            name: Arc::clone(&self.name),
             sender: self.sender.clone(),
             slot_rx: self.slot_rx.clone(),
             supervisor: self.supervisor.clone(),
@@ -1265,7 +1265,7 @@ impl<A: StatefulActor> std::fmt::Debug for ActorClient<A> {
 impl<A: StatefulActor> ActorClient<A> {
     /// Creates a new direct client handle subscribed to the child's [`SlotState`] watch channel.
     pub(crate) fn new(
-        name: impl Into<String>,
+        name: impl Into<Arc<str>>,
         sender: Sender<ActorEnvelope<A>>,
         slot_rx: watch::Receiver<SlotState>,
         supervisor: SupervisorHandle,
@@ -1369,13 +1369,13 @@ impl<A: StatefulActor> ActorClient<A> {
                             return Ok(());
                         }
                         return Err(ActorError::Supervisor(SupervisorError::ChildTypeMismatch(
-                            self.name.clone(),
+                            self.name.to_string(),
                         )));
                     }
                     SlotState::Failed(err) => return Err(ActorError::Supervisor(err.clone())),
                     SlotState::Stopped => {
                         return Err(ActorError::Supervisor(SupervisorError::ChildNotFound(
-                            self.name.clone(),
+                            self.name.to_string(),
                         )));
                     }
                     SlotState::Restarting { .. } => unreachable!(),
@@ -1401,6 +1401,7 @@ impl<A: StatefulActor> ActorClient<A> {
     /// If the actor's channel was closed due to a prior crash (or aborted during `on_start`),
     /// `call` recovers the original message without requiring `A::Message: Clone`, reactively
     /// awaits the replacement actor via `watch`, and delivers the message transparently.
+    #[tracing::instrument(skip(self, msg), fields(actor = %self.name), err(Debug))]
     pub async fn call(&self, mut msg: A::Message) -> Result<A::Response, ActorError<A::Error>> {
         const MAX_ATTEMPTS: usize = 3;
 
@@ -1448,8 +1449,22 @@ impl<A: StatefulActor> ActorClient<A> {
         M::extract_reply(resp).map_err(ActorError::HandlerFailed)
     }
 
+    /// Sends a typed [`CallMessage<A>`] with a client-side timeout deadline and extracts its specific [`CallMessage::Reply`].
+    pub async fn ask_timeout<M>(
+        &self,
+        msg: M,
+        timeout: Duration,
+    ) -> Result<M::Reply, ActorError<A::Error>>
+    where
+        M: CallMessage<A>,
+    {
+        let resp = self.call_timeout(msg.into(), timeout).await?;
+        M::extract_reply(resp).map_err(ActorError::HandlerFailed)
+    }
+
     /// Sends a cloneable request message (`call_retry`) and retries across both channel disconnections
     /// and mid-flight handler crashes.
+    #[tracing::instrument(skip(self, msg), fields(actor = %self.name), err(Debug))]
     pub async fn call_retry(&self, msg: A::Message) -> Result<A::Response, ActorError<A::Error>>
     where
         A::Message: Clone,
@@ -1480,6 +1495,7 @@ impl<A: StatefulActor> ActorClient<A> {
     }
 
     /// Sends a cloneable request message (`call_retry`) with a client-side timeout deadline.
+    #[tracing::instrument(skip(self, msg), fields(actor = %self.name), err(Debug))]
     pub async fn call_retry_timeout(
         &self,
         msg: A::Message,
@@ -1494,6 +1510,7 @@ impl<A: StatefulActor> ActorClient<A> {
     }
 
     /// Sends a request message (`call`) with a client-side timeout deadline.
+    #[tracing::instrument(skip(self, msg), fields(actor = %self.name), err(Debug))]
     pub async fn call_timeout(
         &self,
         msg: A::Message,
@@ -1506,6 +1523,7 @@ impl<A: StatefulActor> ActorClient<A> {
 
     /// Sends an asynchronous fire-and-forget notification (`cast`) to the actor.
     /// Automatically rebinds via the reactive internal `SlotState` watch channel if the mailbox was closed by a prior crash.
+    #[tracing::instrument(skip(self, msg), fields(actor = %self.name), err(Debug))]
     pub async fn cast(&self, mut msg: A::Message) -> Result<(), ActorError<A::Error>> {
         const MAX_ATTEMPTS: usize = 3;
 
@@ -1550,7 +1568,7 @@ impl<A: StatefulActor> ActorClient<A> {
                         }
                         Some(_) => SlotSnapshot::Pending,
                         None => SlotSnapshot::Terminal(ActorError::Supervisor(
-                            SupervisorError::ChildTypeMismatch(self.name.clone()),
+                            SupervisorError::ChildTypeMismatch(self.name.to_string()),
                         )),
                     }
                 }
@@ -1559,7 +1577,7 @@ impl<A: StatefulActor> ActorClient<A> {
                     SlotSnapshot::Terminal(ActorError::Supervisor(err.clone()))
                 }
                 SlotState::Stopped => SlotSnapshot::Terminal(ActorError::Supervisor(
-                    SupervisorError::ChildNotFound(self.name.clone()),
+                    SupervisorError::ChildNotFound(self.name.to_string()),
                 )),
             }
         };
@@ -1625,6 +1643,7 @@ impl<A: StatefulActor> ActorClient<A> {
     }
 
     /// Sends an asynchronous fire-and-forget notification (`cast`) with a client-side timeout deadline.
+    #[tracing::instrument(skip(self, msg), fields(actor = %self.name), err(Debug))]
     pub async fn cast_timeout(
         &self,
         msg: A::Message,
@@ -1656,6 +1675,7 @@ impl<A: StatefulActor> ActorClient<A> {
     }
 
     /// Requests a graceful shutdown of the actor over its direct data-plane channel.
+    #[tracing::instrument(skip(self), fields(actor = %self.name), err(Debug))]
     pub async fn shutdown(&self) -> Result<(), ActorError<A::Error>> {
         self.send_control(|| ActorEnvelope::Shutdown).await
     }

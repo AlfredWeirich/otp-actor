@@ -142,7 +142,7 @@ impl RestartPolicy {
         self
     }
 
-    /// Sets the maximum backoff ceiling across consecutive restarts.
+    /// Sets the maximum backoff ceiling across consecutive restarts (floored at `initial_backoff`).
     #[must_use]
     pub fn max_backoff(mut self, max_backoff: Duration) -> Self {
         self.max_backoff = max_backoff;
@@ -150,6 +150,7 @@ impl RestartPolicy {
     }
 
     /// Sets the exponential backoff multiplier applied on each consecutive restart.
+    /// Non-finite values or multipliers `< 1.0` are safely clamped to `1.0`.
     #[must_use]
     pub fn backoff_multiplier(mut self, backoff_multiplier: f64) -> Self {
         self.backoff_multiplier = backoff_multiplier;
@@ -252,17 +253,26 @@ impl RestartTracker {
         self.restarts.push(now);
         self.consecutive_failures += 1;
 
+        let effective_max = self.policy.max_backoff.max(self.policy.initial_backoff);
+        let base_mult = if self.policy.backoff_multiplier.is_finite()
+            && self.policy.backoff_multiplier >= 1.0
+        {
+            self.policy.backoff_multiplier
+        } else {
+            1.0
+        };
+
         // Cap exponent at 30 to prevent f64 overflow / NaN / Infinity panics
         let exp = (self.consecutive_failures.saturating_sub(1)).min(30) as i32;
-        let multiplier = self.policy.backoff_multiplier.powi(exp);
+        let multiplier = base_mult.powi(exp);
         let backoff_secs = self.policy.initial_backoff.as_secs_f64() * multiplier;
 
         let backoff = if backoff_secs.is_finite() && backoff_secs >= 0.0 {
             Duration::try_from_secs_f64(backoff_secs)
-                .unwrap_or(self.policy.max_backoff)
-                .min(self.policy.max_backoff)
+                .unwrap_or(effective_max)
+                .min(effective_max)
         } else {
-            self.policy.max_backoff
+            effective_max
         };
 
         Some(backoff)

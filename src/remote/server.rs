@@ -574,8 +574,15 @@ impl ActorNodeAdmin for ActorNodeAdminService {
             .include_tree(req.include_tree)
             .include_child_details(req.include_child_details);
 
-        let registered_endpoints = self.registry.snapshot_endpoints();
-        let remote_snapshot = self.metrics.snapshot(registered_endpoints.len());
+        let need_endpoints = req.include_child_details || self.supervisor.is_none();
+        let (registered_endpoints, endpoint_count) = if need_endpoints {
+            let eps = self.registry.snapshot_endpoints();
+            let len = eps.len();
+            (eps, len)
+        } else {
+            (Vec::new(), self.registry.len())
+        };
+        let remote_snapshot = self.metrics.snapshot(endpoint_count);
         let is_draining = self.draining.load(Ordering::Acquire);
 
         let mut node_status = if let Some(sup) = &self.supervisor {

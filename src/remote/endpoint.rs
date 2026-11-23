@@ -42,6 +42,7 @@ struct BoundedVec {
 impl postcard::ser_flavors::Flavor for BoundedVec {
     type Output = prost::bytes::Bytes;
 
+    #[inline]
     fn try_extend(&mut self, data: &[u8]) -> postcard::Result<()> {
         let next_len = self
             .buf
@@ -54,6 +55,7 @@ impl postcard::ser_flavors::Flavor for BoundedVec {
         Ok(())
     }
 
+    #[inline]
     fn try_push(&mut self, data: u8) -> postcard::Result<()> {
         if self.buf.len() >= self.max_len {
             return Err(postcard::Error::SerializeBufferFull);
@@ -62,6 +64,7 @@ impl postcard::ser_flavors::Flavor for BoundedVec {
         Ok(())
     }
 
+    #[inline]
     fn finalize(self) -> postcard::Result<Self::Output> {
         Ok(prost::bytes::Bytes::from(self.buf))
     }

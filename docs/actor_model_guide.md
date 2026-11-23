@@ -1225,12 +1225,13 @@ Inside the host node, the gRPC handler receives untyped byte slices (`&[u8]`). T
 * When an actor is spawned, its typed `ActorClient<A>` is registered into an `ActorNodeRegistry` using either `registry.register_client(client)` (which automatically uses `client.service_name()` and `client.name()`) or `registry.register(service_name, actor_name, client)`.
 * Because `otp-actor` implements `ByteEndpoint` **directly for `ActorClient<A>`** (`impl<A> ByteEndpoint for ActorClient<A>`), `ActorNodeRegistry` stores each registered actor as an `Arc<dyn ByteEndpoint>` without extra wrapper indirection.
 * Upon receiving a gRPC call, `ByteEndpoint::call_bytes` decodes the payload into `A::Message` via bounded `postcard`, forwards it through `self.call` / `self.call_timeout` into the actor's Tokio mailbox channel, awaits `Result<A::Response, ActorError<A::Error>>`, and encodes `ok_payload`, `actor_error_payload`, or `framework_error` into the `CallResponse` envelope. Similarly, `ByteEndpoint::cast_bytes` honors `timeout_ms` via `self.cast_timeout` (or `DEFAULT_REMOTE_CAST_TIMEOUT = 5s`).
-* **DoS Protection:** Both client-side encoding and server-side decoding enforce a strict payload size cap (`MAX_REMOTE_PAYLOAD_BYTES = 4 * 1024 * 1024` = **4 MiB**, aligned with tonic's default HTTP/2 frame limit) using a bounded `postcard` serialization flavor (`BoundedVec`) and `postcard::take_from_bytes` with explicit size and trailing-byte checks, rejecting oversized payloads or trailing garbage bytes before unbounded allocation.
+* **Zero-Alloc Handle Cloning & Tracing:** Client and supervisor handles (`ActorClient`, `ActorContext`, `ActorScope`, `ResourceClient`, `SupervisorHandle`, `RemoteActorClient`) store immutable names as `Arc<str>` for allocation-free cloning and emit structured `tracing` spans (`#[tracing::instrument]`) across local and gRPC invocations.
+* **DoS Protection:** Both client-side encoding and server-side decoding enforce a strict payload size cap (`MAX_REMOTE_PAYLOAD_BYTES = 4 * 1024 * 1024` = **4 MiB**, aligned with tonic's default HTTP/2 frame limit) using an `#[inline]` bounded `postcard` serialization flavor (`BoundedVec`) and `postcard::take_from_bytes` with explicit size and trailing-byte checks, rejecting oversized payloads or trailing garbage bytes before unbounded allocation.
 
 #### 3. Complete Location Transparency with `AnyActorClient<A>`
 In large-scale distributed architectures, components frequently migrate between monolithic co-location and separate microservice pods. If client code had to change its invocation style depending on where an actor runs, architectural refactoring would be cumbersome.
 
-`otp-actor` resolves this with `AnyActorClient<A>`:
+`otp-actor` resolves this with `AnyActorClient<A>` (constructed via `From`, `.from_local(...)`, `.from_remote(...)`, or `.connect(...)`, and exposing `.name()`, `.actor_name()`, and `.service_name()`):
 
 ```rust
 pub enum AnyActorClient<A: StatefulActor> {

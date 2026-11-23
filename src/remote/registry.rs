@@ -168,28 +168,24 @@ impl ActorNodeRegistry {
 
     /// Captures point-in-time queue statistics for all registered endpoints, sorted deterministically.
     pub fn snapshot_endpoints(&self) -> Vec<RegisteredEndpointStatus> {
-        let items: Vec<(String, String, Arc<dyn ByteEndpoint>)> = {
+        let mut out = {
             let map = self
                 .endpoints
                 .read()
                 .unwrap_or_else(PoisonError::into_inner);
-            let mut entries = Vec::new();
+            let total: usize = map.values().map(HashMap::len).sum();
+            let mut entries = Vec::with_capacity(total);
             for (service_name, actors) in map.iter() {
                 for (actor_name, endpoint) in actors.iter() {
-                    entries.push((service_name.clone(), actor_name.clone(), endpoint.clone()));
+                    entries.push(RegisteredEndpointStatus {
+                        service_name: service_name.clone(),
+                        actor_name: actor_name.clone(),
+                        queue: endpoint.queue_stats(),
+                    });
                 }
             }
             entries
         };
-
-        let mut out: Vec<RegisteredEndpointStatus> = items
-            .into_iter()
-            .map(|(service_name, actor_name, endpoint)| RegisteredEndpointStatus {
-                service_name,
-                actor_name,
-                queue: endpoint.queue_stats(),
-            })
-            .collect();
         out.sort_by(|a, b| {
             a.service_name
                 .cmp(&b.service_name)

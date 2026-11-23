@@ -35,7 +35,7 @@ use tracing::Instrument;
 use super::model::{
     EXPIRY_BUFFER, RestartPolicy, RestartType, ShutdownPolicy, SupervisorError, TaskResult,
 };
-use super::stateful_actor::queue_stats_from_sender;
+use super::stateful_actor::{QueueStats, queue_stats_from_sender};
 use super::supervisor::{
     CacheProbeFn, ChildSpec, QueueProbeFn, ShutdownSignalFn, SlotState, SpawnContext,
     SupervisorHandle, UntypedActorFactory,
@@ -161,7 +161,10 @@ impl<T> TimedResource<T> {
         self.is_usable_stale_at(Instant::now(), stale_allowance)
     }
 
-    /// Indicates whether the resource is fresh (outside the pre-expiration buffer).
+    /// Indicates whether more than `buffer` remains before `expires_at` (or always `true` if perpetual).
+    ///
+    /// Note that `ResourceActor` internally clamps its refresh buffer to `min(expiry_buffer, ttl / 2)`;
+    /// prefer [`ResourceClient::cache_state`] when inspecting the actor's effective cache state.
     pub fn is_fresh(&self, buffer: Duration) -> bool {
         match self.expires_at {
             Some(exp) => exp.saturating_duration_since(Instant::now()) > buffer,
@@ -1254,6 +1257,7 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
                     continue;
                 }
 
+                self.waiters.retain(|w| !w.is_closed());
                 if self.refresh_in_flight && self.waiters.len() < self.max_waiters {
                     self.waiters.push(respond_to);
                 } else {
@@ -1279,6 +1283,12 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
                         if join_err.is_cancelled() {
                             continue;
                         }
+                        tracing::error!(
+                            actor = %self.name,
+                            instance = self.instance_id,
+                            error = %join_err,
+                            "💥 In-flight worker panicked during graceful shutdown!"
+                        );
                         self.refresh_in_flight = false;
                         break;
                     }
@@ -1724,7 +1734,7 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
 /// High-performance, self-healing Data Plane client for a [`ResourceActor`].
 #[derive(Clone)]
 pub struct ResourceClient<T, E> {
-    name: String,
+    name: Arc<str>,
     endpoint: Arc<RwLock<ResourceEndpoint<T, E>>>,
     slot_rx: Arc<RwLock<watch::Receiver<SlotState>>>,
     supervisor: SupervisorHandle,
@@ -1748,7 +1758,7 @@ impl<T, E> std::fmt::Debug for ResourceClient<T, E> {
 impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static> ResourceClient<T, E> {
     /// Creates a new direct client handle subscribed to the child's [`SlotState`] watch channel.
     pub(crate) fn new(
-        name: impl Into<String>,
+        name: impl Into<Arc<str>>,
         endpoint: ResourceEndpoint<T, E>,
         slot_rx: watch::Receiver<SlotState>,
         supervisor: SupervisorHandle,
@@ -1773,10 +1783,29 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static> Resourc
         &self.supervisor
     }
 
-    fn current_endpoint(&self) -> ResourceEndpoint<T, E> {
+    /// Returns the name of the [`SupervisorHandle`] managing this actor.
+    #[must_use]
+    pub fn service_name(&self) -> &str {
+        self.supervisor.name()
+    }
+
+    /// Returns an approximate point-in-time snapshot of this client's bounded mailbox queue.
+    ///
+    /// Reads only the locally cached sender without contacting the supervisor or locking across `.await`.
+    #[must_use]
+    pub fn queue_stats(&self) -> QueueStats {
+        let ep = self
+            .endpoint
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        queue_stats_from_sender(&ep.sender)
+    }
+
+    fn current_sender(&self) -> Sender<ResourceCommand<T, E>> {
         self.endpoint
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .sender
             .clone()
     }
 
@@ -1838,13 +1867,13 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static> Resourc
                             return Ok(());
                         }
                         return Err(ResourceError::Supervisor(
-                            SupervisorError::ChildTypeMismatch(self.name.clone()),
+                            SupervisorError::ChildTypeMismatch(self.name.to_string()),
                         ));
                     }
                     SlotState::Failed(err) => return Err(ResourceError::Supervisor(err.clone())),
                     SlotState::Stopped => {
                         return Err(ResourceError::Supervisor(SupervisorError::ChildNotFound(
-                            self.name.clone(),
+                            self.name.to_string(),
                         )));
                     }
                     SlotState::Restarting { .. } => unreachable!(),
@@ -1874,16 +1903,22 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static> Resourc
         const MAX_ATTEMPTS: usize = 3;
 
         for _attempt in 1..=MAX_ATTEMPTS {
-            let current_ep = self.current_endpoint();
-            if invalidate_cache {
-                current_ep.invalidated.store(true, Ordering::Release);
-            }
+            let current_sender = {
+                let current_ep = self
+                    .endpoint
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if invalidate_cache {
+                    current_ep.invalidated.store(true, Ordering::Release);
+                }
+                current_ep.sender.clone()
+            };
 
-            if current_ep.sender.send(make_cmd()).await.is_ok() {
+            if current_sender.send(make_cmd()).await.is_ok() {
                 return Ok(());
             }
 
-            self.rebind_channel(&current_ep.sender).await?;
+            self.rebind_channel(&current_sender).await?;
         }
 
         Err(ResourceError::ActorUnavailable)
@@ -1896,6 +1931,7 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static> Resourc
     ///   `TriggerBackgroundRefresh` when in `RefreshDue` and not already pending or throttled).
     /// - **1-Hop Coalesced Path**: On cold start, hard expiry, or stale-while-error recovery,
     ///   sends a direct request to the [`ResourceActor`] and transparently rebinds via its internal `SlotState` watch channel on crash/restart.
+    #[tracing::instrument(skip(self), fields(actor = %self.name))]
     pub async fn get(&self) -> Result<T, ResourceError<E>> {
         // 0-hop fast path via watch::Receiver (read directly under RwLockReadGuard with zero
         // ResourceEndpoint atomic refcount clones and at most one `Instant::now()` syscall).
@@ -1958,11 +1994,10 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static> Resourc
         const MAX_ATTEMPTS: usize = 3;
 
         for attempt in 1..=MAX_ATTEMPTS {
-            let current_ep = self.current_endpoint();
+            let current_sender = self.current_sender();
 
             let (tx, rx) = oneshot::channel();
-            let send_res = current_ep
-                .sender
+            let send_res = current_sender
                 .send(ResourceCommand::GetResource { respond_to: tx })
                 .await;
 
@@ -1980,13 +2015,14 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static> Resourc
                 "⚠️ Direct channel broken or actor restarting. Rebinding via reactive watch slot..."
             );
 
-            self.rebind_channel(&current_ep.sender).await?;
+            self.rebind_channel(&current_sender).await?;
         }
 
         Err(ResourceError::ActorUnavailable)
     }
 
     /// Retrieves the resource with a client-side timeout deadline.
+    #[tracing::instrument(skip(self), fields(actor = %self.name))]
     pub async fn get_timeout(&self, timeout: Duration) -> Result<T, ResourceError<E>> {
         tokio::time::timeout(timeout, self.get())
             .await
@@ -2011,12 +2047,14 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static> Resourc
     }
 
     /// Proactively forces a background refresh, superseding any currently in-flight refresh.
+    #[tracing::instrument(skip(self), fields(actor = %self.name))]
     pub async fn force_refresh(&self) -> Result<(), ResourceError<E>> {
         self.send_control(false, || ResourceCommand::ForceRefresh)
             .await
     }
 
     /// Requests a graceful shutdown of the actor over its direct data-plane channel.
+    #[tracing::instrument(skip(self), fields(actor = %self.name))]
     pub async fn shutdown(&self) -> Result<(), ResourceError<E>> {
         self.send_control(true, || ResourceCommand::Shutdown).await
     }

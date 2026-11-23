@@ -2645,7 +2645,7 @@ enum SupervisorChannel {
 /// Public thread-safe client handle for interacting with any [`Supervisor`] in the supervision hierarchy.
 #[derive(Clone)]
 pub struct SupervisorHandle {
-    name: String,
+    name: Arc<str>,
     channel: SupervisorChannel,
     parent: Option<Arc<SupervisorHandle>>,
     started_at: Instant,
@@ -2661,7 +2661,7 @@ impl std::fmt::Debug for SupervisorHandle {
 
 impl SupervisorHandle {
     pub(crate) fn new_root_handle(
-        name: impl Into<String>,
+        name: impl Into<Arc<str>>,
         sender: Sender<SupervisorCommand>,
     ) -> Self {
         Self {
@@ -2676,7 +2676,7 @@ impl SupervisorHandle {
     }
 
     pub(crate) fn new_child_handle(
-        name: impl Into<String>,
+        name: impl Into<Arc<str>>,
         sender: Sender<SupervisorCommand>,
         slot_rx: watch::Receiver<SlotState>,
         parent: SupervisorHandle,
@@ -2694,7 +2694,7 @@ impl SupervisorHandle {
     }
 
     pub(crate) fn new_weak(
-        name: impl Into<String>,
+        name: impl Into<Arc<str>>,
         sender: WeakSender<SupervisorCommand>,
         parent: Option<SupervisorHandle>,
     ) -> Self {
@@ -2717,7 +2717,7 @@ impl SupervisorHandle {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .downgrade();
                 Self {
-                    name: self.name.clone(),
+                    name: Arc::clone(&self.name),
                     channel: SupervisorChannel::Weak {
                         sender: Arc::new(RwLock::new(weak)),
                     },

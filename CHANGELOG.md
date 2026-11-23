@@ -24,6 +24,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   - Restricted internal control/channel enums `SlotState` and `ActorControl` to `pub(crate)` and removed them from public crate re-exports (external observers continue using `ChildStatus` / `ChildStatusWatcher` and `ActorContext::{stop, fail}`).
 
 ### Added
+- **Client API Symmetry (`ask_timeout`, `ResourceClient` Queue Telemetry & `AnyActorClient` Helpers) (`src/actor/{stateful_actor,generic_actor}.rs`, `src/remote/client.rs`, Finding `F-14`):**
+  - Added `ActorClient::ask_timeout` for typed [`CallMessage<A>`] deadlines matching `RemoteActorClient::ask_timeout` and `AnyActorClient::ask_timeout`.
+  - Added `ResourceClient::service_name()` and `ResourceClient::queue_stats()`, symmetric with `ActorClient`.
+  - Added `RemoteActorClient::name()` (alias for `actor_name()`), `AnyActorClient::{from_local, from_remote, connect, connect_with, name, actor_name, service_name}`, and `From<ActorClient<A>>` / `From<RemoteActorClient<A>>` without introducing extra `serde` bounds.
 - **Location-Transparent `ask`/`ask_timeout` & `Debug` Implementations for Remote Types (`src/remote/{client,registry,server}.rs`, Finding `F-20`):**
   - Added `ask` and `ask_timeout` (`CallMessage<A>`) on both `RemoteActorClient<A>` and `AnyActorClient<A>`, matching local `ActorClient::ask` ergonomics.
   - Added `std::fmt::Debug` implementations for `RemoteActorClient<A>`, `AnyActorClient<A>`, `ActorNodeRegistry`, `ActorNodeService`, `ActorNodeAdminService`, `ActorNodeBuilder`, and `ActorNodeHandle`.
@@ -32,6 +36,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   - Added manual `std::fmt::Debug` implementations without tightening generic trait bounds for `ActorClient<A>`, `ResourceClient<T, E>`, `StatefulActorBuilder<A, F>`, `ResourceActorBuilder<T, E, W>`, `ChildSpec`, `SupervisorBuilder`, `SpawnContext`, and `SlotState`.
 
 ### Changed
+- **Zero-Allocation `Arc<str>` Handle Cloning, Lazy Admin Endpoint Snapshots & SemVer-Safe Client Tracing (`src/actor/{generic_actor,stateful_actor,supervisor}.rs`, `src/remote/{client,endpoint,registry,server}.rs`, Findings `F-08`, `F-09`, `F-13`):**
+  - Updated `ActorNodeAdminService::status` to skip calling `ActorNodeRegistry::snapshot_endpoints()` (using `len()`) when `include_child_details == false` and a `SupervisorHandle` is attached, and eliminated the intermediate `Vec` and `Arc<dyn ByteEndpoint>` clones inside `ActorNodeRegistry::snapshot_endpoints` by reading `queue_stats()` directly into a pre-sized `Vec::with_capacity(total)`.
+  - Switched immutable handle name fields on `ActorScope`, `ActorContext`, `ActorClient`, `ResourceClient`, `SupervisorHandle`, and `RemoteActorClient` from `String` to `Arc<str>` for zero-allocation cloning, and updated `ResourceClient::{send_control, get}` 1-hop paths to clone only `ep.sender` instead of the full `ResourceEndpoint`.
+  - Added `#[inline]` to `BoundedVec::{try_extend, try_push, finalize}` and added SemVer-compatible `#[tracing::instrument]` spans to `ActorClient::{call, call_timeout, call_retry, call_retry_timeout, cast, cast_timeout, shutdown}` (`err(Debug)`), `RemoteActorClient::{call, call_timeout, cast, cast_timeout}` (`err(Debug)`), and `ResourceClient::{get, get_timeout, force_refresh, shutdown}` (without `err`, preserving `E: Clone` bounds).
+  - Verified with `test_client_handles_arc_str_zero_alloc_clone_and_tracing_instrument_preserves_trait_bounds` and `test_admin_status_skips_endpoint_snapshot_without_details_and_remote_client_arc_str`.
 - **Deterministic Assertions & Zero-Sleep Termination in Remote Examples (`examples/remote/{all_in_one,client}.rs`, Finding `F-22`):**
   - Replaced `let _ = ...` on `AccountMsg::SimulateCrash` with explicit `assert!(matches!(..., Err(RemoteActorError::Actor(_))))` checks and removed the unnecessary `sleep(50ms)` in `all_in_one.rs`, documenting the deterministic `receiver.close()`-before-reply guarantee.
 - **Zero-Allocation Label Sanitization & Pre-Sized `BoundedVec` in Remote gRPC Hot Path (`src/remote/{registry,server,endpoint}.rs`, Finding `F-18` — SemVer-compatible part):**
@@ -58,6 +67,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   - Added `TimedResource::{is_still_usable_at, is_usable_stale_at}` so `ResourceClient::get()` and `ResourceEndpoint::cache_state()` perform at most one `Instant::now()` call (and zero clock calls for perpetual resources with no refresh threshold).
 
 ### Fixed
+- **Prometheus Summary & Registry-Only Metrics, Atomic EMA Sentinel & Edge-Case Hardening (`src/actor/{telemetry,generic_actor,model}.rs`, Findings `F-11`, `F-14`):**
+  - Exported the 6 missing `NodeSummary` Prometheus metrics (`otp_actor_summary_full_mailboxes`, `otp_actor_summary_calls_total`, `otp_actor_summary_casts_total`, `otp_actor_summary_handler_errors_total`, `otp_actor_summary_timeouts_total`, `otp_actor_summary_panics_total`) and `registered_endpoints` queue gauges (`otp_actor_registered_endpoint_mailbox_queued`, `otp_actor_registered_endpoint_mailbox_capacity`), fixing exports for `include_tree(false)` and registry-only remote nodes (`supervisor: None`).
+  - Eliminated the latency initialization race in `ActorMetrics` by replacing `has_latency_sample: AtomicBool` with an `UNINITIALIZED_EMA_US = u64::MAX` sentinel updated atomically via `compare_exchange_weak`.
+  - Pruned closed waiter channels before enforcing `max_waiters` and logged non-cancelled worker panics in `ResourceActor::finish_graceful_shutdown`, clarified `TimedResource::is_fresh` buffer clamping in docs, and hardened `RestartTracker::record_crash` (`max_backoff` floored at `initial_backoff`; non-finite or `< 1.0` `backoff_multiplier` values clamped to `1.0`).
+  - Verified with `test_format_prometheus_metrics_exposition_and_label_escaping`, `test_f11_prometheus_registered_endpoints_and_f14_api_symmetry_and_clamping`, and extended assertions in `tests/remote_grpc_test.rs`.
 - **Dynamic Aging of `RestartTracker::consecutive_failures()`, Single-Roundtrip `SnapshotLevel` Tree Snapshots & Accurate Health/Uptime Reporting (`src/actor/{model,supervisor}.rs`, `src/remote/{registry,server}.rs`, Findings `F-05`, `F-07`, `F-12`):**
   - Updated `RestartTracker::consecutive_failures()` to verify the most recent crash timestamp against `RestartPolicy::time_window`, returning `0` once a full stability window elapses without another crash (`restarts_in_window() == 0`).
   - Added internal `SupervisorCommand::SnapshotLevel` returning both the flat `SupervisorSnapshot` and direct `Sender<SupervisorCommand>` endpoints for immediate child supervisors, eliminating $K$ redundant `ResolveChildSlot` roundtrips per level in `snapshot_tree_timeout` and avoiding blocking on `SlotState::Restarting` backoff timers.

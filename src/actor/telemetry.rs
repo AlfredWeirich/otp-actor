@@ -7,7 +7,7 @@
 
 use std::fmt::Write as _;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::generic_actor::CacheState;
@@ -21,7 +21,9 @@ use super::supervisor::{
 // 1. Lock-Free Actor Metrics Collector
 // ============================================================================
 
-#[derive(Debug, Default)]
+const UNINITIALIZED_EMA_US: u64 = u64::MAX;
+
+#[derive(Debug)]
 struct ActorMetricsInner {
     in_flight: AtomicUsize,
     calls_total: AtomicU64,
@@ -31,7 +33,21 @@ struct ActorMetricsInner {
     panics_total: AtomicU64,
     last_latency_us: AtomicU64,
     ema_latency_us: AtomicU64,
-    has_latency_sample: AtomicBool,
+}
+
+impl Default for ActorMetricsInner {
+    fn default() -> Self {
+        Self {
+            in_flight: AtomicUsize::new(0),
+            calls_total: AtomicU64::new(0),
+            casts_total: AtomicU64::new(0),
+            handler_errors_total: AtomicU64::new(0),
+            timeouts_total: AtomicU64::new(0),
+            panics_total: AtomicU64::new(0),
+            last_latency_us: AtomicU64::new(0),
+            ema_latency_us: AtomicU64::new(UNINITIALIZED_EMA_US),
+        }
+    }
 }
 
 /// Lock-free, thread-safe performance and error counter handle shared between a
@@ -112,29 +128,29 @@ impl ActorMetrics {
             self.inner.timeouts_total.fetch_add(1, Ordering::Relaxed);
         }
 
-        let sample_us = duration.as_micros().min(u128::from(u64::MAX)) as u64;
+        let sample_us = duration
+            .as_micros()
+            .min(u128::from(UNINITIALIZED_EMA_US - 1)) as u64;
         self.inner
             .last_latency_us
             .store(sample_us, Ordering::Relaxed);
 
-        if !self.inner.has_latency_sample.swap(true, Ordering::Relaxed) {
-            self.inner
-                .ema_latency_us
-                .store(sample_us, Ordering::Relaxed);
-        } else {
-            // Exponential moving average with alpha = 0.25 ((prev * 3 + sample) / 4).
-            let mut prev = self.inner.ema_latency_us.load(Ordering::Relaxed);
-            loop {
-                let next = prev.saturating_mul(3).saturating_add(sample_us) / 4;
-                match self.inner.ema_latency_us.compare_exchange_weak(
-                    prev,
-                    next,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => break,
-                    Err(actual) => prev = actual,
-                }
+        // Exponential moving average with alpha = 0.25 ((prev * 3 + sample) / 4).
+        let mut prev = self.inner.ema_latency_us.load(Ordering::Relaxed);
+        loop {
+            let next = if prev == UNINITIALIZED_EMA_US {
+                sample_us
+            } else {
+                prev.saturating_mul(3).saturating_add(sample_us) / 4
+            };
+            match self.inner.ema_latency_us.compare_exchange_weak(
+                prev,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => prev = actual,
             }
         }
     }
@@ -142,6 +158,12 @@ impl ActorMetrics {
     /// Captures a lock-free point-in-time snapshot of all atomic actor counters.
     #[must_use]
     pub fn snapshot(&self) -> ActorMetricsSnapshot {
+        let raw_ema = self.inner.ema_latency_us.load(Ordering::Relaxed);
+        let ema_latency_us = if raw_ema == UNINITIALIZED_EMA_US {
+            0
+        } else {
+            raw_ema
+        };
         ActorMetricsSnapshot {
             in_flight: self.inner.in_flight.load(Ordering::Relaxed),
             calls_total: self.inner.calls_total.load(Ordering::Relaxed),
@@ -150,7 +172,7 @@ impl ActorMetrics {
             timeouts_total: self.inner.timeouts_total.load(Ordering::Relaxed),
             panics_total: self.inner.panics_total.load(Ordering::Relaxed),
             last_latency_us: self.inner.last_latency_us.load(Ordering::Relaxed),
-            ema_latency_us: self.inner.ema_latency_us.load(Ordering::Relaxed),
+            ema_latency_us,
         }
     }
 }
@@ -919,6 +941,65 @@ pub fn format_prometheus_metrics(status: &NodeStatus) -> String {
     );
     out.push('\n');
 
+    let _ = writeln!(
+        out,
+        "# HELP otp_actor_summary_full_mailboxes Number of inspected bounded mailboxes currently at full capacity."
+    );
+    let _ = writeln!(out, "# TYPE otp_actor_summary_full_mailboxes gauge");
+    let _ = writeln!(out, "otp_actor_summary_full_mailboxes {}", s.full_mailboxes);
+    out.push('\n');
+
+    let _ = writeln!(
+        out,
+        "# HELP otp_actor_summary_calls_total Total synchronous call invocations processed across inspected actors."
+    );
+    let _ = writeln!(out, "# TYPE otp_actor_summary_calls_total counter");
+    let _ = writeln!(out, "otp_actor_summary_calls_total {}", s.total_calls);
+    out.push('\n');
+
+    let _ = writeln!(
+        out,
+        "# HELP otp_actor_summary_casts_total Total fire-and-forget cast invocations processed across inspected actors."
+    );
+    let _ = writeln!(out, "# TYPE otp_actor_summary_casts_total counter");
+    let _ = writeln!(out, "otp_actor_summary_casts_total {}", s.total_casts);
+    out.push('\n');
+
+    let _ = writeln!(
+        out,
+        "# HELP otp_actor_summary_handler_errors_total Total domain handler errors returned across inspected actors."
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE otp_actor_summary_handler_errors_total counter"
+    );
+    let _ = writeln!(
+        out,
+        "otp_actor_summary_handler_errors_total {}",
+        s.total_handler_errors
+    );
+    out.push('\n');
+
+    let _ = writeln!(
+        out,
+        "# HELP otp_actor_summary_timeouts_total Total handler executions aborted due to handler_timeout across inspected actors."
+    );
+    let _ = writeln!(out, "# TYPE otp_actor_summary_timeouts_total counter");
+    let _ = writeln!(
+        out,
+        "otp_actor_summary_timeouts_total {}",
+        s.total_timeouts
+    );
+    out.push('\n');
+
+    let _ = writeln!(
+        out,
+        "# HELP otp_actor_summary_panics_total Total unwinding panics caught across inspected actors."
+    );
+    let _ = writeln!(out, "# TYPE otp_actor_summary_panics_total counter");
+    let _ = writeln!(out, "otp_actor_summary_panics_total {}", s.total_panics);
+    out.push('\n');
+
     if let Some(remote) = &status.remote {
         let _ = writeln!(
             out,
@@ -1022,6 +1103,55 @@ pub fn format_prometheus_metrics(status: &NodeStatus) -> String {
             "otp_actor_remote_framework_errors_total {}",
             remote.framework_errors_total
         );
+        out.push('\n');
+    }
+
+    let registered_queues: Vec<_> = status
+        .registered_endpoints
+        .iter()
+        .filter_map(|ep| {
+            ep.queue.as_ref().map(|q| {
+                (
+                    escape_prom_label(&ep.service_name),
+                    escape_prom_label(&ep.actor_name),
+                    q,
+                )
+            })
+        })
+        .collect();
+    if !registered_queues.is_empty() {
+        let _ = writeln!(
+            out,
+            "# HELP otp_actor_registered_endpoint_mailbox_queued Approximate queued message count per registered remote endpoint."
+        );
+        let _ = writeln!(
+            out,
+            "# TYPE otp_actor_registered_endpoint_mailbox_queued gauge"
+        );
+        for (svc, actor, q) in &registered_queues {
+            let _ = writeln!(
+                out,
+                "otp_actor_registered_endpoint_mailbox_queued{{service=\"{svc}\",actor=\"{actor}\"}} {}",
+                q.queued
+            );
+        }
+        out.push('\n');
+
+        let _ = writeln!(
+            out,
+            "# HELP otp_actor_registered_endpoint_mailbox_capacity Configured bounded mailbox capacity per registered remote endpoint."
+        );
+        let _ = writeln!(
+            out,
+            "# TYPE otp_actor_registered_endpoint_mailbox_capacity gauge"
+        );
+        for (svc, actor, q) in &registered_queues {
+            let _ = writeln!(
+                out,
+                "otp_actor_registered_endpoint_mailbox_capacity{{service=\"{svc}\",actor=\"{actor}\"}} {}",
+                q.max_capacity
+            );
+        }
         out.push('\n');
     }
 
