@@ -47,10 +47,10 @@
 //!
 //! - **Data Plane (0-Hop Cache / Direct 1-Hop / gRPC Bridge)**: In-process clients ([`ResourceClient`], [`ActorClient`]) hold direct `watch` cache receivers and bounded `mpsc`
 //!   channels to the actor mailboxes, while remote clients traverse gRPC into a registered `ActorClient` (`ByteEndpoint`). Requests never traverse supervisors, eliminating bottlenecks.
-//! - **Control Plane (Supervisors)**: [`Supervisor`]s own task handles, monitor exits/panics, manage lifecycle transitions,
-//!   and publish reactive [`SlotState`] updates over per-child `watch` channels.
+//! - **Control Plane (Supervisors)**: [`Supervisor`]s own child tasks directly in a `JoinSet`, monitor exits/panics, manage lifecycle transitions,
+//!   and publish reactive internal `SlotState` updates over per-child `watch` channels.
 //! - **Zero-Polling Self-Healing**: If an actor crashes, its direct channel closes. The client awaits the child's
-//!   reactive [`SlotState`] `watch` channel and rebinds in 0ms as soon as the replacement actor spawns.
+//!   reactive `SlotState` `watch` channel and rebinds in 0ms as soon as the replacement actor spawns.
 //!
 //! ## Quick Start: Resource Actor
 //!

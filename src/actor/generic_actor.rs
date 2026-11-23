@@ -63,7 +63,27 @@ pub enum ResourceError<E> {
     Overloaded(usize),
 }
 
+/// Non-generic span constructor so all `ResourceActor` types share a single `tracing` callsite.
+fn make_resource_actor_span(name: &str, instance_id: usize) -> tracing::Span {
+    tracing::info_span!(
+        "resource_actor",
+        actor = %name,
+        instance = instance_id,
+    )
+}
+
+/// Non-generic span constructor so all `ResourceActor` workers share a single `tracing` callsite.
+fn make_resource_worker_span(name: &str, instance_id: usize, generation: usize) -> tracing::Span {
+    tracing::info_span!(
+        "resource_worker",
+        actor = %name,
+        instance = instance_id,
+        generation = generation,
+    )
+}
+
 /// Execution metadata provided to [`Worker`] implementations.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorkerContext {
     /// Identifier of the actor instance (increments upon supervisor auto-restart of this actor).
@@ -600,12 +620,8 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
             });
             let w = worker.clone();
             let cfg = config.clone();
-            let actor_span = tracing::info_span!(
-                "resource_actor",
-                actor = %cfg.name,
-                instance = spawn_ctx.instance_id,
-            );
-            let task_handle = tokio::spawn(
+            let actor_span = make_resource_actor_span(&cfg.name, spawn_ctx.instance_id);
+            let fut = Box::pin(
                 async move {
                     let actor = ResourceActor::with_channels(
                         cfg,
@@ -620,7 +636,7 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
                 }
                 .instrument(actor_span),
             );
-            (endpoint, task_handle)
+            (endpoint, fut)
         });
 
         let shutdown_signal: ShutdownSignalFn = Arc::new(|untyped| {
@@ -1367,12 +1383,7 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
             generation: next_gen,
         };
 
-        let worker_span = tracing::info_span!(
-            "resource_worker",
-            actor = %actor_name,
-            instance = actor_id,
-            generation = next_gen,
-        );
+        let worker_span = make_resource_worker_span(&actor_name, actor_id, next_gen);
 
         let abort_handle = worker_tasks.spawn(
             async move {
@@ -1746,7 +1757,7 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static> Resourc
     /// - **0-Hop Fast Path**: If the actor holds a fresh cached resource outside its expiration buffer,
     ///   returns a clone directly from the [`tokio::sync::watch`] channel without any channel allocation or context switch.
     /// - **1-Hop Coalesced Path**: On cold start, pre-expiration refresh window, or stale-while-error recovery,
-    ///   sends a direct request to the [`ResourceActor`] and transparently rebinds via [`SlotState`] on crash/restart.
+    ///   sends a direct request to the [`ResourceActor`] and transparently rebinds via its internal `SlotState` watch channel on crash/restart.
     pub async fn get(&self) -> Result<T, ResourceError<E>> {
         // 0-hop fast path via watch::Receiver (read directly under RwLockReadGuard with zero
         // ResourceEndpoint atomic refcount clones and at most one `Instant::now()` syscall).

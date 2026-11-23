@@ -33,9 +33,18 @@ use super::supervisor::{
 };
 use super::telemetry::{ActorMetrics, RunnerPanicGuard};
 
+/// Non-generic span constructor so all `StatefulActor` types share a single `tracing` callsite.
+fn make_stateful_actor_span(name: &str, instance_id: usize) -> tracing::Span {
+    tracing::info_span!(
+        "stateful_actor",
+        actor = %name,
+        instance = instance_id,
+    )
+}
+
 /// Control directive set by a [`StatefulActor`] through its [`ActorContext`] during message handling.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ActorControl {
+pub(crate) enum ActorControl {
     /// Continue normal message processing.
     Continue,
     /// Stop the actor cleanly (`Ok(())`) after the current handler completes, invoking `on_stop`.
@@ -726,12 +735,8 @@ where
             let factory = actor_factory.clone();
             let cfg = config.clone();
             let runner_metrics = metrics_for_factory.clone();
-            let actor_span = tracing::info_span!(
-                "stateful_actor",
-                actor = %cfg.name,
-                instance = spawn_ctx.instance_id,
-            );
-            let task_handle = tokio::spawn(
+            let actor_span = make_stateful_actor_span(&cfg.name, spawn_ctx.instance_id);
+            let fut = Box::pin(
                 async move {
                     let actor = (factory)(spawn_ctx.instance_id);
                     let runner = StatefulActorRunner::new(
@@ -748,7 +753,7 @@ where
                 }
                 .instrument(actor_span),
             );
-            (sender_arc, task_handle)
+            (sender_arc, fut)
         });
 
         let shutdown_signal: ShutdownSignalFn = Arc::new(|untyped| {
@@ -1510,7 +1515,7 @@ impl<A: StatefulActor> ActorClient<A> {
     }
 
     /// Sends an asynchronous fire-and-forget notification (`cast`) to the actor.
-    /// Automatically rebinds via the reactive [`SlotState`] watch channel if the mailbox was closed by a prior crash.
+    /// Automatically rebinds via the reactive internal `SlotState` watch channel if the mailbox was closed by a prior crash.
     pub async fn cast(&self, mut msg: A::Message) -> Result<(), ActorError<A::Error>> {
         const MAX_ATTEMPTS: usize = 3;
 
@@ -1606,7 +1611,7 @@ impl<A: StatefulActor> ActorClient<A> {
     ///
     /// Returns [`ActorError::MailboxFull`] immediately if the actor's bounded mailbox has reached
     /// capacity. If the cached mailbox channel was closed due to a prior restart, synchronously
-    /// checks the local [`SlotState`] watch channel to rebind to a live replacement instance and
+    /// checks the local `SlotState` watch channel to rebind to a live replacement instance and
     /// retry once without blocking; returns [`ActorError::ActorUnavailable`] while the replacement
     /// is still starting, or [`ActorError::Supervisor`] if the actor has permanently failed or
     /// stopped.

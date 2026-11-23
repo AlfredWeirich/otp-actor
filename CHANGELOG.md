@@ -8,7 +8,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
-## [0.3.4] - Unreleased
+## [0.4.0] - Unreleased
+
+### Breaking Changes
+- **Single-Task `Supervisor` `JoinSet` Architecture (`src/actor/{supervisor,generic_actor,stateful_actor,mod}.rs`, Finding `F-10`):**
+  - Added public type alias `ChildFuture = Pin<Box<dyn Future<Output = TaskResult> + Send + 'static>>` and updated `UntypedActorFactory` to return `(UntypedSender, ChildFuture)` instead of `(UntypedSender, JoinHandle<TaskResult>)`.
+  - `Supervisor` now spawns each child future directly into its `JoinSet<TaskResult>` and maps `tokio::task::Id` via `join_next_with_id()`, eliminating the second monitor wrapper task per supervised child and letting `JoinSet::abort_all()` abort child tasks directly.
+  - *Migration:* Custom `ChildSpec::new(...)` factories should replace `tokio::spawn(async move { ... })` with `Box::pin(async move { ... })`. High-level builders (`StatefulActorBuilder`, `ResourceActorBuilder`, `SupervisorBuilder`) are unaffected.
+- **API Encapsulation & `#[non_exhaustive]` Future-Proofing (`src/actor/{generic_actor,stateful_actor,supervisor,telemetry,mod}.rs`, Finding `F-14`):**
+  - Added `#[non_exhaustive]` to `WorkerContext`, `SpawnContext`, `ChildKind`, and `ChildLifecycle`.
+  - Restricted internal control/channel enums `SlotState` and `ActorControl` to `pub(crate)` and removed them from public crate re-exports (external observers continue using `ChildStatus` / `ChildStatusWatcher` and `ActorContext::{stop, fail}`).
 
 ### Added
 - **Location-Transparent `ask`/`ask_timeout` & `Debug` Implementations for Remote Types (`src/remote/{client,registry,server}.rs`, Finding `F-20`):**

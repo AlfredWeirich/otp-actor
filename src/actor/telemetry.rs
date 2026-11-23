@@ -278,6 +278,7 @@ impl StatusOptions {
 }
 
 /// Distinguishes leaf actors from nested child supervisors in [`ChildStatusEntry`].
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "remote", derive(serde::Serialize, serde::Deserialize))]
 pub enum ChildKind {
@@ -297,6 +298,7 @@ impl ChildKind {
 }
 
 /// Serializable lifecycle state of a supervised child in [`ChildStatusEntry`].
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "remote", derive(serde::Serialize, serde::Deserialize))]
 pub enum ChildLifecycle {

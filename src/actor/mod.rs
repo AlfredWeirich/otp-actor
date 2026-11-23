@@ -111,11 +111,11 @@ pub use model::{
     RestartTracker, RestartType, ShutdownPolicy, SupervisionStrategy, SupervisorError, TaskResult,
 };
 pub use stateful_actor::{
-    ActorClient, ActorContext, ActorControl, ActorError, ActorScope, CallMessage, QueueStats,
-    StatefulActor, StatefulActorBuilder, StatefulActorConfig,
+    ActorClient, ActorContext, ActorError, ActorScope, CallMessage, QueueStats, StatefulActor,
+    StatefulActorBuilder, StatefulActorConfig,
 };
 pub use supervisor::{
-    ChildSnapshot, ChildSpec, ChildStatus, ChildStatusWatcher, ShutdownSignalFn, SlotState,
+    ChildFuture, ChildSnapshot, ChildSpec, ChildStatus, ChildStatusWatcher, ShutdownSignalFn,
     SpawnContext, SubtreeSnapshot, Supervisor, SupervisorBuilder, SupervisorHandle,
     SupervisorSnapshot, SupervisorTreeSnapshot, UntypedActorFactory, UntypedSender,
 };

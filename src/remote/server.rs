@@ -192,7 +192,7 @@ impl ActorNodeService {
     ///
     /// When set to `Some(Duration::ZERO)`, casts without an explicit timeout perform non-blocking
     /// `try_cast` load-shedding (`MailboxFull`) instead of waiting up to
-    /// [`crate::remote::DEFAULT_REMOTE_CAST_TIMEOUT`].
+    /// [`crate::remote::endpoint::DEFAULT_REMOTE_CAST_TIMEOUT`].
     #[must_use]
     pub fn with_default_cast_timeout(mut self, timeout: Option<Duration>) -> Self {
         self.default_cast_timeout = timeout;
@@ -731,7 +731,7 @@ impl ActorNodeBuilder {
     ///
     /// When set to `Some(Duration::ZERO)`, casts without an explicit timeout execute non-blocking
     /// `try_cast` load-shedding (`MailboxFull`) instead of waiting up to
-    /// [`crate::remote::DEFAULT_REMOTE_CAST_TIMEOUT`].
+    /// [`crate::remote::endpoint::DEFAULT_REMOTE_CAST_TIMEOUT`].
     #[must_use]
     pub fn default_cast_timeout(mut self, timeout: Option<Duration>) -> Self {
         self.default_cast_timeout = timeout;

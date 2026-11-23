@@ -3927,13 +3927,13 @@ async fn test_factory_panic_returns_factory_panicked_and_allows_recovery() {
             }
             let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(4);
             let mut shutdown_rx = spawn_ctx.shutdown_rx;
-            let handle = tokio::spawn(async move {
+            let fut = Box::pin(async move {
                 tokio::select! {
                     _ = shutdown_rx.changed() => Ok(()),
                     _ = rx.recv() => Ok(()),
                 }
             });
-            (Arc::new(tx), handle)
+            (Arc::new(tx), fut)
         }),
         RestartPolicy::default(),
     );
@@ -3971,7 +3971,7 @@ async fn test_factory_panic_returns_factory_panicked_and_allows_recovery() {
     // 2. Dynamic start_child factory panic returns Err(FactoryPanicked) immediately
     let dyn_spec = ChildSpec::new(
         "dyn-panicker",
-        Arc::new(|_spawn_ctx| -> (otp_actor::actor::UntypedSender, tokio::task::JoinHandle<otp_actor::actor::TaskResult>) {
+        Arc::new(|_spawn_ctx| -> (otp_actor::actor::UntypedSender, otp_actor::actor::ChildFuture) {
             panic!("dynamic start boom");
         }),
         RestartPolicy::default(),
@@ -3997,13 +3997,13 @@ async fn test_factory_panic_returns_factory_panicked_and_allows_recovery() {
             }
             let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(4);
             let mut shutdown_rx = spawn_ctx.shutdown_rx;
-            let handle = tokio::spawn(async move {
+            let fut = Box::pin(async move {
                 tokio::select! {
                     _ = shutdown_rx.changed() => Ok(()),
                     _ = rx.recv() => Ok(()),
                 }
             });
-            (Arc::new(tx), handle)
+            (Arc::new(tx), fut)
         }),
         RestartPolicy::default(),
     );
@@ -4026,13 +4026,13 @@ async fn test_factory_panic_returns_factory_panicked_and_allows_recovery() {
         Arc::new(|spawn_ctx| {
             let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(4);
             let mut shutdown_rx = spawn_ctx.shutdown_rx;
-            let handle = tokio::spawn(async move {
+            let fut = Box::pin(async move {
                 tokio::select! {
                     _ = shutdown_rx.changed() => Ok(()),
                     _ = rx.recv() => Ok(()),
                 }
             });
-            (Arc::new(tx), handle)
+            (Arc::new(tx), fut)
         }),
         RestartPolicy::default(),
     );
@@ -4063,11 +4063,11 @@ async fn test_factory_panic_during_auto_recovery_retries_and_escalates() {
                 panic!("factory crashed on attempt {n}");
             }
             let (tx, _rx) = tokio::sync::mpsc::channel::<()>(1);
-            let handle = tokio::spawn(async move {
+            let fut = Box::pin(async move {
                 tokio::time::sleep(Duration::from_millis(15)).await;
                 Err("initial worker failure".to_string())
             });
-            (Arc::new(tx), handle)
+            (Arc::new(tx), fut)
         }),
         RestartPolicy::new(2, Duration::from_secs(10))
             .initial_backoff(Duration::from_millis(10))
@@ -4109,11 +4109,11 @@ async fn test_factory_panic_during_auto_recovery_retries_and_escalates() {
                 panic!("escalating factory panic");
             }
             let (tx, _rx) = tokio::sync::mpsc::channel::<()>(1);
-            let handle = tokio::spawn(async move {
+            let fut = Box::pin(async move {
                 tokio::time::sleep(Duration::from_millis(15)).await;
                 Err("trigger escalation".to_string())
             });
-            (Arc::new(tx), handle)
+            (Arc::new(tx), fut)
         }),
         RestartPolicy::new(1, Duration::from_secs(10)).initial_backoff(Duration::ZERO),
     );
@@ -6730,13 +6730,13 @@ async fn test_manual_restart_aborts_dependent_siblings_when_upstream_factory_pan
             );
             let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(4);
             let mut shutdown_rx = spawn_ctx.shutdown_rx;
-            let handle = tokio::spawn(async move {
+            let fut = Box::pin(async move {
                 tokio::select! {
                     _ = shutdown_rx.wait_for(|&s| s) => Ok(()),
                     _ = rx.recv() => Ok(()),
                 }
             });
-            (Arc::new(tx), handle)
+            (Arc::new(tx), fut)
         }),
         RestartPolicy::default(),
     );
@@ -7118,6 +7118,9 @@ async fn test_format_prometheus_metrics_nested_supervisor_path_escaping() {
 #[tokio::test]
 async fn test_tracing_spans_propagate_to_actors_workers_and_scoped_tasks() {
     let _sub_guard = tracing::subscriber::set_default(tracing_subscriber::registry());
+    // Rebuild global callsite interest cache to guard against concurrent callsite registration
+    // from parallel tests running without a subscriber (`tracing-core` callsite race).
+    tracing::callsite::rebuild_interest_cache();
     let root = Supervisor::new("f13-span-root");
 
     // 1. ResourceActor worker inherits `resource_worker` span
@@ -7221,9 +7224,7 @@ async fn test_supervisor_child_order_remains_deduplicated_across_stop_restart_an
 
 #[tokio::test]
 async fn test_config_builders_and_debug_impls_for_public_types() {
-    use otp_actor::{
-        ResourceActorBuilder, ResourceActorConfig, SlotState, SpawnContext, StatefulActorConfig,
-    };
+    use otp_actor::{ResourceActorBuilder, ResourceActorConfig, StatefulActorConfig};
 
     let root = Supervisor::new("f14-config-debug-root");
 
@@ -7311,18 +7312,72 @@ async fn test_config_builders_and_debug_impls_for_public_types() {
     assert!(res_client_dbg.contains("cfg-res-v2"));
     assert!(res_client_dbg.contains("cache_state"));
 
-    // 3. SlotState & SpawnContext Debug formatting
-    assert_eq!(format!("{:?}", SlotState::Stopped), "Stopped");
-    assert!(format!("{:?}", SlotState::Restarting { instance_id: 3 }).contains("instance_id: 3"));
-    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let spawn_ctx = SpawnContext {
-        instance_id: 2,
-        shutdown_rx,
-        supervisor: root.clone(),
-    };
-    let spawn_ctx_dbg = format!("{spawn_ctx:?}");
+    // 3. SpawnContext Debug formatting observed via ChildSpec factory (SpawnContext is #[non_exhaustive])
+    let observed_spawn_ctx_dbg = Arc::new(std::sync::Mutex::new(String::new()));
+    let observed_clone = observed_spawn_ctx_dbg.clone();
+    let dbg_spec = ChildSpec::new(
+        "spawn-ctx-probe",
+        Arc::new(move |spawn_ctx| {
+            *observed_clone.lock().unwrap() = format!("{spawn_ctx:?}");
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
+            let mut shutdown_rx = spawn_ctx.shutdown_rx;
+            let fut = Box::pin(async move {
+                tokio::select! {
+                    _ = shutdown_rx.wait_for(|&s| s) => Ok(()),
+                    _ = rx.recv() => Ok(()),
+                }
+            });
+            (Arc::new(tx), fut)
+        }),
+        RestartPolicy::default(),
+    );
+    root.start_child(dbg_spec).await.unwrap();
+    let spawn_ctx_dbg = observed_spawn_ctx_dbg.lock().unwrap().clone();
     assert!(spawn_ctx_dbg.contains("SpawnContext"));
     assert!(spawn_ctx_dbg.contains("f14-config-debug-root"));
+
+    root.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_single_task_child_future_runs_in_supervisor_join_set_and_recovers_on_panic() {
+    let root = Supervisor::new("f10-single-task-root");
+    let task_ids = Arc::new(std::sync::Mutex::new(Vec::<tokio::task::Id>::new()));
+    let task_ids_clone = task_ids.clone();
+
+    let spec = ChildSpec::new(
+        "direct-joinset-child",
+        Arc::new(move |spawn_ctx| {
+            let ids = task_ids_clone.clone();
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
+            let mut shutdown_rx = spawn_ctx.shutdown_rx;
+            let inst = spawn_ctx.instance_id;
+            let fut = Box::pin(async move {
+                ids.lock().unwrap().push(tokio::task::id());
+                if inst == 1 {
+                    panic!("intentional panic inside direct JoinSet child future");
+                }
+                tokio::select! {
+                    _ = shutdown_rx.wait_for(|&s| s) => Ok(()),
+                    _ = rx.recv() => Ok(()),
+                }
+            });
+            (Arc::new(tx), fut)
+        }),
+        RestartPolicy::new(2, Duration::from_secs(10)).initial_backoff(Duration::from_millis(5)),
+    );
+
+    root.start_child(spec).await.unwrap();
+    let mut watcher = root.watch_child_status("direct-joinset-child").await.unwrap();
+    watcher
+        .wait_for(|status| matches!(status, ChildStatus::Running { instance_id: 2 }))
+        .await
+        .unwrap();
+
+    // Both incarnations ran directly as distinct Tokio tasks owned by Supervisor's JoinSet
+    let recorded = task_ids.lock().unwrap().clone();
+    assert_eq!(recorded.len(), 2);
+    assert_ne!(recorded[0], recorded[1]);
 
     root.shutdown().await.unwrap();
 }

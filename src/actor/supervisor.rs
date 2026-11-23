@@ -9,7 +9,7 @@
 //! - [`RestartType::Transient`], [`RestartType::Permanent`], and [`RestartType::Temporary`]
 //! - [`ShutdownPolicy::Timeout`], [`ShutdownPolicy::BrutalKill`], and [`ShutdownPolicy::Infinity`]
 //! - Rate-limited exponential backoff ([`RestartPolicy`], [`RestartTracker`]) and optional failure escalation (`escalate_on_failure`)
-//! - Lock-free, zero-polling data-plane rebinding via per-child [`tokio::sync::watch`] channels ([`SlotState`])
+//! - Lock-free, zero-polling data-plane rebinding via per-child [`tokio::sync::watch`] channels (`SlotState`)
 //! - Runtime introspection snapshots with built-in timeouts ([`SupervisorHandle::snapshot`], [`SupervisorHandle::snapshot_timeout`]), whole-hierarchy snapshots under one shared deadline ([`SupervisorHandle::snapshot_tree`], [`SupervisorHandle::snapshot_tree_timeout`]), and read-only status observation ([`SupervisorHandle::watch_child_status`]).
 
 use std::any::Any;
@@ -22,7 +22,7 @@ use tokio::sync::{
     mpsc::{self, Receiver, Sender, WeakSender},
     oneshot, watch,
 };
-use tokio::task::{JoinError, JoinHandle, JoinSet};
+use tokio::task::{Id as TaskId, JoinError, JoinSet};
 use tracing::Instrument;
 
 use super::generic_actor::{CacheState, ResourceClient, ResourceEndpoint};
@@ -36,7 +36,11 @@ use super::telemetry::{ActorMetrics, ActorMetricsSnapshot};
 /// Type-erased endpoint handle stored by the supervisor for dynamic client resolution.
 pub type UntypedSender = Arc<dyn Any + Send + Sync>;
 
+/// Boxed future executing a supervised child actor or nested [`Supervisor`] task.
+pub type ChildFuture = Pin<Box<dyn Future<Output = TaskResult> + Send + 'static>>;
+
 /// Context provided by a [`Supervisor`] to a [`ChildSpec`] factory upon initial spawn and every restart.
+#[non_exhaustive]
 #[derive(Clone)]
 pub struct SpawnContext {
     /// Monotonically increasing instance ID (starts at `1` and increments on each supervisor restart).
@@ -57,9 +61,11 @@ impl std::fmt::Debug for SpawnContext {
     }
 }
 
-/// Type-erased factory closure invoked by the [`Supervisor`] to spawn or restart a supervised child.
+/// Type-erased factory closure invoked by the [`Supervisor`] to construct a supervised child's
+/// endpoint and [`ChildFuture`]. The [`Supervisor`] spawns the returned future directly into its
+/// `JoinSet` (single Tokio task per child, no wrapper task).
 pub type UntypedActorFactory =
-    Arc<dyn Fn(SpawnContext) -> (UntypedSender, JoinHandle<TaskResult>) + Send + Sync + 'static>;
+    Arc<dyn Fn(SpawnContext) -> (UntypedSender, ChildFuture) + Send + Sync + 'static>;
 
 /// Optional callback invoked by the supervisor to signal a graceful shutdown or crash to a child.
 pub type ShutdownSignalFn = Arc<dyn Fn(&UntypedSender) + Send + Sync + 'static>;
@@ -77,7 +83,7 @@ pub(crate) type CacheProbeFn =
 /// Data-plane clients ([`ActorClient`], [`ResourceClient`], and child [`SupervisorHandle`]s)
 /// subscribe to a [`watch::Receiver<SlotState>`] to rebind in 0ms without polling loops.
 #[derive(Clone)]
-pub enum SlotState {
+pub(crate) enum SlotState {
     /// The child is actively running with the given `instance_id` and type-erased endpoint.
     Running {
         instance_id: usize,
@@ -110,7 +116,7 @@ impl std::fmt::Debug for SlotState {
 
 /// Public lifecycle status of a supervised child at the time of inspection.
 ///
-/// Mirrors [`SlotState`] without exposing internal communication endpoints (`UntypedSender`).
+/// Mirrors the internal `SlotState` without exposing communication endpoints (`UntypedSender`).
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChildStatus {
@@ -720,8 +726,8 @@ impl SupervisorBuilder {
                 supervisor = %supervisor.name,
                 instance = supervisor.instance_id,
             );
-            let task_handle = tokio::spawn(supervisor.run(rx).instrument(sup_span));
-            (sender_arc, task_handle)
+            let fut: ChildFuture = Box::pin(supervisor.run(rx).instrument(sup_span));
+            (sender_arc, fut)
         });
 
         let shutdown_signal: ShutdownSignalFn = Arc::new(|untyped| {
@@ -1071,7 +1077,8 @@ pub struct Supervisor {
     child_order: Vec<String>,
     next_restart_ticket: u64,
     next_spawn_id: u64,
-    join_set: JoinSet<(String, u64, Result<TaskResult, JoinError>)>,
+    join_set: JoinSet<TaskResult>,
+    task_index: HashMap<TaskId, (String, u64)>,
 }
 
 impl Supervisor {
@@ -1150,6 +1157,7 @@ impl Supervisor {
             next_restart_ticket: 0,
             next_spawn_id: 0,
             join_set: JoinSet::new(),
+            task_index: HashMap::new(),
         }
     }
 
@@ -1164,6 +1172,24 @@ impl Supervisor {
     fn allocate_spawn_id(&mut self) -> u64 {
         self.next_spawn_id = self.next_spawn_id.wrapping_add(1);
         self.next_spawn_id
+    }
+
+    /// Spawns a child's [`ChildFuture`] directly into `self.join_set` as a single Tokio task,
+    /// returning its [`tokio::task::AbortHandle`] and termination watch receiver.
+    fn spawn_child_task(
+        &mut self,
+        child_name: String,
+        spawn_id: u64,
+        child_fut: ChildFuture,
+    ) -> (tokio::task::AbortHandle, watch::Receiver<bool>) {
+        let (term_tx, term_rx) = watch::channel(false);
+        let abort_handle = self.join_set.spawn(async move {
+            let _guard = TermSignalGuard(term_tx);
+            child_fut.await
+        });
+        self.task_index
+            .insert(abort_handle.id(), (child_name, spawn_id));
+        (abort_handle, term_rx)
     }
 
     /// Spawns a child from a [`ChildSpec`], tracking it in `join_set` and `children`.
@@ -1205,7 +1231,7 @@ impl Supervisor {
 
         let spawn_res =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (spec.factory)(spawn_ctx)));
-        let (sender, task_handle) = match spawn_res {
+        let (sender, child_fut) = match spawn_res {
             Ok(pair) => pair,
             Err(panic_err) => {
                 let panic_msg = panic_payload_message(&*panic_err);
@@ -1220,17 +1246,9 @@ impl Supervisor {
             }
         };
 
-        let abort_handle = task_handle.abort_handle();
-        let (term_tx, term_rx) = watch::channel(false);
-        let name_for_task = name.clone();
         let ticket = self.allocate_restart_ticket();
         let spawn_id = self.allocate_spawn_id();
-
-        self.join_set.spawn(async move {
-            let _guard = TermSignalGuard(term_tx);
-            let res = task_handle.await;
-            (name_for_task, spawn_id, res)
-        });
+        let (abort_handle, term_rx) = self.spawn_child_task(name.clone(), spawn_id, child_fut);
 
         let initial_state = SlotState::Running {
             instance_id: inst_id,
@@ -1465,7 +1483,8 @@ impl Supervisor {
         }
 
         // Reap all terminated child tasks from join_set
-        while self.join_set.join_next().await.is_some() {}
+        while self.join_set.join_next_with_id().await.is_some() {}
+        self.task_index.clear();
         self.children.clear();
 
         tracing::info!(
@@ -1582,10 +1601,8 @@ impl Supervisor {
                             "All supervisor handles dropped. Aborting supervised child tasks."
                         );
                         scheduled_restart_rx.close();
-                        // Explicitly clear `children` so `ActiveChild::drop` aborts the inner
-                        // factory-spawned child tasks before `join_set.abort_all()` aborts only
-                        // the monitor wrapper tasks.
                         self.children.clear();
+                        self.task_index.clear();
                         self.join_set.abort_all();
                         return Ok(());
                     };
@@ -1603,8 +1620,12 @@ impl Supervisor {
                     }
                 }
 
-                Some(join_res) = self.join_set.join_next() => {
-                    if let Ok((child_name, spawn_id, task_result)) = join_res {
+                Some(join_res) = self.join_set.join_next_with_id() => {
+                    let (task_id, task_result) = match join_res {
+                        Ok((id, res)) => (id, Ok(res)),
+                        Err(join_err) => (join_err.id(), Err(join_err)),
+                    };
+                    if let Some((child_name, spawn_id)) = self.task_index.remove(&task_id) {
                         self.handle_child_exit(
                             child_name,
                             spawn_id,
@@ -2407,7 +2428,7 @@ impl Supervisor {
                 let spawn_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     (entry.factory)(spawn_ctx)
                 }));
-                let (new_sender, task_handle) = match spawn_res {
+                let (new_sender, child_fut) = match spawn_res {
                     Ok(pair) => pair,
                     Err(panic_err) => {
                         let panic_msg = panic_payload_message(&*panic_err);
@@ -2447,8 +2468,13 @@ impl Supervisor {
                     }
                 };
                 let (term_tx, term_rx) = watch::channel(false);
-                let name_for_task = target_name.clone();
-                entry.abort_handle = Some(task_handle.abort_handle());
+                let abort_handle = self.join_set.spawn(async move {
+                    let _guard = TermSignalGuard(term_tx);
+                    child_fut.await
+                });
+                self.task_index
+                    .insert(abort_handle.id(), (target_name.clone(), new_spawn_id));
+                entry.abort_handle = Some(abort_handle);
                 entry.term_rx = term_rx;
                 entry.shutdown_tx = shutdown_tx;
                 entry.sender = new_sender.clone();
@@ -2460,12 +2486,6 @@ impl Supervisor {
                 for waiter in entry.pending_resolutions.drain(..) {
                     let _ = waiter.send(Ok(new_sender.clone()));
                 }
-
-                self.join_set.spawn(async move {
-                    let _guard = TermSignalGuard(term_tx);
-                    let res = task_handle.await;
-                    (name_for_task, new_spawn_id, res)
-                });
             }
         }
         RestartOutcome::Done(result)
@@ -3177,5 +3197,25 @@ impl SupervisorHandle {
             .send(SupervisorCommand::SimulateCrash)
             .await
             .map_err(|_| SupervisorError::SupervisorUnavailable)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_slot_state_debug_formatting() {
+        assert_eq!(format!("{:?}", SlotState::Stopped), "Stopped");
+        assert!(format!("{:?}", SlotState::Restarting { instance_id: 3 }).contains("instance_id: 3"));
+        let running = SlotState::Running {
+            instance_id: 7,
+            endpoint: Arc::new(()),
+        };
+        let running_dbg = format!("{running:?}");
+        assert!(running_dbg.contains("Running"));
+        assert!(running_dbg.contains("instance_id: 7"));
+        let failed = SlotState::Failed(SupervisorError::ChildNotFound("ghost".to_string()));
+        assert!(format!("{failed:?}").contains("Failed"));
     }
 }
