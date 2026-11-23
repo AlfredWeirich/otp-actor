@@ -4758,26 +4758,33 @@ async fn test_restart_tracker_restarts_in_window_ages_out_without_new_crash() {
     let mut tracker = RestartTracker::new(policy);
 
     assert_eq!(tracker.restarts_in_window(), 0);
+    assert_eq!(tracker.consecutive_failures(), 0);
     assert!(tracker.record_crash().is_some());
     assert!(tracker.record_crash().is_some());
     assert_eq!(tracker.restarts_in_window(), 2);
+    assert_eq!(tracker.consecutive_failures(), 2);
 
     tokio::time::advance(Duration::from_secs(6)).await;
     assert_eq!(tracker.restarts_in_window(), 2);
+    assert_eq!(tracker.consecutive_failures(), 2);
     assert!(tracker.record_crash().is_some());
     assert_eq!(tracker.restarts_in_window(), 3);
+    assert_eq!(tracker.consecutive_failures(), 3);
 
     // Budget exhausted
     assert!(tracker.record_crash().is_none());
     assert_eq!(tracker.restarts_in_window(), 3);
+    assert_eq!(tracker.consecutive_failures(), 3);
 
     // Advance 5s without a new crash: first two (11s old) age out; third (5s old) stays inside 10s window
     tokio::time::advance(Duration::from_secs(5)).await;
     assert_eq!(tracker.restarts_in_window(), 1);
+    assert_eq!(tracker.consecutive_failures(), 3);
 
     // Advance another 6s without a new crash: all three have aged out cleanly
     tokio::time::advance(Duration::from_secs(6)).await;
     assert_eq!(tracker.restarts_in_window(), 0);
+    assert_eq!(tracker.consecutive_failures(), 0);
 }
 
 #[tokio::test]
@@ -8203,6 +8210,129 @@ async fn test_actor_context_client_try_cast_rebinds_synchronously_after_actor_re
 
     assert_eq!(recorded.lock().unwrap().as_slice(), &[(99, 2)]);
     assert!(!self_client.queue_stats().is_closed);
+
+    root.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_consecutive_failures_ages_out_and_child_supervisor_started_at_and_snapshot_tree_no_backoff_stall() {
+    let root = Supervisor::new("f05-f07-f12-root");
+
+    // 1. Spawn a fast-restarting child supervisor with a nested grandchild (for F-12 + F-07)
+    //    and a slow-backoff child supervisor (for F-07).
+    let t_before_spawn = std::time::Instant::now();
+    let fast_sup = Supervisor::builder("fast-sup")
+        .restart_type(RestartType::Permanent)
+        .restart_policy(
+            RestartPolicy::new(5, Duration::from_secs(10))
+                .initial_backoff(Duration::from_millis(10))
+                .max_backoff(Duration::from_millis(10)),
+        )
+        .add_child(Supervisor::builder("grandchild-sup"))
+        .spawn(&root)
+        .await
+        .unwrap();
+    let t_after_spawn = std::time::Instant::now();
+    let initial_started_at = fast_sup.started_at();
+    assert!(initial_started_at >= t_before_spawn && initial_started_at <= t_after_spawn);
+
+    let slow_sup = Supervisor::builder("slow-sup")
+        .restart_type(RestartType::Permanent)
+        .restart_policy(
+            RestartPolicy::new(5, Duration::from_secs(60)).initial_backoff(Duration::from_secs(30)),
+        )
+        .spawn(&root)
+        .await
+        .unwrap();
+
+    // 2. F-05: In a live supervisor, consecutive_failures is 1 after recovery within time_window,
+    //    then ages out to 0 once time_window elapses without another crash.
+    let worker = StatefulActorBuilder::from_default::<CounterActor>("worker-f05")
+        .restart_type(RestartType::Permanent)
+        .restart_policy(
+            RestartPolicy::new(5, Duration::from_millis(350))
+                .initial_backoff(Duration::from_millis(5))
+                .max_backoff(Duration::from_millis(5)),
+        )
+        .spawn(&root)
+        .await
+        .unwrap();
+    let mut worker_watch = root.watch_child_status("worker-f05").await.unwrap();
+
+    worker.cast(CounterMsg::TriggerFatalError).await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        worker_watch.wait_for(|s| matches!(s, ChildStatus::Running { instance_id: 2 })),
+    )
+    .await
+    .expect("Timed out waiting for worker-f05 restart")
+    .expect("Watch closed");
+
+    let snap_recent = root.snapshot().await.unwrap();
+    let worker_recent = snap_recent.child("worker-f05").unwrap();
+    assert_eq!(worker_recent.restarts_in_window, 1);
+    assert_eq!(worker_recent.consecutive_failures, 1);
+
+    // Waiting 380ms both expires the 350ms F-05 window AND lets wall-clock uptime accrue for F-12.
+    tokio::time::sleep(Duration::from_millis(380)).await;
+
+    let snap_aged = root.snapshot().await.unwrap();
+    let worker_aged = snap_aged.child("worker-f05").unwrap();
+    assert_eq!(worker_aged.restarts_in_window, 0);
+    assert_eq!(worker_aged.consecutive_failures, 0);
+
+    // 3. F-12: Calling get_supervisor("fast-sup") after uptime has accrued preserves its original
+    //    started_at() and LocalNodeMonitor uptime instead of resetting to Instant::now().
+    let t_before_lookup = std::time::Instant::now();
+    let looked_up = root.get_supervisor("fast-sup").await.unwrap();
+    assert_eq!(looked_up.started_at(), initial_started_at);
+    assert!(looked_up.started_at() < t_before_lookup);
+    assert!(looked_up.uptime() >= Duration::from_millis(350));
+    assert!(LocalNodeMonitor::new(looked_up.clone()).uptime() >= Duration::from_millis(350));
+
+    // After fast-sup restarts into instance 2, started_at() updates to the new incarnation's timestamp.
+    let mut fast_watch = root.watch_child_status("fast-sup").await.unwrap();
+    let t_before_restart = std::time::Instant::now();
+    fast_sup.simulate_crash().await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        fast_watch.wait_for(|s| matches!(s, ChildStatus::Running { instance_id: 2 })),
+    )
+    .await
+    .expect("Timed out waiting for fast-sup restart")
+    .expect("Watch closed");
+    assert!(looked_up.started_at() >= t_before_restart);
+    assert!(looked_up.started_at() > initial_started_at);
+    let refreshed = root.get_supervisor("fast-sup").await.unwrap();
+    assert_eq!(refreshed.started_at(), looked_up.started_at());
+
+    // 4. F-07: When slow-sup enters a 30s Restarting backoff, snapshot_tree_timeout returns
+    //    immediately with SupervisorUnavailable for slow-sup while still returning fast-sup -> grandchild-sup.
+    let mut slow_watch = root.watch_child_status("slow-sup").await.unwrap();
+    slow_sup.simulate_crash().await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        slow_watch.wait_for(|s| s.is_restarting()),
+    )
+    .await
+    .expect("Timed out waiting for slow-sup backoff")
+    .expect("Watch closed");
+
+    let t_tree = std::time::Instant::now();
+    let tree = root
+        .snapshot_tree_timeout(Duration::from_millis(200))
+        .await
+        .unwrap();
+    assert!(
+        t_tree.elapsed() < Duration::from_millis(120),
+        "snapshot_tree_timeout stalled on 30s backoff: {:?}",
+        t_tree.elapsed()
+    );
+    assert!(tree.find(&["fast-sup", "grandchild-sup"]).is_some());
+    assert_eq!(
+        tree.subtree("slow-sup").unwrap().result,
+        Err(SupervisorError::SupervisorUnavailable)
+    );
 
     root.shutdown().await.unwrap();
 }

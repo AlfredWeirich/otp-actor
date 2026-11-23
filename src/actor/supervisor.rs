@@ -86,9 +86,10 @@ pub(crate) type CacheProbeFn =
 /// subscribe to a [`watch::Receiver<SlotState>`] to rebind in 0ms without polling loops.
 #[derive(Clone)]
 pub(crate) enum SlotState {
-    /// The child is actively running with the given `instance_id` and type-erased endpoint.
+    /// The child is actively running with the given `instance_id`, startup timestamp, and type-erased endpoint.
     Running {
         instance_id: usize,
+        started_at: Instant,
         endpoint: UntypedSender,
     },
     /// The child is currently shutting down or waiting in exponential backoff before restarting.
@@ -805,6 +806,9 @@ impl From<SupervisorBuilder> for ChildSpec {
     }
 }
 
+type ChildSupervisorEndpoint = (Sender<SupervisorCommand>, watch::Receiver<bool>);
+type ChildSupervisorSenders = Vec<(String, Result<ChildSupervisorEndpoint, SupervisorError>)>;
+
 /// Internal commands processed by a [`Supervisor`].
 pub(crate) enum SupervisorCommand {
     /// Starts and supervises a child from a [`ChildSpec`].
@@ -831,6 +835,11 @@ pub(crate) enum SupervisorCommand {
     /// Captures a point-in-time [`SupervisorSnapshot`] of this supervisor and its children.
     Snapshot {
         respond_to: oneshot::Sender<SupervisorSnapshot>,
+    },
+    /// Captures a point-in-time [`SupervisorSnapshot`] along with direct command senders
+    /// (or current failure reasons) for all immediate child supervisors (`is_supervisor`).
+    SnapshotLevel {
+        respond_to: oneshot::Sender<(SupervisorSnapshot, ChildSupervisorSenders)>,
     },
     /// Manually restarts or recovers a child (and any strategy-coupled siblings), resetting backoff limits.
     RestartChild {
@@ -1260,8 +1269,10 @@ impl Supervisor {
         let spawn_id = self.allocate_spawn_id();
         let (abort_handle, term_rx) = self.spawn_child_task(name.clone(), spawn_id, child_fut);
 
+        let instance_started_at = Instant::now();
         let initial_state = SlotState::Running {
             instance_id: inst_id,
+            started_at: instance_started_at,
             endpoint: sender.clone(),
         };
         let existing = self.children.remove(name);
@@ -1290,7 +1301,7 @@ impl Supervisor {
                 queue_probe: spec.queue_probe.clone(),
                 cache_probe: spec.cache_probe.clone(),
                 instance_id: inst_id,
-                instance_started_at: Instant::now(),
+                instance_started_at,
                 restarts_total: prev_restarts_total,
                 spawn_id,
                 restart_ticket: ticket,
@@ -1744,6 +1755,44 @@ impl Supervisor {
         }
     }
 
+    /// Builds a [`SupervisorSnapshot`] paired with direct command channels for all `is_supervisor`
+    /// children so `snapshot_tree_timeout` avoids `ResolveChildSlot` roundtrips and never
+    /// blocks on `SlotState::Restarting` backoff timers.
+    fn build_level_snapshot(&self) -> (SupervisorSnapshot, ChildSupervisorSenders) {
+        let snapshot = self.build_snapshot();
+        let child_supervisors = snapshot
+            .children
+            .iter()
+            .filter(|c| c.is_supervisor)
+            .map(|child_snap| {
+                let res = match &child_snap.status {
+                    ChildStatus::Running { .. } => {
+                        if let Some(child) = self.children.get(&child_snap.name) {
+                            if *child.term_rx.borrow() {
+                                Err(SupervisorError::SupervisorUnavailable)
+                            } else if let Some(tx) =
+                                child.sender.downcast_ref::<Sender<SupervisorCommand>>()
+                            {
+                                Ok((tx.clone(), child.term_rx.clone()))
+                            } else {
+                                Err(SupervisorError::ChildTypeMismatch(child_snap.name.clone()))
+                            }
+                        } else {
+                            Err(SupervisorError::ChildNotFound(child_snap.name.clone()))
+                        }
+                    }
+                    ChildStatus::Failed(err) => Err(err.clone()),
+                    ChildStatus::Stopped => {
+                        Err(SupervisorError::ChildNotFound(child_snap.name.clone()))
+                    }
+                    ChildStatus::Restarting { .. } => Err(SupervisorError::SupervisorUnavailable),
+                };
+                (child_snap.name.clone(), res)
+            })
+            .collect();
+        (snapshot, child_supervisors)
+    }
+
     /// Processes a single incoming [`SupervisorCommand`], returning `Some(TaskResult)` when
     /// the supervisor event loop should terminate (e.g. `Shutdown`, `SimulateCrash`, or escalation).
     async fn handle_command(
@@ -1837,6 +1886,10 @@ impl Supervisor {
 
             SupervisorCommand::Snapshot { respond_to } => {
                 let _ = respond_to.send(self.build_snapshot());
+            }
+
+            SupervisorCommand::SnapshotLevel { respond_to } => {
+                let _ = respond_to.send(self.build_level_snapshot());
             }
 
             SupervisorCommand::RestartChild {
@@ -2477,7 +2530,8 @@ impl Supervisor {
                 }
                 entry.instance_id += 1;
                 entry.restarts_total = entry.restarts_total.saturating_add(1);
-                entry.instance_started_at = Instant::now();
+                let instance_started_at = Instant::now();
+                entry.instance_started_at = instance_started_at;
                 let new_inst = entry.instance_id;
                 entry.spawn_id = new_spawn_id;
                 entry.phase = ChildPhase::Running;
@@ -2553,6 +2607,7 @@ impl Supervisor {
                 entry.sender = new_sender.clone();
                 entry.slot_tx.send_replace(SlotState::Running {
                     instance_id: new_inst,
+                    started_at: instance_started_at,
                     endpoint: new_sender.clone(),
                 });
 
@@ -2625,6 +2680,7 @@ impl SupervisorHandle {
         sender: Sender<SupervisorCommand>,
         slot_rx: watch::Receiver<SlotState>,
         parent: SupervisorHandle,
+        started_at: Instant,
     ) -> Self {
         Self {
             name: name.into(),
@@ -2633,7 +2689,7 @@ impl SupervisorHandle {
                 slot_rx: Some(Arc::new(RwLock::new(slot_rx))),
             },
             parent: Some(Arc::new(parent)),
-            started_at: Instant::now(),
+            started_at,
         }
     }
 
@@ -2666,7 +2722,7 @@ impl SupervisorHandle {
                         sender: Arc::new(RwLock::new(weak)),
                     },
                     parent: self.parent.as_ref().map(|p| Arc::new(p.downgrade())),
-                    started_at: self.started_at,
+                    started_at: self.started_at(),
                 }
             }
             SupervisorChannel::Weak { .. } => self.clone(),
@@ -2679,16 +2735,27 @@ impl SupervisorHandle {
         &self.name
     }
 
-    /// Returns the [`Instant`] at which this handle's supervisor was created.
+    /// Returns the [`Instant`] at which this handle's supervisor was created (or last restarted).
     #[must_use]
     pub fn started_at(&self) -> Instant {
+        if let SupervisorChannel::Strong {
+            slot_rx: Some(slot_lock),
+            ..
+        } = &self.channel
+            && let SlotState::Running { started_at, .. } = &*slot_lock
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .borrow()
+        {
+            return *started_at;
+        }
         self.started_at
     }
 
-    /// Returns the elapsed uptime since this handle's supervisor was created.
+    /// Returns the elapsed uptime since this handle's supervisor was created (or last restarted).
     #[must_use]
     pub fn uptime(&self) -> Duration {
-        self.started_at.elapsed()
+        self.started_at().elapsed()
     }
 
     /// Returns `true` if the supervisor's command channel is still open (zero-hop liveness check).
@@ -3012,6 +3079,14 @@ impl SupervisorHandle {
             .await
     }
 
+    /// Requests a [`SupervisorSnapshot`] plus direct child supervisor senders without a deadline of its own.
+    async fn snapshot_level_untimed(
+        &self,
+    ) -> Result<(SupervisorSnapshot, ChildSupervisorSenders), SupervisorError> {
+        self.send_request(|respond_to| SupervisorCommand::SnapshotLevel { respond_to })
+            .await
+    }
+
     /// Captures a point-in-time [`SupervisorTreeSnapshot`] of this supervisor and all nested child
     /// supervisors with the default [`DEFAULT_SNAPSHOT_TIMEOUT`].
     ///
@@ -3043,99 +3118,105 @@ impl SupervisorHandle {
     }
 
     /// Recursively collects the tree below this supervisor, honoring the shared `deadline`.
-    fn collect_tree(
+    async fn collect_tree(
         &self,
         deadline: tokio::time::Instant,
         timeout: Duration,
-    ) -> Pin<Box<dyn Future<Output = Result<SupervisorTreeSnapshot, SupervisorError>> + Send + '_>>
-    {
-        Box::pin(async move {
-            let snapshot = tokio::time::timeout_at(deadline, self.snapshot_untimed())
+    ) -> Result<SupervisorTreeSnapshot, SupervisorError> {
+        let (snapshot, child_supervisors) =
+            tokio::time::timeout_at(deadline, self.snapshot_level_untimed())
                 .await
                 .map_err(|_| SupervisorError::Timeout(timeout))??;
+        Self::collect_tree_from_level(snapshot, child_supervisors, deadline, timeout).await
+    }
 
-            let supervisor_children: Vec<&ChildSnapshot> = snapshot
-                .children
-                .iter()
-                .filter(|c| c.is_supervisor)
-                .collect();
-            let mut slots: Vec<Option<SubtreeSnapshot>> =
-                (0..supervisor_children.len()).map(|_| None).collect();
-            let mut pending: JoinSet<(usize, SubtreeSnapshot)> = JoinSet::new();
-
-            for (idx, child) in supervisor_children.iter().enumerate() {
-                let child_name = child.name.clone();
-                match &child.status {
-                    ChildStatus::Running { .. } => {
-                        let parent = self.clone();
-                        pending.spawn(
-                            async move {
-                                let result = tokio::time::timeout_at(
-                                    deadline,
-                                    Self::collect_child_tree(
-                                        &parent,
-                                        &child_name,
-                                        deadline,
-                                        timeout,
-                                    ),
-                                )
-                                .await
-                                .unwrap_or(Err(SupervisorError::Timeout(timeout)));
-                                (idx, SubtreeSnapshot { child_name, result })
-                            }
-                            .in_current_span(),
-                        );
-                    }
-                    other => {
-                        let reason = match other {
-                            ChildStatus::Failed(err) => err.clone(),
-                            ChildStatus::Stopped => {
-                                SupervisorError::ChildNotFound(child_name.clone())
-                            }
-                            _ => SupervisorError::SupervisorUnavailable,
-                        };
-                        if let Some(slot) = slots.get_mut(idx) {
-                            *slot = Some(SubtreeSnapshot {
-                                child_name,
-                                result: Err(reason),
-                            });
-                        }
-                    }
-                }
+    /// Collects the subtree rooted at a child supervisor directly via its command sender.
+    fn collect_tree_from_sender(
+        endpoint: ChildSupervisorEndpoint,
+        deadline: tokio::time::Instant,
+        timeout: Duration,
+    ) -> Pin<Box<dyn Future<Output = Result<SupervisorTreeSnapshot, SupervisorError>> + Send>> {
+        Box::pin(async move {
+            let (cmd_sender, mut term_rx) = endpoint;
+            let (tx, rx) = oneshot::channel();
+            if cmd_sender
+                .send(SupervisorCommand::SnapshotLevel { respond_to: tx })
+                .await
+                .is_err()
+            {
+                let _ = term_rx.wait_for(|&done| done).await;
+                return Err(SupervisorError::SupervisorUnavailable);
             }
-
-            while let Some(joined) = pending.join_next().await {
-                if let Ok((idx, subtree)) = joined
-                    && let Some(slot) = slots.get_mut(idx)
-                {
-                    *slot = Some(subtree);
-                }
-            }
-
-            let subtrees = supervisor_children
-                .iter()
-                .zip(slots)
-                .map(|(child, slot)| {
-                    slot.unwrap_or_else(|| SubtreeSnapshot {
-                        child_name: child.name.clone(),
-                        result: Err(SupervisorError::SupervisorUnavailable),
-                    })
-                })
-                .collect();
-
-            Ok(SupervisorTreeSnapshot { snapshot, subtrees })
+            let Ok((snapshot, child_supervisors)) = rx.await else {
+                let _ = term_rx.wait_for(|&done| done).await;
+                return Err(SupervisorError::SupervisorUnavailable);
+            };
+            Self::collect_tree_from_level(snapshot, child_supervisors, deadline, timeout).await
         })
     }
 
-    /// Resolves the child supervisor `child_name` below `parent` and collects its subtree.
-    async fn collect_child_tree(
-        parent: &SupervisorHandle,
-        child_name: &str,
+    /// Fans out concurrent child subtree queries for one supervisor level under the shared `deadline`.
+    async fn collect_tree_from_level(
+        snapshot: SupervisorSnapshot,
+        child_supervisors: ChildSupervisorSenders,
         deadline: tokio::time::Instant,
         timeout: Duration,
     ) -> Result<SupervisorTreeSnapshot, SupervisorError> {
-        let child = parent.get_supervisor(child_name).await?;
-        child.collect_tree(deadline, timeout).await
+        let mut slots: Vec<Option<SubtreeSnapshot>> =
+            (0..child_supervisors.len()).map(|_| None).collect();
+        let mut pending: JoinSet<(usize, SubtreeSnapshot)> = JoinSet::new();
+        let child_names: Vec<String> = child_supervisors
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect();
+
+        for (idx, (child_name, sender_res)) in child_supervisors.into_iter().enumerate() {
+            match sender_res {
+                Ok(child_tx) => {
+                    pending.spawn(
+                        async move {
+                            let result = tokio::time::timeout_at(
+                                deadline,
+                                Self::collect_tree_from_sender(child_tx, deadline, timeout),
+                            )
+                            .await
+                            .unwrap_or(Err(SupervisorError::Timeout(timeout)));
+                            (idx, SubtreeSnapshot { child_name, result })
+                        }
+                        .in_current_span(),
+                    );
+                }
+                Err(reason) => {
+                    if let Some(slot) = slots.get_mut(idx) {
+                        *slot = Some(SubtreeSnapshot {
+                            child_name,
+                            result: Err(reason),
+                        });
+                    }
+                }
+            }
+        }
+
+        while let Some(joined) = pending.join_next().await {
+            if let Ok((idx, subtree)) = joined
+                && let Some(slot) = slots.get_mut(idx)
+            {
+                *slot = Some(subtree);
+            }
+        }
+
+        let subtrees = child_names
+            .into_iter()
+            .zip(slots)
+            .map(|(child_name, slot)| {
+                slot.unwrap_or(SubtreeSnapshot {
+                    child_name,
+                    result: Err(SupervisorError::SupervisorUnavailable),
+                })
+            })
+            .collect();
+
+        Ok(SupervisorTreeSnapshot { snapshot, subtrees })
     }
 
     /// Returns a read-only [`ChildStatusWatcher`] for `child_name` backed by the supervisor's
@@ -3163,16 +3244,20 @@ impl SupervisorHandle {
     async fn resolve_running_endpoint<E: Clone + Send + Sync + 'static>(
         &self,
         child_name: String,
-    ) -> Result<(String, E, watch::Receiver<SlotState>), SupervisorError> {
+    ) -> Result<(String, E, watch::Receiver<SlotState>, Instant), SupervisorError> {
         let mut slot_rx = self.resolve_child_slot(&child_name).await?;
         let state = slot_rx
             .wait_for(|s| !matches!(s, SlotState::Restarting { .. }))
             .await
             .map_err(|_| SupervisorError::SupervisorUnavailable)?;
-        let endpoint = match &*state {
-            SlotState::Running { endpoint, .. } => {
+        let (endpoint, started_at) = match &*state {
+            SlotState::Running {
+                endpoint,
+                started_at,
+                ..
+            } => {
                 if let Some(ep) = endpoint.downcast_ref::<E>() {
-                    ep.clone()
+                    (ep.clone(), *started_at)
                 } else {
                     return Err(SupervisorError::ChildTypeMismatch(child_name));
                 }
@@ -3183,7 +3268,7 @@ impl SupervisorHandle {
         };
         drop(state);
 
-        Ok((child_name, endpoint, slot_rx))
+        Ok((child_name, endpoint, slot_rx, started_at))
     }
 
     /// Retrieves a direct [`ResourceClient`] data-plane handle for a supervised [`super::generic_actor::ResourceActor`].
@@ -3194,7 +3279,7 @@ impl SupervisorHandle {
         &self,
         child_name: impl Into<String>,
     ) -> Result<ResourceClient<T, E>, SupervisorError> {
-        let (name, endpoint, slot_rx) = self
+        let (name, endpoint, slot_rx, _) = self
             .resolve_running_endpoint::<ResourceEndpoint<T, E>>(child_name.into())
             .await?;
         Ok(ResourceClient::new(name, endpoint, slot_rx, self.clone()))
@@ -3205,7 +3290,7 @@ impl SupervisorHandle {
         &self,
         child_name: impl Into<String>,
     ) -> Result<ActorClient<A>, SupervisorError> {
-        let (name, sender, slot_rx) = self
+        let (name, sender, slot_rx, _) = self
             .resolve_running_endpoint::<Sender<ActorEnvelope<A>>>(child_name.into())
             .await?;
         Ok(ActorClient::new(name, sender, slot_rx, self.clone()))
@@ -3216,7 +3301,7 @@ impl SupervisorHandle {
         &self,
         child_name: impl Into<String>,
     ) -> Result<SupervisorHandle, SupervisorError> {
-        let (name, sender, slot_rx) = self
+        let (name, sender, slot_rx, started_at) = self
             .resolve_running_endpoint::<Sender<SupervisorCommand>>(child_name.into())
             .await?;
         Ok(SupervisorHandle::new_child_handle(
@@ -3224,6 +3309,7 @@ impl SupervisorHandle {
             sender,
             slot_rx,
             self.clone(),
+            started_at,
         ))
     }
 
@@ -3283,6 +3369,7 @@ mod tests {
         assert!(format!("{:?}", SlotState::Restarting { instance_id: 3 }).contains("instance_id: 3"));
         let running = SlotState::Running {
             instance_id: 7,
+            started_at: Instant::now(),
             endpoint: Arc::new(()),
         };
         let running_dbg = format!("{running:?}");

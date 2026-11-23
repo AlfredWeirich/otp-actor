@@ -153,6 +153,19 @@ impl ActorNodeRegistry {
         self.len() == 0
     }
 
+    /// Returns `true` if at least one registered endpoint currently reports a closed mailbox.
+    pub(crate) fn has_closed_endpoint(&self) -> bool {
+        let map = self
+            .endpoints
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        map.values().any(|actors| {
+            actors
+                .values()
+                .any(|ep| ep.queue_stats().is_some_and(|q| q.is_closed))
+        })
+    }
+
     /// Captures point-in-time queue statistics for all registered endpoints, sorted deterministically.
     pub fn snapshot_endpoints(&self) -> Vec<RegisteredEndpointStatus> {
         let items: Vec<(String, String, Arc<dyn ByteEndpoint>)> = {

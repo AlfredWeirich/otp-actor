@@ -918,6 +918,8 @@ async fn test_admin_service_health_status_authorizer_and_registry_only_mode() {
     };
     let decoded: NodeStatus = postcard::from_bytes(&bytes).unwrap();
     assert_eq!(decoded.health.state, HealthState::Healthy);
+    assert_eq!(decoded.summary.running_children, 1);
+    assert_eq!(decoded.summary.stopped_children, 0);
     assert!(decoded.supervision_tree.is_none());
     assert_eq!(decoded.registered_endpoints.len(), 1);
     assert_eq!(decoded.registered_endpoints[0].service_name, "admin-svc");
@@ -934,6 +936,43 @@ async fn test_admin_service_health_status_authorizer_and_registry_only_mode() {
     assert!(prom.contains("# HELP otp_actor_remote_incompatible_protocol_total "));
     assert!(prom.contains("# TYPE otp_actor_remote_incompatible_protocol_total counter\n"));
     assert!(prom.contains("otp_actor_remote_incompatible_protocol_total 1\n"));
+
+    // 4. Stopping the sole registered actor degrades registry-only health and updates summary counts (F-12)
+    svc.stop_child("calc").await.unwrap();
+
+    let mut degraded_health_req = tonic::Request::new(HealthRequest {
+        protocol_version: REMOTE_PROTOCOL_VERSION,
+    });
+    degraded_health_req
+        .metadata_mut()
+        .insert("authorization", "Bearer admin-token".parse().unwrap());
+    let degraded_health = admin_svc
+        .health(degraded_health_req)
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(degraded_health.alive);
+    assert_eq!(degraded_health.state, "degraded");
+
+    let mut degraded_status_req = tonic::Request::new(StatusRequest {
+        protocol_version: REMOTE_PROTOCOL_VERSION,
+        timeout_ms: Some(1000),
+        include_tree: true,
+        include_child_details: false,
+    });
+    degraded_status_req
+        .metadata_mut()
+        .insert("authorization", "Bearer admin-token".parse().unwrap());
+    let degraded_status_resp = admin_svc.status(degraded_status_req).await.unwrap().into_inner();
+    let StatusResult::StatusPayload(degraded_bytes) = degraded_status_resp.result.unwrap() else {
+        panic!("Expected StatusPayload");
+    };
+    let degraded_decoded: NodeStatus = postcard::from_bytes(&degraded_bytes).unwrap();
+    assert!(degraded_decoded.health.alive);
+    assert_eq!(degraded_decoded.health.state, HealthState::Degraded);
+    assert_eq!(degraded_decoded.summary.total_actors, 1);
+    assert_eq!(degraded_decoded.summary.running_children, 0);
+    assert_eq!(degraded_decoded.summary.stopped_children, 1);
 
     // Ensure StatusOptions::default() stays aligned
     assert!(StatusOptions::default().include_tree);

@@ -493,9 +493,14 @@ impl ActorNodeAdminService {
                 uptime_seconds,
             };
         }
+        let state = if self.registry.has_closed_endpoint() {
+            HealthState::Degraded
+        } else {
+            HealthState::Healthy
+        };
         NodeHealth {
             alive: true,
-            state: HealthState::Healthy,
+            state,
             uptime_seconds,
         }
     }
@@ -598,6 +603,11 @@ impl ActorNodeAdmin for ActorNodeAdminService {
             };
             for ep in &registered_endpoints {
                 if let Some(q) = &ep.queue {
+                    if q.is_closed {
+                        summary.stopped_children += 1;
+                    } else {
+                        summary.running_children += 1;
+                    }
                     summary.total_queued_messages =
                         summary.total_queued_messages.saturating_add(q.queued);
                     if q.is_full() {
@@ -605,8 +615,12 @@ impl ActorNodeAdmin for ActorNodeAdminService {
                     }
                 }
             }
+            let mut health = self.compute_fast_health();
+            if health.state == HealthState::Healthy && summary.stopped_children > 0 {
+                health.state = HealthState::Degraded;
+            }
             NodeStatus {
-                health: self.compute_fast_health(),
+                health,
                 timestamp_unix: SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()

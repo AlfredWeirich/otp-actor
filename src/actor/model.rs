@@ -199,16 +199,27 @@ impl RestartTracker {
         now.saturating_duration_since(recorded_at) <= window
     }
 
-    /// Returns the number of consecutive failures within the active window.
+    /// Returns the number of consecutive failures within the active window, or `0` once a full
+    /// [`RestartPolicy::time_window`] has elapsed since the most recent failure without another crash.
     #[must_use]
     pub fn consecutive_failures(&self) -> usize {
-        self.consecutive_failures
+        let now = Instant::now();
+        let window = self.policy.time_window;
+        if self
+            .restarts
+            .last()
+            .is_some_and(|&t| Self::is_within_window(t, now, window))
+        {
+            self.consecutive_failures
+        } else {
+            0
+        }
     }
 
     /// Returns the number of restarts currently inside [`RestartPolicy::time_window`].
     ///
-    /// Unlike [`Self::consecutive_failures`], expired crash timestamps age out dynamically even
-    /// when no recent crash has occurred, making this metric directly suitable for flapping checks.
+    /// Expired crash timestamps age out dynamically even when no recent crash has occurred,
+    /// making this metric directly suitable for sliding-window flapping checks.
     #[must_use]
     pub fn restarts_in_window(&self) -> usize {
         let now = Instant::now();
