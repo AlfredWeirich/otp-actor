@@ -8734,3 +8734,74 @@ async fn test_f11_prometheus_registered_endpoints_and_f14_api_symmetry_and_clamp
 
     root.shutdown().await.unwrap();
 }
+
+#[test]
+fn test_f15_restart_policy_eq_and_child_status_lifecycle_bridge() {
+    fn assert_eq_trait<T: Eq>() {}
+    assert_eq_trait::<RestartPolicy>();
+
+    let base = RestartPolicy::new(3, Duration::from_secs(15)).backoff_multiplier(1.0);
+    for invalid in [0.5_f64, -2.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let clamped = RestartPolicy::new(3, Duration::from_secs(15)).backoff_multiplier(invalid);
+        assert_eq!(clamped.backoff_multiplier, 1.0);
+        assert_eq!(clamped, base);
+    }
+
+    // Even direct field assignment of NaN or -0.0 satisfies Eq reflexivity via canonical bit comparison.
+    let mut manual_nan = RestartPolicy::default();
+    manual_nan.backoff_multiplier = f64::NAN;
+    assert_eq!(manual_nan, manual_nan);
+    let mut neg_zero = RestartPolicy::default();
+    neg_zero.backoff_multiplier = -0.0;
+    let mut pos_zero = RestartPolicy::default();
+    pos_zero.backoff_multiplier = 0.0;
+    assert_eq!(neg_zero, pos_zero);
+
+    let sup_err = SupervisorError::MaxRestartsExceeded(
+        "worker".into(),
+        3,
+        Duration::from_secs(10),
+    );
+    let statuses = [
+        (ChildStatus::Running { instance_id: 2 }, "running"),
+        (ChildStatus::Restarting { instance_id: 2 }, "restarting"),
+        (ChildStatus::Stopped, "stopped"),
+        (ChildStatus::Failed(sup_err.clone()), "failed"),
+    ];
+
+    for (status, expected_label) in statuses {
+        assert_eq!(status.as_str(), expected_label);
+        let lifecycle = status.to_lifecycle();
+        assert_eq!(lifecycle, ChildLifecycle::from(status.clone()));
+        assert_eq!(status, lifecycle);
+        assert_eq!(lifecycle, status);
+        assert_eq!(lifecycle.as_str(), expected_label);
+        assert_eq!(lifecycle.is_running(), status.is_running());
+        assert_eq!(lifecycle.is_restarting(), status.is_restarting());
+        assert_eq!(lifecycle.is_stopped(), status.is_stopped());
+        assert_eq!(lifecycle.is_failed(), status.is_failed());
+    }
+
+    let failed_status = ChildStatus::Failed(sup_err.clone());
+    assert_eq!(failed_status.failure_error(), Some(&sup_err));
+    assert!(ChildStatus::Stopped.failure_error().is_none());
+
+    let failed_lifecycle = failed_status.to_lifecycle();
+    assert_eq!(
+        failed_lifecycle.failure_reason(),
+        Some(sup_err.to_string().as_str())
+    );
+    assert!(ChildLifecycle::Running.failure_reason().is_none());
+
+    #[cfg(feature = "remote")]
+    {
+        let err_bytes = postcard::to_stdvec(&sup_err).unwrap();
+        let err_roundtrip: SupervisorError = postcard::from_bytes(&err_bytes).unwrap();
+        assert_eq!(err_roundtrip, sup_err);
+
+        let status_bytes = postcard::to_stdvec(&failed_status).unwrap();
+        let status_roundtrip: ChildStatus = postcard::from_bytes(&status_bytes).unwrap();
+        assert_eq!(status_roundtrip, failed_status);
+        assert_eq!(status_roundtrip, failed_lifecycle);
+    }
+}

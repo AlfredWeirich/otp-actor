@@ -95,7 +95,7 @@ pub enum SupervisionStrategy {
 
 /// Configuration defining restart rate-limiting and exponential backoff behavior for supervised children.
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy)]
 pub struct RestartPolicy {
     /// Maximum number of restarts allowed within the time window.
     pub max_restarts: usize,
@@ -110,6 +110,27 @@ pub struct RestartPolicy {
 }
 
 impl RestartPolicy {
+    /// Normalizes the exponential backoff multiplier so non-finite or `< 1.0` values clamp to `1.0`.
+    #[inline]
+    fn normalize_multiplier(backoff_multiplier: f64) -> f64 {
+        if backoff_multiplier.is_finite() && backoff_multiplier >= 1.0 {
+            backoff_multiplier
+        } else {
+            1.0
+        }
+    }
+
+    #[inline]
+    fn canonical_f64_bits(value: f64) -> u64 {
+        if value.is_nan() {
+            f64::NAN.to_bits()
+        } else if value == 0.0 {
+            0.0_f64.to_bits()
+        } else {
+            value.to_bits()
+        }
+    }
+
     /// Creates a new [`RestartPolicy`] with the given `max_restarts` and `time_window`,
     /// using default backoff settings (`50ms` initial, `2s` max, `2.0x` multiplier).
     #[must_use]
@@ -150,13 +171,26 @@ impl RestartPolicy {
     }
 
     /// Sets the exponential backoff multiplier applied on each consecutive restart.
-    /// Non-finite values or multipliers `< 1.0` are safely clamped to `1.0`.
+    /// Non-finite values or multipliers `< 1.0` are normalized to `1.0`.
     #[must_use]
     pub fn backoff_multiplier(mut self, backoff_multiplier: f64) -> Self {
-        self.backoff_multiplier = backoff_multiplier;
+        self.backoff_multiplier = Self::normalize_multiplier(backoff_multiplier);
         self
     }
 }
+
+impl PartialEq for RestartPolicy {
+    fn eq(&self, other: &Self) -> bool {
+        self.max_restarts == other.max_restarts
+            && self.time_window == other.time_window
+            && self.initial_backoff == other.initial_backoff
+            && self.max_backoff == other.max_backoff
+            && Self::canonical_f64_bits(self.backoff_multiplier)
+                == Self::canonical_f64_bits(other.backoff_multiplier)
+    }
+}
+
+impl Eq for RestartPolicy {}
 
 impl Default for RestartPolicy {
     fn default() -> Self {
@@ -254,13 +288,7 @@ impl RestartTracker {
         self.consecutive_failures += 1;
 
         let effective_max = self.policy.max_backoff.max(self.policy.initial_backoff);
-        let base_mult = if self.policy.backoff_multiplier.is_finite()
-            && self.policy.backoff_multiplier >= 1.0
-        {
-            self.policy.backoff_multiplier
-        } else {
-            1.0
-        };
+        let base_mult = RestartPolicy::normalize_multiplier(self.policy.backoff_multiplier);
 
         // Cap exponent at 30 to prevent f64 overflow / NaN / Infinity panics
         let exp = (self.consecutive_failures.saturating_sub(1)).min(30) as i32;
@@ -298,6 +326,7 @@ impl RestartTracker {
 /// Error conditions encountered at any level of the [`super::supervisor::Supervisor`] hierarchy.
 #[non_exhaustive]
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "remote", derive(serde::Serialize, serde::Deserialize))]
 pub enum SupervisorError {
     #[error("Child '{0}' is already registered and running under this supervisor")]
     ChildAlreadyExists(String),

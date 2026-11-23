@@ -122,6 +122,7 @@ impl std::fmt::Debug for SlotState {
 /// Mirrors the internal `SlotState` without exposing communication endpoints (`UntypedSender`).
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "remote", derive(serde::Serialize, serde::Deserialize))]
 pub enum ChildStatus {
     /// The child is currently running under `instance_id`.
     Running { instance_id: usize },
@@ -134,6 +135,17 @@ pub enum ChildStatus {
 }
 
 impl ChildStatus {
+    /// Returns a stable status label (`"running"`, `"restarting"`, `"stopped"`, `"failed"`).
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Running { .. } => "running",
+            Self::Restarting { .. } => "restarting",
+            Self::Stopped => "stopped",
+            Self::Failed(_) => "failed",
+        }
+    }
+
     /// Returns `true` if the child is currently running (`ChildStatus::Running`).
     #[must_use]
     pub fn is_running(&self) -> bool {
@@ -165,6 +177,21 @@ impl ChildStatus {
             Self::Running { instance_id } | Self::Restarting { instance_id } => Some(*instance_id),
             Self::Stopped | Self::Failed(_) => None,
         }
+    }
+
+    /// Returns the underlying [`SupervisorError`] when the child is [`ChildStatus::Failed`].
+    #[must_use]
+    pub fn failure_error(&self) -> Option<&SupervisorError> {
+        match self {
+            Self::Failed(err) => Some(err),
+            Self::Running { .. } | Self::Restarting { .. } | Self::Stopped => None,
+        }
+    }
+
+    /// Converts this live [`ChildStatus`] into its portable [`super::telemetry::ChildLifecycle`] representation.
+    #[must_use]
+    pub fn to_lifecycle(&self) -> super::telemetry::ChildLifecycle {
+        super::telemetry::ChildLifecycle::from(self)
     }
 }
 

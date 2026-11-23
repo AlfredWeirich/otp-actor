@@ -1476,3 +1476,96 @@ async fn test_admin_status_skips_endpoint_snapshot_without_details_and_remote_cl
     ));
     non_serde_root.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn test_actor_node_builder_tower_layer_and_remote_error_eq() {
+    fn assert_eq_trait<T: Eq>() {}
+    assert_eq_trait::<RemoteActorError<String>>();
+
+    let root = Supervisor::new("layer-root");
+    let svc = Supervisor::builder("layer-svc").spawn(&root).await.unwrap();
+    let calc = StatefulActorBuilder::from_default::<CalculatorActor>("calc")
+        .spawn(&svc)
+        .await
+        .unwrap();
+
+    let registry = ActorNodeRegistry::new();
+    registry.register("layer-svc", "calc", calc);
+
+    let layer_hits = Arc::new(AtomicUsize::new(0));
+    let auth_layer = tonic::service::InterceptorLayer::new({
+        let hits = layer_hits.clone();
+        move |req: tonic::Request<()>| {
+            hits.fetch_add(1, Ordering::Relaxed);
+            match req.metadata().get("x-layer-key") {
+                Some(v) if v == "allow" => Ok(req),
+                _ => Err(tonic::Status::permission_denied("blocked by tower layer")),
+            }
+        }
+    });
+
+    // 1. ActorNodeBuilder::layer(...) supports Tower layers (F-15) and enforces them on live gRPC traffic.
+    let node1 = ActorNodeHandle::builder("127.0.0.1:0".parse().unwrap(), registry.clone())
+        .layer(auth_layer)
+        .start()
+        .await
+        .unwrap();
+    let endpoint1 = format!("http://{}", node1.local_addr());
+
+    let unauth = RemoteActorClient::<CalculatorActor>::connect(&endpoint1, "layer-svc", "calc")
+        .await
+        .unwrap();
+    let blocked_err = unauth.call(CalcMsg::Get).await.unwrap_err();
+    assert_eq!(
+        blocked_err,
+        RemoteActorError::transport(tonic::Status::permission_denied("blocked by tower layer"))
+    );
+    assert_eq!(
+        blocked_err.transport_status().map(tonic::Status::code),
+        Some(tonic::Code::PermissionDenied)
+    );
+
+    let authed = unauth.with_request_metadata(|m| {
+        m.insert("x-layer-key", "allow".parse().unwrap());
+    });
+    assert_eq!(authed.call(CalcMsg::Add(12)).await.unwrap(), 12);
+    assert!(layer_hits.load(Ordering::Relaxed) >= 2);
+
+    // 2. Convenience start_with_layer(...) and ActorNodeHandle::start_with(..., Server::builder().layer(...))
+    let node2 = ActorNodeHandle::builder("127.0.0.1:0".parse().unwrap(), registry.clone())
+        .start_with_layer(tonic::service::RecoverErrorLayer::new())
+        .await
+        .unwrap();
+    let c2 = RemoteActorClient::<CalculatorActor>::connect(
+        format!("http://{}", node2.local_addr()),
+        "layer-svc",
+        "calc",
+    )
+    .await
+    .unwrap();
+    assert_eq!(c2.call(CalcMsg::Add(3)).await.unwrap(), 15);
+
+    let layered_server =
+        tonic::transport::Server::builder().layer(tonic::service::RecoverErrorLayer::new());
+    let node3 = ActorNodeHandle::start_with(
+        "127.0.0.1:0".parse().unwrap(),
+        registry,
+        None,
+        layered_server,
+    )
+    .await
+    .unwrap();
+    let c3 = RemoteActorClient::<CalculatorActor>::connect(
+        format!("http://{}", node3.local_addr()),
+        "layer-svc",
+        "calc",
+    )
+    .await
+    .unwrap();
+    assert_eq!(c3.call(CalcMsg::Get).await.unwrap(), 15);
+
+    node3.shutdown().await.unwrap();
+    node2.shutdown().await.unwrap();
+    node1.shutdown().await.unwrap();
+    root.shutdown().await.unwrap();
+}

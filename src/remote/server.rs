@@ -670,12 +670,13 @@ impl ActorNodeAdmin for ActorNodeAdminService {
 pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Builder for configuring and starting an [`ActorNodeHandle`] with custom Tonic [`tonic::transport::Server`]
-/// settings (such as TLS, HTTP/2 limits, keepalive), request timeouts, or an [`Authorizer`].
-pub struct ActorNodeBuilder {
+/// settings (such as TLS, HTTP/2 limits, keepalive), Tower middleware [`layer`](Self::layer)s,
+/// request timeouts, or an [`Authorizer`].
+pub struct ActorNodeBuilder<L = tower_layer::Identity> {
     addr: SocketAddr,
     registry: ActorNodeRegistry,
     supervisor: Option<SupervisorHandle>,
-    server: tonic::transport::Server,
+    server: tonic::transport::Server<L>,
     default_call_timeout: Option<Duration>,
     default_cast_timeout: Option<Duration>,
     max_request_timeout: Option<Duration>,
@@ -684,7 +685,7 @@ pub struct ActorNodeBuilder {
     started_at: Option<Instant>,
 }
 
-impl std::fmt::Debug for ActorNodeBuilder {
+impl<L> std::fmt::Debug for ActorNodeBuilder<L> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ActorNodeBuilder")
             .field("addr", &self.addr)
@@ -702,7 +703,7 @@ impl std::fmt::Debug for ActorNodeBuilder {
     }
 }
 
-impl ActorNodeBuilder {
+impl ActorNodeBuilder<tower_layer::Identity> {
     /// Creates a new builder bound to `addr` and backed by `registry`.
     pub fn new(addr: SocketAddr, registry: ActorNodeRegistry) -> Self {
         Self {
@@ -718,7 +719,9 @@ impl ActorNodeBuilder {
             started_at: None,
         }
     }
+}
 
+impl<L> ActorNodeBuilder<L> {
     /// Overrides the reference start timestamp reported by `ActorNodeAdmin` (`uptime_seconds`).
     #[must_use]
     pub fn started_at(mut self, started_at: Instant) -> Self {
@@ -734,11 +737,42 @@ impl ActorNodeBuilder {
     }
 
     /// Supplies a pre-configured [`tonic::transport::Server`] (e.g. with TLS, concurrency limits,
-    /// or HTTP/2 settings).
+    /// HTTP/2 settings, or Tower middleware layers).
     #[must_use]
-    pub fn server(mut self, server: tonic::transport::Server) -> Self {
-        self.server = server;
-        self
+    pub fn server<NewL>(self, server: tonic::transport::Server<NewL>) -> ActorNodeBuilder<NewL> {
+        ActorNodeBuilder {
+            addr: self.addr,
+            registry: self.registry,
+            supervisor: self.supervisor,
+            server,
+            default_call_timeout: self.default_call_timeout,
+            default_cast_timeout: self.default_cast_timeout,
+            max_request_timeout: self.max_request_timeout,
+            authorizer: self.authorizer,
+            drain_timeout: self.drain_timeout,
+            started_at: self.started_at,
+        }
+    }
+
+    /// Wraps the gRPC node server with a [`tower_layer::Layer`] middleware stack (e.g. rate
+    /// limiting, mTLS/OID verification, concurrency control, or request tracing).
+    #[must_use]
+    pub fn layer<NewL>(
+        self,
+        new_layer: NewL,
+    ) -> ActorNodeBuilder<tower_layer::Stack<NewL, L>> {
+        ActorNodeBuilder {
+            addr: self.addr,
+            registry: self.registry,
+            supervisor: self.supervisor,
+            server: self.server.layer(new_layer),
+            default_call_timeout: self.default_call_timeout,
+            default_cast_timeout: self.default_cast_timeout,
+            max_request_timeout: self.max_request_timeout,
+            authorizer: self.authorizer,
+            drain_timeout: self.drain_timeout,
+            started_at: self.started_at,
+        }
     }
 
     /// Sets the fallback timeout for `call` requests omitting `timeout_ms`.
@@ -816,23 +850,40 @@ impl ActorNodeBuilder {
         )
     }
 
-    /// Binds the TCP listener and starts serving both `ActorNode` and `ActorNodeAdmin` gRPC services.
-    pub async fn start(mut self) -> Result<ActorNodeHandle, RemoteNodeError> {
+    async fn serve_routes<ResBody>(
+        self,
+        routes: tonic::service::Routes,
+        metrics: RemoteNodeMetrics,
+        draining: Arc<AtomicBool>,
+        started_at: Instant,
+    ) -> Result<ActorNodeHandle, RemoteNodeError>
+    where
+        L: tower_layer::Layer<tonic::service::Routes> + Send + 'static,
+        L::Service: tonic::codegen::Service<
+                tonic::codegen::http::Request<tonic::body::Body>,
+                Response = tonic::codegen::http::Response<ResBody>,
+            > + Clone
+            + Send
+            + 'static,
+        <<L as tower_layer::Layer<tonic::service::Routes>>::Service as tonic::codegen::Service<
+            tonic::codegen::http::Request<tonic::body::Body>,
+        >>::Future: Send + 'static,
+        <<L as tower_layer::Layer<tonic::service::Routes>>::Service as tonic::codegen::Service<
+            tonic::codegen::http::Request<tonic::body::Body>,
+        >>::Error: Into<tonic::codegen::StdError> + Send + 'static,
+        ResBody: tonic::codegen::Body<Data = tonic::codegen::Bytes> + Send + 'static,
+        ResBody::Error: Into<tonic::codegen::StdError>,
+    {
         let listener = tokio::net::TcpListener::bind(self.addr).await?;
         let local_addr = listener.local_addr()?;
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let started_at = self.started_at.unwrap_or_else(Instant::now);
-        let draining = Arc::new(AtomicBool::new(false));
-        let metrics = RemoteNodeMetrics::default();
-
-        let (node_svc, admin_svc) =
-            self.build_services(metrics.clone(), draining.clone(), started_at);
-        let router = self.server.add_service(node_svc).add_service(admin_svc);
+        let server = self.server;
+        let prepared = routes.prepare();
 
         let server_task = tokio::spawn(async move {
             let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
-            router
-                .serve_with_incoming_shutdown(incoming, async {
+            server
+                .serve_with_incoming_shutdown(prepared, incoming, async {
                     let _ = shutdown_rx.await;
                 })
                 .await
@@ -851,17 +902,85 @@ impl ActorNodeBuilder {
         })
     }
 
+    /// Binds the TCP listener and starts serving both `ActorNode` and `ActorNodeAdmin` gRPC services.
+    pub async fn start<ResBody>(self) -> Result<ActorNodeHandle, RemoteNodeError>
+    where
+        L: tower_layer::Layer<tonic::service::Routes> + Send + 'static,
+        L::Service: tonic::codegen::Service<
+                tonic::codegen::http::Request<tonic::body::Body>,
+                Response = tonic::codegen::http::Response<ResBody>,
+            > + Clone
+            + Send
+            + 'static,
+        <<L as tower_layer::Layer<tonic::service::Routes>>::Service as tonic::codegen::Service<
+            tonic::codegen::http::Request<tonic::body::Body>,
+        >>::Future: Send + 'static,
+        <<L as tower_layer::Layer<tonic::service::Routes>>::Service as tonic::codegen::Service<
+            tonic::codegen::http::Request<tonic::body::Body>,
+        >>::Error: Into<tonic::codegen::StdError> + Send + 'static,
+        ResBody: tonic::codegen::Body<Data = tonic::codegen::Bytes> + Send + 'static,
+        ResBody::Error: Into<tonic::codegen::StdError>,
+    {
+        let started_at = self.started_at.unwrap_or_else(Instant::now);
+        let draining = Arc::new(AtomicBool::new(false));
+        let metrics = RemoteNodeMetrics::default();
+
+        let (node_svc, admin_svc) =
+            self.build_services(metrics.clone(), draining.clone(), started_at);
+        let routes = tonic::service::Routes::new(node_svc).add_service(admin_svc);
+        self.serve_routes(routes, metrics, draining, started_at)
+            .await
+    }
+
+    /// Applies an additional Tower [`tower_layer::Layer`] and starts serving both gRPC services.
+    pub async fn start_with_layer<NewL, ResBody>(
+        self,
+        new_layer: NewL,
+    ) -> Result<ActorNodeHandle, RemoteNodeError>
+    where
+        tower_layer::Stack<NewL, L>: tower_layer::Layer<tonic::service::Routes> + Send + 'static,
+        <tower_layer::Stack<NewL, L> as tower_layer::Layer<tonic::service::Routes>>::Service:
+            tonic::codegen::Service<
+                    tonic::codegen::http::Request<tonic::body::Body>,
+                    Response = tonic::codegen::http::Response<ResBody>,
+                > + Clone
+                + Send
+                + 'static,
+        <<tower_layer::Stack<NewL, L> as tower_layer::Layer<tonic::service::Routes>>::Service as tonic::codegen::Service<
+            tonic::codegen::http::Request<tonic::body::Body>,
+        >>::Future: Send + 'static,
+        <<tower_layer::Stack<NewL, L> as tower_layer::Layer<tonic::service::Routes>>::Service as tonic::codegen::Service<
+            tonic::codegen::http::Request<tonic::body::Body>,
+        >>::Error: Into<tonic::codegen::StdError> + Send + 'static,
+        ResBody: tonic::codegen::Body<Data = tonic::codegen::Bytes> + Send + 'static,
+        ResBody::Error: Into<tonic::codegen::StdError>,
+    {
+        self.layer(new_layer).start().await
+    }
+
     /// Binds the TCP listener and starts serving the gRPC node wrapped with a Tonic [`tonic::service::Interceptor`].
-    pub async fn start_with_interceptor<F>(
-        mut self,
+    pub async fn start_with_interceptor<F, ResBody>(
+        self,
         interceptor: F,
     ) -> Result<ActorNodeHandle, RemoteNodeError>
     where
         F: tonic::service::Interceptor + Clone + Send + Sync + 'static,
+        L: tower_layer::Layer<tonic::service::Routes> + Send + 'static,
+        L::Service: tonic::codegen::Service<
+                tonic::codegen::http::Request<tonic::body::Body>,
+                Response = tonic::codegen::http::Response<ResBody>,
+            > + Clone
+            + Send
+            + 'static,
+        <<L as tower_layer::Layer<tonic::service::Routes>>::Service as tonic::codegen::Service<
+            tonic::codegen::http::Request<tonic::body::Body>,
+        >>::Future: Send + 'static,
+        <<L as tower_layer::Layer<tonic::service::Routes>>::Service as tonic::codegen::Service<
+            tonic::codegen::http::Request<tonic::body::Body>,
+        >>::Error: Into<tonic::codegen::StdError> + Send + 'static,
+        ResBody: tonic::codegen::Body<Data = tonic::codegen::Bytes> + Send + 'static,
+        ResBody::Error: Into<tonic::codegen::StdError>,
     {
-        let listener = tokio::net::TcpListener::bind(self.addr).await?;
-        let local_addr = listener.local_addr()?;
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let started_at = self.started_at.unwrap_or_else(Instant::now);
         let draining = Arc::new(AtomicBool::new(false));
         let metrics = RemoteNodeMetrics::default();
@@ -872,28 +991,9 @@ impl ActorNodeBuilder {
             tonic::service::interceptor::InterceptedService::new(raw_node_svc, interceptor.clone());
         let admin_svc =
             tonic::service::interceptor::InterceptedService::new(raw_admin_svc, interceptor);
-        let router = self.server.add_service(node_svc).add_service(admin_svc);
-
-        let server_task = tokio::spawn(async move {
-            let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
-            router
-                .serve_with_incoming_shutdown(incoming, async {
-                    let _ = shutdown_rx.await;
-                })
-                .await
-        });
-
-        Ok(ActorNodeHandle {
-            addr: local_addr,
-            registry: self.registry,
-            supervisor: self.supervisor,
-            drain_timeout: self.drain_timeout,
-            started_at,
-            draining,
-            metrics,
-            shutdown_tx: Some(shutdown_tx),
-            server_task: Some(server_task),
-        })
+        let routes = tonic::service::Routes::new(node_svc).add_service(admin_svc);
+        self.serve_routes(routes, metrics, draining, started_at)
+            .await
     }
 }
 
@@ -926,7 +1026,8 @@ impl std::fmt::Debug for ActorNodeHandle {
 }
 
 impl ActorNodeHandle {
-    /// Creates an [`ActorNodeBuilder`] for configuring TLS, timeouts, interceptors, or authorization.
+    /// Creates an [`ActorNodeBuilder`] for configuring TLS, Tower middleware layers, timeouts,
+    /// interceptors, or authorization.
     pub fn builder(addr: SocketAddr, registry: ActorNodeRegistry) -> ActorNodeBuilder {
         ActorNodeBuilder::new(addr, registry)
     }
@@ -941,13 +1042,30 @@ impl ActorNodeHandle {
     }
 
     /// Spawns a new `ActorNodeServer` bound to `addr` using a pre-configured [`tonic::transport::Server`]
-    /// (for example with TLS configuration, HTTP/2 settings, or concurrency limits).
-    pub async fn start_with(
+    /// (for example with TLS configuration, HTTP/2 settings, concurrency limits, or Tower layers).
+    pub async fn start_with<L, ResBody>(
         addr: SocketAddr,
         registry: ActorNodeRegistry,
         supervisor: Option<SupervisorHandle>,
-        server: tonic::transport::Server,
-    ) -> Result<Self, RemoteNodeError> {
+        server: tonic::transport::Server<L>,
+    ) -> Result<Self, RemoteNodeError>
+    where
+        L: tower_layer::Layer<tonic::service::Routes> + Send + 'static,
+        L::Service: tonic::codegen::Service<
+                tonic::codegen::http::Request<tonic::body::Body>,
+                Response = tonic::codegen::http::Response<ResBody>,
+            > + Clone
+            + Send
+            + 'static,
+        <<L as tower_layer::Layer<tonic::service::Routes>>::Service as tonic::codegen::Service<
+            tonic::codegen::http::Request<tonic::body::Body>,
+        >>::Future: Send + 'static,
+        <<L as tower_layer::Layer<tonic::service::Routes>>::Service as tonic::codegen::Service<
+            tonic::codegen::http::Request<tonic::body::Body>,
+        >>::Error: Into<tonic::codegen::StdError> + Send + 'static,
+        ResBody: tonic::codegen::Body<Data = tonic::codegen::Bytes> + Send + 'static,
+        ResBody::Error: Into<tonic::codegen::StdError>,
+    {
         let mut builder = Self::builder(addr, registry).server(server);
         if let Some(sup) = supervisor {
             builder = builder.supervisor(sup);

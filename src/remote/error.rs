@@ -3,6 +3,7 @@
 use crate::remote::proto::RemoteError;
 use crate::remote::proto::remote_error::Kind;
 use std::fmt::{self, Debug, Display};
+use std::sync::Arc;
 
 /// Error encountered when starting or shutting down a remote [`crate::remote::ActorNodeHandle`].
 #[non_exhaustive]
@@ -33,7 +34,7 @@ pub enum RemoteActorError<E> {
     Actor(E),
 
     /// Transport-level network or gRPC communication failure.
-    Transport(tonic::Status),
+    Transport(Arc<tonic::Status>),
 
     /// The target service supervisor was not registered on the remote node.
     ServiceNotFound(String),
@@ -69,6 +70,72 @@ pub enum RemoteActorError<E> {
     Unknown { kind: i32, message: String },
 }
 
+impl<E> RemoteActorError<E> {
+    /// Wraps a [`tonic::Status`] into [`RemoteActorError::Timeout`] if it represents a deadline
+    /// expiration, or into [`RemoteActorError::Transport`] otherwise.
+    #[must_use]
+    pub fn transport(status: tonic::Status) -> Self {
+        Self::from(status)
+    }
+
+    /// Returns a reference to the underlying [`tonic::Status`] when this error is
+    /// [`RemoteActorError::Transport`].
+    #[must_use]
+    pub fn transport_status(&self) -> Option<&tonic::Status> {
+        match self {
+            Self::Transport(status) => Some(status.as_ref()),
+            _ => None,
+        }
+    }
+
+    /// Returns a reference to the actor's domain error when this error is
+    /// [`RemoteActorError::Actor`].
+    #[must_use]
+    pub fn actor_error(&self) -> Option<&E> {
+        match self {
+            Self::Actor(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
+impl<E: PartialEq> PartialEq for RemoteActorError<E> {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Actor(a), Self::Actor(b)) => a == b,
+            (Self::Transport(a), Self::Transport(b)) => {
+                Arc::ptr_eq(a, b)
+                    || (a.code() == b.code()
+                        && a.message() == b.message()
+                        && a.details() == b.details())
+            }
+            (Self::ServiceNotFound(a), Self::ServiceNotFound(b)) => a == b,
+            (Self::ActorNotFound(a), Self::ActorNotFound(b)) => a == b,
+            (Self::MailboxFull, Self::MailboxFull) => true,
+            (Self::ActorUnavailable, Self::ActorUnavailable) => true,
+            (Self::MaxRestartsExceeded(a), Self::MaxRestartsExceeded(b)) => a == b,
+            (Self::Timeout, Self::Timeout) => true,
+            (Self::Serialization(a), Self::Serialization(b)) => a == b,
+            (Self::Deserialization(a), Self::Deserialization(b)) => a == b,
+            (Self::ActorPanic(a), Self::ActorPanic(b)) => a == b,
+            (Self::IncompatibleProtocol(a), Self::IncompatibleProtocol(b)) => a == b,
+            (
+                Self::Unknown {
+                    kind: k1,
+                    message: m1,
+                },
+                Self::Unknown {
+                    kind: k2,
+                    message: m2,
+                },
+            ) => k1 == k2 && m1 == m2,
+            _ => false,
+        }
+    }
+}
+
+impl<E: Eq> Eq for RemoteActorError<E> {}
+
 impl<E: Display> Display for RemoteActorError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -96,7 +163,7 @@ impl<E: Display> Display for RemoteActorError<E> {
 impl<E: Debug + Display> std::error::Error for RemoteActorError<E> {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Transport(status) => Some(status),
+            Self::Transport(status) => Some(status.as_ref()),
             _ => None,
         }
     }
@@ -118,6 +185,16 @@ fn status_is_timeout(status: &tonic::Status) -> bool {
 
 impl<E> From<tonic::Status> for RemoteActorError<E> {
     fn from(status: tonic::Status) -> Self {
+        if status_is_timeout(&status) {
+            Self::Timeout
+        } else {
+            Self::Transport(Arc::new(status))
+        }
+    }
+}
+
+impl<E> From<Arc<tonic::Status>> for RemoteActorError<E> {
+    fn from(status: Arc<tonic::Status>) -> Self {
         if status_is_timeout(&status) {
             Self::Timeout
         } else {
@@ -195,7 +272,7 @@ mod tests {
     #[test]
     fn test_remote_actor_error_preserves_transport_source_chain() {
         let status = tonic::Status::permission_denied("missing bearer token");
-        let err: RemoteActorError<String> = RemoteActorError::Transport(status);
+        let err: RemoteActorError<String> = RemoteActorError::transport(status);
         let source = err
             .source()
             .expect("Transport variant must expose tonic::Status via Error::source()");
@@ -204,10 +281,33 @@ mod tests {
             .expect("source must downcast to tonic::Status");
         assert_eq!(downcast.code(), tonic::Code::PermissionDenied);
         assert_eq!(downcast.message(), "missing bearer token");
+        assert_eq!(
+            err.transport_status().map(tonic::Status::code),
+            Some(tonic::Code::PermissionDenied)
+        );
+        assert!(err.actor_error().is_none());
+
+        let same_err: RemoteActorError<String> =
+            RemoteActorError::from(tonic::Status::permission_denied("missing bearer token"));
+        let diff_err: RemoteActorError<String> =
+            RemoteActorError::from(tonic::Status::unauthenticated("missing bearer token"));
+        assert_eq!(err, err.clone());
+        assert_eq!(err, same_err);
+        assert_ne!(err, diff_err);
+        assert!(
+            std::mem::size_of::<RemoteActorError<String>>() <= 40,
+            "Expected Arc-boxed Transport variant to keep RemoteActorError compact, got {} bytes",
+            std::mem::size_of::<RemoteActorError<String>>()
+        );
 
         let domain_err: RemoteActorError<String> = RemoteActorError::Actor("boom".to_string());
+        assert_eq!(domain_err.actor_error().map(String::as_str), Some("boom"));
+        assert!(domain_err.transport_status().is_none());
         assert!(domain_err.source().is_none());
+        assert_eq!(domain_err, RemoteActorError::Actor("boom".to_string()));
+
         let timeout_err: RemoteActorError<String> = RemoteActorError::Timeout;
         assert!(timeout_err.source().is_none());
+        assert_eq!(timeout_err, RemoteActorError::Timeout);
     }
 }

@@ -342,6 +342,39 @@ impl ChildLifecycle {
         }
     }
 
+    /// Returns `true` if the child is currently running (`ChildLifecycle::Running`).
+    #[must_use]
+    pub fn is_running(&self) -> bool {
+        matches!(self, Self::Running)
+    }
+
+    /// Returns `true` if the child is currently restarting or waiting in backoff (`ChildLifecycle::Restarting`).
+    #[must_use]
+    pub fn is_restarting(&self) -> bool {
+        matches!(self, Self::Restarting)
+    }
+
+    /// Returns `true` if the child is stopped (`ChildLifecycle::Stopped`).
+    #[must_use]
+    pub fn is_stopped(&self) -> bool {
+        matches!(self, Self::Stopped)
+    }
+
+    /// Returns `true` if the child is permanently failed (`ChildLifecycle::Failed`).
+    #[must_use]
+    pub fn is_failed(&self) -> bool {
+        matches!(self, Self::Failed(_))
+    }
+
+    /// Returns the failure reason string when the child is [`ChildLifecycle::Failed`].
+    #[must_use]
+    pub fn failure_reason(&self) -> Option<&str> {
+        match self {
+            Self::Failed(reason) => Some(reason.as_str()),
+            Self::Running | Self::Restarting | Self::Stopped => None,
+        }
+    }
+
     fn metric_code(&self) -> u8 {
         match self {
             Self::Running => 0,
@@ -360,6 +393,30 @@ impl From<&ChildStatus> for ChildLifecycle {
             ChildStatus::Stopped => Self::Stopped,
             ChildStatus::Failed(err) => Self::Failed(err.to_string()),
         }
+    }
+}
+
+impl From<ChildStatus> for ChildLifecycle {
+    fn from(status: ChildStatus) -> Self {
+        Self::from(&status)
+    }
+}
+
+impl PartialEq<ChildStatus> for ChildLifecycle {
+    fn eq(&self, other: &ChildStatus) -> bool {
+        match (self, other) {
+            (Self::Running, ChildStatus::Running { .. }) => true,
+            (Self::Restarting, ChildStatus::Restarting { .. }) => true,
+            (Self::Stopped, ChildStatus::Stopped) => true,
+            (Self::Failed(reason), ChildStatus::Failed(err)) => reason == &err.to_string(),
+            _ => false,
+        }
+    }
+}
+
+impl PartialEq<ChildLifecycle> for ChildStatus {
+    fn eq(&self, other: &ChildLifecycle) -> bool {
+        other == self
     }
 }
 

@@ -1248,7 +1248,7 @@ Both `RemoteActorClient<A>` and `AnyActorClient<A>` expose matching asynchronous
 
 A caller can accept an `AnyActorClient<MyActor>` and invoke `.call(...)`, `.call_timeout(...)`, `.cast(...)`, or `.cast_timeout(...)` completely oblivious to whether the request traverses a fast in-memory Tokio channel or an HTTP/2 TCP connection across availability zones. Controlled actor shutdown over gRPC is intentionally modeled explicitly via domain messages whose `StatefulActor::handle` invokes `ctx.stop()` (rather than an unauthenticated generic stop RPC).
 
-> **Transport Security & Authorization:** In production deployments across untrusted networks, configure TLS, per-request timeout caps, and token/mTLS authentication using `ActorNodeHandle::builder(addr, registry).server(tls_server).authorizer(...)` (or `ActorNodeHandle::start_with(...)` / `.start_with_interceptor(...)`) on the server, paired with `RemoteActorClient::connect_with(tls_endpoint, ...).with_request_metadata(...)` on the client.
+> **Transport Security & Authorization:** In production deployments across untrusted networks, configure TLS, Tower middleware layers, per-request timeout caps, and token/mTLS authentication using `ActorNodeHandle::builder(addr, registry).server(tls_server).layer(...).authorizer(...)` (or `.start_with_layer(...)` / `.start_with_interceptor(...)` / `ActorNodeHandle::start_with(...)`) on the server, paired with `RemoteActorClient::connect_with(tls_endpoint, ...).with_request_metadata(...)` on the client.
 
 ---
 

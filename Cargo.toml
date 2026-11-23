@@ -1,6 +1,6 @@
 [package]
 name = "otp-actor"
-version = "0.4.1"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.88"
 description = "OTP Actor framework for Tokio with supervision tree and resilient resource actor inclusive gRPC remoting inspired by Erlang/OTP"
@@ -28,6 +28,7 @@ remote = [
     "dep:postcard",
     "dep:tokio-stream",
     "dep:tonic-prost-build",
+    "dep:tower-layer",
     "tokio/net",
 ]
 
@@ -43,6 +44,7 @@ prost = { version = "0.14", optional = true }
 serde = { version = "1.0", features = ["derive"], optional = true }
 postcard = { version = "1.1.3", default-features = false, features = ["use-std"], optional = true }
 tokio-stream = { version = "0.1", features = ["net"], optional = true }
+tower-layer = { version = "0.3", optional = true }
 
 [build-dependencies]
 tonic-prost-build = { version = "0.14", optional = true }

@@ -11,6 +11,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ## [0.4.0] - Unreleased
 
 ### Breaking Changes
+- **`Arc<tonic::Status>` Boxing on `RemoteActorError` & Generic Tower Layer Support on `ActorNodeBuilder` (`src/remote/{error,server}.rs`, `Cargo.toml`, Finding `F-15`):**
+  - Boxed `RemoteActorError::Transport(Arc<tonic::Status>)` (reducing `sizeof(RemoteActorError<E>)` to a single pointer) and implemented `PartialEq` / `Eq` (comparing `code()`, `message()`, and `details()` on `Transport`), alongside `From<Arc<tonic::Status>>` and inherent helpers `RemoteActorError::{transport, transport_status, actor_error}`.
+  - Added optional `tower-layer` (`"0.3"`) under the `remote` feature and parameterized `ActorNodeBuilder<L = tower_layer::Identity>` with `.layer(new_layer)`, `.start_with_layer(new_layer)`, generalized `.server<NewL>(Server<NewL>)`, and `ActorNodeHandle::start_with<L, ResBody>(..., Server<L>)` so `Tower` middleware layers (rate limiting, mTLS/OID verification, error recovery) compose seamlessly with gRPC nodes (`0.4.0` breaking cleanup).
+  - *Migration:* Callers destructuring `RemoteActorError::Transport(status)` receive `&Arc<tonic::Status>` (dereferencing cleanly to `&tonic::Status` or via `.transport_status()`); callers constructing `RemoteActorError::from(status)` or `RemoteActorError::transport(status)` are unaffected.
 - **Zero-Copy `prost::bytes::Bytes` Payloads in `proto::v1` (`build.rs`, `src/remote/{proto,endpoint}.rs`, Finding `F-18`):**
   - Enabled `.bytes(".")` on `tonic_prost_build::configure()` so Prost generates zero-copy `prost::bytes::Bytes` instead of `Vec<u8>` for all `proto::v1` payload fields (`CallRequest.payload`, `CastRequest.payload`, `CallResponse.{ok_payload, actor_error_payload}`, `StatusResponse.status_payload`).
   - Re-exported `otp_actor::remote::proto::Bytes` and updated internal `BoundedVec` / `encode_payload` to return `prost::bytes::Bytes` without extra copies.
@@ -24,6 +28,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   - Restricted internal control/channel enums `SlotState` and `ActorControl` to `pub(crate)` and removed them from public crate re-exports (external observers continue using `ChildStatus` / `ChildStatusWatcher` and `ActorContext::{stop, fail}`).
 
 ### Added
+- **`RestartPolicy: Eq`, `SupervisorError`/`ChildStatus` Serde & `ChildStatus`/`ChildLifecycle` Bridge (`src/actor/{model,supervisor,telemetry}.rs`, Finding `F-15`):**
+  - Normalized invalid (`< 1.0` or non-finite) `backoff_multiplier` values directly in `RestartPolicy::backoff_multiplier()` and implemented `Eq` (with canonical bit-level `PartialEq` semantics) on `RestartPolicy`.
+  - Derived `serde::{Serialize, Deserialize}` under `#[cfg(feature = "remote")]` for `SupervisorError` and `ChildStatus`, added `ChildStatus::{as_str, failure_error, to_lifecycle}`, `ChildLifecycle::{is_running, is_restarting, is_stopped, is_failed, failure_reason}`, `From<ChildStatus> for ChildLifecycle`, and symmetric cross-type `PartialEq` between `ChildStatus` and `ChildLifecycle`.
+  - Verified with `test_f15_restart_policy_eq_and_child_status_lifecycle_bridge` and `test_actor_node_builder_tower_layer_and_remote_error_eq`.
 - **Client API Symmetry (`ask_timeout`, `ResourceClient` Queue Telemetry & `AnyActorClient` Helpers) (`src/actor/{stateful_actor,generic_actor}.rs`, `src/remote/client.rs`, Finding `F-14`):**
   - Added `ActorClient::ask_timeout` for typed [`CallMessage<A>`] deadlines matching `RemoteActorClient::ask_timeout` and `AnyActorClient::ask_timeout`.
   - Added `ResourceClient::service_name()` and `ResourceClient::queue_stats()`, symmetric with `ActorClient`.
