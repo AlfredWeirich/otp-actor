@@ -20,7 +20,7 @@
 use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use thiserror::Error;
@@ -183,6 +183,12 @@ pub(crate) struct ResourceEndpoint<T, E> {
     pub(crate) sender: Sender<ResourceCommand<T, E>>,
     pub(crate) cache_rx: watch::Receiver<Option<ResourceSnapshot<T>>>,
     pub(crate) invalidated: Arc<AtomicBool>,
+    /// `true` while a background refresh trigger is queued or a refresh worker is running.
+    pub(crate) refresh_pending: Arc<AtomicBool>,
+    /// Monotonic deadline (ns since `epoch`) until which background refreshes are throttled (`0` = none).
+    pub(crate) throttle_until_ns: Arc<AtomicU64>,
+    /// Monotonic reference instant captured when this endpoint was created.
+    pub(crate) epoch: Instant,
     /// Configured stale-while-error grace window, used to classify expired cache entries.
     pub(crate) stale_while_error: Duration,
 }
@@ -193,12 +199,27 @@ impl<T, E> Clone for ResourceEndpoint<T, E> {
             sender: self.sender.clone(),
             cache_rx: self.cache_rx.clone(),
             invalidated: self.invalidated.clone(),
+            refresh_pending: self.refresh_pending.clone(),
+            throttle_until_ns: self.throttle_until_ns.clone(),
+            epoch: self.epoch,
             stale_while_error: self.stale_while_error,
         }
     }
 }
 
 impl<T, E> ResourceEndpoint<T, E> {
+    /// Returns `true` if background refreshes are currently throttled by cooldown, backoff, or retry delay.
+    #[inline]
+    pub(crate) fn is_refresh_throttled_at(&self, now: Instant) -> bool {
+        let deadline_ns = self.throttle_until_ns.load(Ordering::Acquire);
+        if deadline_ns == 0 {
+            return false;
+        }
+        let elapsed_ns = u64::try_from(now.saturating_duration_since(self.epoch).as_nanos())
+            .unwrap_or(u64::MAX);
+        elapsed_ns < deadline_ns
+    }
+
     /// Classifies the locally visible cache without any channel round-trip (see [`CacheState`]).
     pub(crate) fn cache_state(&self) -> CacheState {
         if self.invalidated.load(Ordering::Acquire) || self.sender.is_closed() {
@@ -259,8 +280,8 @@ pub enum CacheState {
         /// Remaining validity, or `None` for a perpetual resource ([`TimedResource::perpetual`]).
         expires_in: Option<Duration>,
     },
-    /// The resource is still valid but inside the pre-expiration buffer: the next
-    /// [`ResourceClient::get`] is served by the actor (1 hop) and triggers a background refresh.
+    /// The resource is still valid inside its pre-expiration buffer: [`ResourceClient::get`] still
+    /// serves it in 0 hops and triggers at most one non-blocking background refresh when none is pending or throttled.
     RefreshDue {
         /// Remaining validity, or `None` for a perpetual resource.
         expires_in: Option<Duration>,
@@ -285,7 +306,7 @@ pub enum CacheState {
 }
 
 impl CacheState {
-    /// Returns `true` if [`ResourceClient::get`] is currently served from the cache in 0 hops.
+    /// Returns `true` if the cached resource is outside its pre-expiration buffer (`CacheState::Fresh`).
     #[must_use]
     pub fn is_fresh(&self) -> bool {
         matches!(self, Self::Fresh { .. })
@@ -345,6 +366,9 @@ pub(crate) enum ResourceCommand<T, E> {
     GetResource {
         respond_to: oneshot::Sender<Result<T, ResourceError<E>>>,
     },
+    /// Fire-and-forget trigger sent from the 0-hop `RefreshDue` fast path to start at most one
+    /// background refresh without allocating a `oneshot` or stalling the caller.
+    TriggerBackgroundRefresh,
     /// Proactively forces a cache refresh, superseding older in-flight fetches.
     ForceRefresh,
     /// Requests a graceful shutdown: closes the mailbox, completes any in-flight worker
@@ -612,10 +636,16 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
             let (tx, rx) = mpsc::channel(channel_capacity);
             let (cache_tx, cache_rx) = watch::channel(None);
             let invalidated = Arc::new(AtomicBool::new(false));
+            let refresh_pending = Arc::new(AtomicBool::new(false));
+            let throttle_until_ns = Arc::new(AtomicU64::new(0));
+            let epoch = Instant::now();
             let endpoint = Arc::new(ResourceEndpoint {
                 sender: tx,
                 cache_rx,
                 invalidated: invalidated.clone(),
+                refresh_pending: refresh_pending.clone(),
+                throttle_until_ns: throttle_until_ns.clone(),
+                epoch,
                 stale_while_error,
             });
             let w = worker.clone();
@@ -631,7 +661,8 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
                         spawn_ctx.shutdown_rx,
                         spawn_ctx.instance_id,
                         w,
-                    );
+                    )
+                    .with_refresh_sync(refresh_pending, throttle_until_ns, epoch);
                     actor.run().await
                 }
                 .instrument(actor_span),
@@ -736,6 +767,9 @@ pub struct ResourceActor<T = (), E = (), W = ()> {
     receiver: Receiver<ResourceCommand<T, E>>,
     cache_tx: watch::Sender<Option<ResourceSnapshot<T>>>,
     invalidated: Arc<AtomicBool>,
+    refresh_pending: Arc<AtomicBool>,
+    throttle_until_ns: Arc<AtomicU64>,
+    epoch: Instant,
     shutdown_rx: watch::Receiver<bool>,
     refresh_in_flight: bool,
     waiters: Vec<oneshot::Sender<Result<T, ResourceError<E>>>>,
@@ -788,6 +822,9 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
             receiver,
             cache_tx,
             invalidated,
+            refresh_pending: Arc::new(AtomicBool::new(false)),
+            throttle_until_ns: Arc::new(AtomicU64::new(0)),
+            epoch: Instant::now(),
             shutdown_rx,
             refresh_in_flight: false,
             waiters: Vec::new(),
@@ -809,6 +846,41 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
             next_proactive_target: None,
             current_worker_abort: None,
         }
+    }
+
+    /// Attaches the endpoint's shared 0-hop refresh synchronization atomics and monotonic epoch.
+    pub(crate) fn with_refresh_sync(
+        mut self,
+        refresh_pending: Arc<AtomicBool>,
+        throttle_until_ns: Arc<AtomicU64>,
+        epoch: Instant,
+    ) -> Self {
+        self.refresh_pending = refresh_pending;
+        self.throttle_until_ns = throttle_until_ns;
+        self.epoch = epoch;
+        self
+    }
+
+    /// Publishes the active failure cooldown, backoff, and retry target deadline for 0-hop checks.
+    fn sync_throttle_deadline(&self) {
+        let Some((failed_at, _)) = &self.last_failure else {
+            self.throttle_until_ns.store(0, Ordering::Release);
+            return;
+        };
+
+        let max_delay = self.failure_cooldown.max(self.failure_backoff_delay());
+        let Some(mut deadline) = failed_at.checked_add(max_delay) else {
+            self.throttle_until_ns.store(u64::MAX, Ordering::Release);
+            return;
+        };
+        if let Some(target) = self.next_proactive_target {
+            deadline = deadline.max(target);
+        }
+
+        let ns = u64::try_from(deadline.saturating_duration_since(self.epoch).as_nanos())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        self.throttle_until_ns.store(ns, Ordering::Release);
     }
 
     /// Indicates whether the actor is currently within a post-failure cooldown window.
@@ -970,6 +1042,7 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
             "⏰ Proactive retry scheduled following worker failure."
         );
         self.next_proactive_target = Some(target);
+        self.sync_throttle_deadline();
     }
 
     /// Main message processing loop (supervised within actor task).
@@ -1062,9 +1135,13 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
                                 self.cache_tx.send_replace(None);
                                 self.current_worker_abort = None;
                                 self.refresh_in_flight = false;
+                                self.refresh_pending.store(false, Ordering::Release);
                                 self.waiters.clear();
                                 return Err(format!("Worker panic escalated to supervisor: {:?}", join_err));
                             } else if join_err.is_cancelled() {
+                                if !self.refresh_in_flight {
+                                    self.refresh_pending.store(false, Ordering::Release);
+                                }
                                 tracing::debug!(
                                     actor = %self.name,
                                     instance = self.instance_id,
@@ -1078,12 +1155,16 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
                 cmd_opt = self.receiver.recv() => {
                     let Some(command) = cmd_opt else {
                         self.invalidated.store(true, Ordering::Release);
+                        self.refresh_pending.store(false, Ordering::Release);
                         return Ok(());
                     };
 
                     match command {
                         ResourceCommand::GetResource { respond_to } => {
                             self.handle_get_resource(respond_to, &mut worker_tasks);
+                        }
+                        ResourceCommand::TriggerBackgroundRefresh => {
+                            self.handle_trigger_background_refresh(&mut worker_tasks);
                         }
                         ResourceCommand::ForceRefresh => {
                             tracing::info!(
@@ -1104,6 +1185,7 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
                             self.refresh_in_flight = false;
                             self.last_failure = None;
                             self.failure_count = 0;
+                            self.throttle_until_ns.store(0, Ordering::Release);
                             self.trigger_background_worker(&mut worker_tasks);
                         }
                         ResourceCommand::Shutdown => {
@@ -1118,6 +1200,7 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
                             );
                             self.invalidated.store(true, Ordering::Release);
                             self.cache_tx.send_replace(None);
+                            self.refresh_pending.store(false, Ordering::Release);
                             worker_tasks.abort_all();
                             self.waiters.clear();
                             return Err(format!(
@@ -1207,6 +1290,7 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
 
         // 4. Clean up any remaining waiters or background tasks
         self.cache_tx.send_replace(None);
+        self.refresh_pending.store(false, Ordering::Release);
         for waiter in self.waiters.drain(..) {
             let _ = waiter.send(Err(ResourceError::ActorUnavailable));
         }
@@ -1218,6 +1302,43 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
             "✅ ResourceActor graceful shutdown complete."
         );
         Ok(())
+    }
+
+    /// Handles non-blocking 0-hop background refresh notifications sent from [`ResourceClient::get`].
+    fn handle_trigger_background_refresh(
+        &mut self,
+        worker_tasks: &mut JoinSet<WorkerOutcome<T, E>>,
+    ) {
+        if self.refresh_in_flight {
+            return;
+        }
+
+        let needs_refresh = {
+            let cached = self.cache_tx.borrow();
+            match cached.as_ref() {
+                Some(snap) => {
+                    let now = Instant::now();
+                    let res = &snap.resource;
+                    if res.is_still_usable_at(now) {
+                        snap.refresh_threshold.is_some_and(|t| now >= t)
+                    } else {
+                        self.stale_while_error > Duration::ZERO
+                            && res.is_usable_stale_at(now, self.stale_while_error)
+                    }
+                }
+                None => false,
+            }
+        };
+
+        if !needs_refresh || self.is_background_refresh_throttled() {
+            if self.last_failure.is_some() {
+                self.sync_throttle_deadline();
+            }
+            self.refresh_pending.store(false, Ordering::Release);
+            return;
+        }
+
+        self.trigger_background_worker(worker_tasks);
     }
 
     /// Handles client get requests: Serves valid caches immediately; triggers background refresh.
@@ -1271,6 +1392,7 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
 
                 if should_refresh && !self.refresh_in_flight {
                     if bg_throttled {
+                        self.sync_throttle_deadline();
                         tracing::debug!(
                             actor = %self.name,
                             instance = self.instance_id,
@@ -1364,6 +1486,7 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
         }
 
         self.refresh_in_flight = true;
+        self.refresh_pending.store(true, Ordering::Release);
         self.generation_counter += 1;
         let next_gen = self.generation_counter;
         let actor_name = self.name.clone();
@@ -1442,6 +1565,7 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
             );
             self.invalidated.store(true, Ordering::Release);
             self.cache_tx.send_replace(None);
+            self.refresh_pending.store(false, Ordering::Release);
             self.waiters.clear();
             return Err(format!(
                 "ResourceActor '{}' #{} exceeded max_consecutive_failures ({}) after worker timeout",
@@ -1465,6 +1589,10 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
         if self.proactive_refresh {
             self.schedule_proactive_retry();
         }
+        // Publish throttle deadline before clearing `refresh_pending` so concurrent 0-hop readers
+        // see the updated backoff window immediately.
+        self.sync_throttle_deadline();
+        self.refresh_pending.store(false, Ordering::Release);
         Ok(())
     }
 
@@ -1500,6 +1628,7 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
 
                 self.last_failure = None;
                 self.failure_count = 0;
+                self.throttle_until_ns.store(0, Ordering::Release);
 
                 let expires_at = new_resource.expires_at;
                 let now = Instant::now();
@@ -1520,6 +1649,9 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
                 if self.proactive_refresh {
                     self.schedule_proactive_refresh(expires_at);
                 }
+
+                // Publish the refreshed watch snapshot first before clearing `refresh_pending`.
+                self.refresh_pending.store(false, Ordering::Release);
 
                 if !self.waiters.is_empty() {
                     tracing::debug!(
@@ -1553,6 +1685,7 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
                     );
                     self.invalidated.store(true, Ordering::Release);
                     self.cache_tx.send_replace(None);
+                    self.refresh_pending.store(false, Ordering::Release);
                     self.waiters.clear();
                     return Err(format!(
                         "ResourceActor '{}' #{} exceeded max_consecutive_failures ({})",
@@ -1575,6 +1708,9 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static, W: Work
                 if self.proactive_refresh {
                     self.schedule_proactive_retry();
                 }
+                // Publish throttle deadline before clearing `refresh_pending`.
+                self.sync_throttle_deadline();
+                self.refresh_pending.store(false, Ordering::Release);
             }
         }
         Ok(())
@@ -1754,9 +1890,11 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static> Resourc
     }
 
     /// Retrieves the resource:
-    /// - **0-Hop Fast Path**: If the actor holds a fresh cached resource outside its expiration buffer,
-    ///   returns a clone directly from the [`tokio::sync::watch`] channel without any channel allocation or context switch.
-    /// - **1-Hop Coalesced Path**: On cold start, pre-expiration refresh window, or stale-while-error recovery,
+    /// - **0-Hop Fast Path**: If the actor holds a fresh or still-usable pre-expiration (`RefreshDue`)
+    ///   cached resource, returns a clone directly from the [`tokio::sync::watch`] channel without any
+    ///   `oneshot` allocation or mailbox waiting (firing at most one non-blocking
+    ///   `TriggerBackgroundRefresh` when in `RefreshDue` and not already pending or throttled).
+    /// - **1-Hop Coalesced Path**: On cold start, hard expiry, or stale-while-error recovery,
     ///   sends a direct request to the [`ResourceActor`] and transparently rebinds via its internal `SlotState` watch channel on crash/restart.
     pub async fn get(&self) -> Result<T, ResourceError<E>> {
         // 0-hop fast path via watch::Receiver (read directly under RwLockReadGuard with zero
@@ -1770,19 +1908,49 @@ impl<T: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static> Resourc
                 && !current_ep.sender.is_closed()
                 && let Some(snapshot) = current_ep.cache_rx.borrow().as_ref()
             {
-                let usable_and_fresh =
+                let (usable, refresh_due_now) =
                     match (snapshot.resource.expires_at, snapshot.refresh_threshold) {
-                        (None, None) => true,
+                        (None, None) => (true, None),
                         _ => {
                             let now = Instant::now();
-                            snapshot.resource.is_still_usable_at(now)
-                                && !snapshot
-                                    .refresh_threshold
-                                    .is_some_and(|threshold| now >= threshold)
+                            if !snapshot.resource.is_still_usable_at(now) {
+                                (false, None)
+                            } else if snapshot
+                                .refresh_threshold
+                                .is_some_and(|threshold| now >= threshold)
+                            {
+                                (true, Some(now))
+                            } else {
+                                (true, None)
+                            }
                         }
                     };
-                if usable_and_fresh {
-                    return Ok(snapshot.resource.value.clone());
+                if usable {
+                    if let Some(now) = refresh_due_now
+                        && !current_ep.refresh_pending.load(Ordering::Acquire)
+                        && !current_ep.is_refresh_throttled_at(now)
+                        && current_ep
+                            .refresh_pending
+                            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                            .is_ok()
+                    {
+                        match current_ep
+                            .sender
+                            .try_send(ResourceCommand::TriggerBackgroundRefresh)
+                        {
+                            Ok(()) => return Ok(snapshot.resource.value.clone()),
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                current_ep.refresh_pending.store(false, Ordering::Release);
+                                return Ok(snapshot.resource.value.clone());
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                current_ep.refresh_pending.store(false, Ordering::Release);
+                                // Fall through to the 1-hop rebinding loop below.
+                            }
+                        }
+                    } else {
+                        return Ok(snapshot.resource.value.clone());
+                    }
                 }
             }
         }

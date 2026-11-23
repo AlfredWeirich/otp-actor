@@ -915,6 +915,11 @@ RestForOne:     [Worker 1] (unaffected)
 3. **`Temporary`:** The child is **never** restarted under any circumstances.  
    *Use Case:* Ephemeral one-shot computational tasks.
 
+### Manual Lifecycle Control (`stop_child`, `restart_child`, `delete_child`)
+- **`stop_child(name)`:** Transitions a child to `Stopped` whether it is currently `Running`, awaiting a backoff timer (`Restarting`), or already halted in `Failed`—unwinding any active task per its `ShutdownPolicy` and immediately finalizing exited slots so a subsequent `start_child` can reuse the slot without `ChildAlreadyExists`. Its `ChildSpec` is cleared from automatic supervisor reboot while keeping its registration slot (`child_order`) intact.
+- **`restart_child(name)` / `start_child(spec)`:** Re-activates or replaces a stopped/failed child while restoring its `ChildSpec` at its original `child_order` index rather than appending to the end, preserving `RestForOne` dependencies and reverse-registration shutdown order across subsequent parent-supervisor reboots.
+- **`delete_child(name)`:** Gracefully stops (if active) and completely removes both the slot (`child_order`) and its `ChildSpec`.
+
 ### Shutdown Policies (`ShutdownPolicy`)
 
 Shutting down concurrent systems cleanly is notoriously error-prone. Abrupt termination (`abort()`) introduces severe hazards: partially written disk buffers, dangling database transactions, orphaned locks, and dropped in-flight client requests.
@@ -1038,7 +1043,7 @@ A flat `snapshot()` only describes one level. Real deployments nest supervisors 
 
 ### 6. Cache Health Without a Mailbox Hop (`ResourceClient::cache_state`)
 Whether an expiring resource (OAuth token, DB credential) is currently servable is a common readiness signal, but asking the `ResourceActor` for it would queue the probe behind in-flight workers and mailbox traffic, which is the opposite of what a probe should do.
-* **Solution:** `ResourceClient::cache_state()` is **synchronous** and classifies the same 0-hop `watch` snapshot that `get()` reads first: `Empty`, `Fresh`, `RefreshDue` (valid but inside the pre-expiration buffer, so the next `get()` takes the 1-hop refresh path), `StaleUsable` (expired but inside the `stale_while_error` window), `Expired`, or `Invalidated`. Timing metadata (`expires_in`, `expired_for`) is included. The configured `stale_while_error` window travels with the endpoint so expired entries can be told apart as `StaleUsable` vs. `Expired`.
+* **Solution:** `ResourceClient::cache_state()` is **synchronous** and classifies the same 0-hop `watch` snapshot that `get()` reads first: `Empty`, `Fresh`, `RefreshDue` (still valid inside the pre-expiration buffer: `get()` keeps serving the cached value in 0 hops while triggering at most one non-blocking background refresh when not already pending or throttled), `StaleUsable` (expired but inside the `stale_while_error` window), `Expired`, or `Invalidated`. Timing metadata (`expires_in`, `expired_for`) is included. The configured `stale_while_error` window travels with the endpoint so expired entries can be told apart as `StaleUsable` vs. `Expired`.
 * **No Secret Leakage:** The state carries metadata only and never the cached value, so it is safe to log or export as a metric. This complements the redacting `Debug` of `TimedResource`.
 * **Operational Caveat:** Like `queue_stats()`, it reads the client's locally cached endpoint. After an actor crash and *before* the client's next call rebinds it, it reports `Invalidated`.
 

@@ -893,7 +893,7 @@ enum ChildPhase {
 impl ChildPhase {
     /// Returns `true` if the child is still active or its previous task has not finished exiting yet.
     fn is_active_or_terminating(&self, term_rx: &watch::Receiver<bool>) -> bool {
-        !matches!(self, Self::Stopped | Self::Failed(_)) || !*term_rx.borrow()
+        !matches!(self, Self::Stopping | Self::Stopped | Self::Failed(_)) || !*term_rx.borrow()
     }
 }
 
@@ -1342,7 +1342,6 @@ impl Supervisor {
         mark_slot_stopped: bool,
         respond_to: Option<oneshot::Sender<Result<(), SupervisorError>>>,
     ) {
-        entry.phase = ChildPhase::Stopping;
         entry.restart_ticket = restart_ticket;
         if mark_slot_stopped {
             entry.slot_tx.send_replace(SlotState::Stopped);
@@ -1355,6 +1354,19 @@ impl Supervisor {
             let _ = waiter.send(Err(SupervisorError::ChildNotFound(child_name.clone())));
         }
 
+        // If no task is currently running (e.g., `Failed` or awaiting a backoff sleep), transition
+        // directly to `Stopped` because `handle_child_exit` will never fire for an exited task.
+        if *entry.term_rx.borrow() {
+            entry.phase = ChildPhase::Stopped;
+            entry.abort_handle = None;
+            entry.sender = Arc::new(());
+            if let Some(tx) = respond_to {
+                let _ = tx.send(Ok(()));
+            }
+            return;
+        }
+
+        entry.phase = ChildPhase::Stopping;
         let mut term_rx = Self::initiate_child_termination(supervisor_name, child_name, entry);
         if let Some(tx) = respond_to {
             tokio::spawn(async move {
@@ -1385,6 +1397,36 @@ impl Supervisor {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .retain(|s| s.name != child_name);
+    }
+
+    /// Inserts or replaces `spec` in `self.child_specs` at its canonical [`Self::child_order`] position.
+    fn upsert_child_spec(&self, spec: ChildSpec) {
+        let mut guard = self
+            .child_specs
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(existing) = guard.iter_mut().find(|s| s.name == spec.name) {
+            *existing = spec;
+            return;
+        }
+
+        let target_order_idx = self
+            .child_order
+            .iter()
+            .position(|n| n == &spec.name)
+            .unwrap_or(self.child_order.len());
+
+        let insert_pos = guard
+            .iter()
+            .position(|existing| {
+                self.child_order
+                    .iter()
+                    .position(|n| n == &existing.name)
+                    .is_some_and(|idx| idx > target_order_idx)
+            })
+            .unwrap_or(guard.len());
+
+        guard.insert(insert_pos, spec);
     }
 
     /// Removes a child slot completely (`child_specs`, `child_order`, `children`), publishes
@@ -1696,19 +1738,7 @@ impl Supervisor {
                 } else {
                     match self.spawn_child_from_spec(&spec) {
                         Ok(()) => {
-                            {
-                                let mut guard = self
-                                    .child_specs
-                                    .write()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                if let Some(existing_spec) =
-                                    guard.iter_mut().find(|s| s.name == spec.name)
-                                {
-                                    *existing_spec = spec;
-                                } else {
-                                    guard.push(spec);
-                                }
-                            }
+                            self.upsert_child_spec(spec);
                             let _ = respond_to.send(Ok(()));
                         }
                         Err(err) => {
@@ -1948,29 +1978,32 @@ impl Supervisor {
             }
 
             let ticket = self.allocate_restart_ticket();
+            let mut restored_spec: Option<ChildSpec> = None;
             if let Some(entry) = self.children.get_mut(target_name) {
-                // Ensure manually restarted child is present in shared child_specs
-                if target_name == &child_name {
-                    let mut guard = self
+                // Ensure any restarted target (direct or strategy-coupled sibling) is present in
+                // shared child_specs at its canonical child_order position.
+                let missing_spec = {
+                    let guard = self
                         .child_specs
-                        .write()
+                        .read()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if !guard.iter().any(|s| s.name == *target_name) {
-                        guard.push(ChildSpec {
-                            name: target_name.clone(),
-                            factory: entry.factory.clone(),
-                            restart_policy: entry.restart_tracker.policy,
-                            restart_type: entry.restart_type,
-                            shutdown_policy: entry.shutdown_policy,
-                            shutdown_signal: entry.shutdown_signal.clone(),
-                            #[cfg(any(test, feature = "chaos_test"))]
-                            crash_signal: entry.crash_signal.clone(),
-                            is_supervisor: entry.is_supervisor,
-                            actor_metrics: entry.actor_metrics.clone(),
-                            queue_probe: entry.queue_probe.clone(),
-                            cache_probe: entry.cache_probe.clone(),
-                        });
-                    }
+                    !guard.iter().any(|s| s.name == *target_name)
+                };
+                if missing_spec {
+                    restored_spec = Some(ChildSpec {
+                        name: target_name.clone(),
+                        factory: entry.factory.clone(),
+                        restart_policy: entry.restart_tracker.policy,
+                        restart_type: entry.restart_type,
+                        shutdown_policy: entry.shutdown_policy,
+                        shutdown_signal: entry.shutdown_signal.clone(),
+                        #[cfg(any(test, feature = "chaos_test"))]
+                        crash_signal: entry.crash_signal.clone(),
+                        is_supervisor: entry.is_supervisor,
+                        actor_metrics: entry.actor_metrics.clone(),
+                        queue_probe: entry.queue_probe.clone(),
+                        cache_probe: entry.cache_probe.clone(),
+                    });
                 }
 
                 let is_running = !*entry.term_rx.borrow();
@@ -1989,6 +2022,9 @@ impl Supervisor {
                     ));
                 }
                 targets.push((target_name.clone(), ticket));
+            }
+            if let Some(spec) = restored_spec {
+                self.upsert_child_spec(spec);
             }
         }
 

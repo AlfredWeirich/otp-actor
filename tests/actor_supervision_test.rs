@@ -7117,9 +7117,14 @@ async fn test_format_prometheus_metrics_nested_supervisor_path_escaping() {
 
 #[tokio::test]
 async fn test_tracing_spans_propagate_to_actors_workers_and_scoped_tasks() {
+    // Install both a global default registry and a second live Dispatch so `tracing-core`'s
+    // `REGISTRARS.len() >= 2` (`has_just_one == false`), preventing parallel tests without a
+    // subscriber from resolving callsites via `Rebuilder::JustDefault` as `Interest::never()`.
+    let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
     let _sub_guard = tracing::subscriber::set_default(tracing_subscriber::registry());
+    let _second_dispatch = tracing::Dispatch::new(tracing_subscriber::registry());
     // Rebuild global callsite interest cache to guard against concurrent callsite registration
-    // from parallel tests running without a subscriber (`tracing-core` callsite race).
+    // already in flight before `set_global_default` took effect (`tracing-core` callsite race).
     tracing::callsite::rebuild_interest_cache();
     let root = Supervisor::new("f13-span-root");
 
@@ -7137,6 +7142,7 @@ async fn test_tracing_spans_propagate_to_actors_workers_and_scoped_tasks() {
         .spawn(&root)
         .await
         .unwrap();
+    tracing::callsite::rebuild_interest_cache();
     assert_eq!(res_client.get().await.unwrap(), "ok");
     assert_eq!(*worker_span_name.lock().unwrap(), Some("resource_worker"));
 
@@ -7163,6 +7169,7 @@ async fn test_tracing_spans_propagate_to_actors_workers_and_scoped_tasks() {
         }
     }
 
+    tracing::callsite::rebuild_interest_cache();
     let actor_client = StatefulActorBuilder::new("span-actor", |_| SpanProbeActor)
         .spawn(&root)
         .await
@@ -7378,6 +7385,509 @@ async fn test_single_task_child_future_runs_in_supervisor_join_set_and_recovers_
     let recorded = task_ids.lock().unwrap().clone();
     assert_eq!(recorded.len(), 2);
     assert_ne!(recorded[0], recorded[1]);
+
+    root.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_stop_child_on_failed_and_backoff_restarting_children_allows_immediate_start_child() {
+    let root = Supervisor::new("root");
+    let sup = Supervisor::builder("f01-stop-recreate-svc")
+        .spawn(&root)
+        .await
+        .expect("Failed to spawn service supervisor");
+
+    // 1. Stop a child already in `ChildPhase::Failed(_)` (task exited, max_restarts(0)),
+    // then immediately recreate the slot with `start_child`.
+    let failed_client = StatefulActorBuilder::from_default::<CounterActor>("failed-worker")
+        .restart_policy(RestartPolicy::default().max_restarts(0))
+        .spawn(&sup)
+        .await
+        .expect("Failed to spawn failed-worker");
+    let mut failed_watch = sup
+        .watch_child_status("failed-worker")
+        .await
+        .expect("Failed to watch failed-worker status");
+
+    failed_client
+        .cast(CounterMsg::TriggerFatalError)
+        .await
+        .expect("Failed to trigger fatal error");
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        failed_watch.wait_for(|s| matches!(s, ChildStatus::Failed(_))),
+    )
+    .await
+    .expect("Timed out waiting for failed-worker to enter Failed")
+    .expect("Watch channel closed unexpectedly");
+
+    sup.stop_child("failed-worker")
+        .await
+        .expect("stop_child on Failed child must succeed");
+    assert_eq!(failed_watch.current(), ChildStatus::Stopped);
+
+    sup.start_child(StatefulActorBuilder::from_default::<CounterActor>("failed-worker").build_child_spec())
+        .await
+        .expect("start_child after stopping Failed child must not return ChildAlreadyExists");
+    let (val, _) = failed_client
+        .call(CounterMsg::Add(7))
+        .await
+        .expect("Restarted failed-worker slot must serve calls");
+    assert_eq!(val, 7);
+
+    // 2. Stop a child awaiting a long exponential backoff sleep (`ChildPhase::Restarting`,
+    // `*term_rx.borrow() == true`), then immediately recreate it with `start_child`.
+    let backoff_client = StatefulActorBuilder::from_default::<CounterActor>("backoff-worker")
+        .restart_policy(
+            RestartPolicy::default()
+                .max_restarts(5)
+                .initial_backoff(Duration::from_secs(30)),
+        )
+        .spawn(&sup)
+        .await
+        .expect("Failed to spawn backoff-worker");
+    let mut backoff_watch = sup
+        .watch_child_status("backoff-worker")
+        .await
+        .expect("Failed to watch backoff-worker status");
+
+    backoff_client
+        .cast(CounterMsg::TriggerFatalError)
+        .await
+        .expect("Failed to trigger backoff crash");
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        backoff_watch.wait_for(|s| matches!(s, ChildStatus::Restarting { .. })),
+    )
+    .await
+    .expect("Timed out waiting for backoff-worker to enter Restarting backoff")
+    .expect("Watch channel closed unexpectedly");
+
+    sup.stop_child("backoff-worker")
+        .await
+        .expect("stop_child during Restarting backoff must succeed");
+    assert_eq!(backoff_watch.current(), ChildStatus::Stopped);
+
+    sup.start_child(StatefulActorBuilder::from_default::<CounterActor>("backoff-worker").build_child_spec())
+        .await
+        .expect("start_child after stopping backoff Restarting child must succeed");
+    let (val, _) = backoff_client
+        .call(CounterMsg::Add(19))
+        .await
+        .expect("Re-created backoff-worker slot must serve calls");
+    assert_eq!(val, 19);
+
+    // 3. Repeated stop_child -> immediate start_child on a running child must never fail with
+    // ChildAlreadyExists if StartChild is polled before join_set reaps handle_child_exit.
+    for i in 1..=5_i64 {
+        sup.stop_child("backoff-worker")
+            .await
+            .expect("stop_child on running child must succeed");
+        sup.start_child(
+            StatefulActorBuilder::from_default::<CounterActor>("backoff-worker").build_child_spec(),
+        )
+        .await
+        .expect("Immediate start_child after stop_child must not race");
+        let (sum, _) = backoff_client
+            .call(CounterMsg::Add(i))
+            .await
+            .expect("Re-started running slot must respond");
+        assert_eq!(sum, i);
+    }
+
+    root.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_child_specs_preserve_registration_order_after_stop_restart_and_supervisor_reboot() {
+    #[derive(Clone, Debug)]
+    enum OrderProbeMsg {
+        Ping,
+        StopCleanly,
+        Crash,
+    }
+
+    struct OrderProbeActor {
+        name: &'static str,
+        stop_log: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl StatefulActor for OrderProbeActor {
+        type Message = OrderProbeMsg;
+        type Response = ();
+        type Error = String;
+
+        async fn handle(
+            &mut self,
+            msg: Self::Message,
+            ctx: &mut ActorContext<Self>,
+        ) -> Result<Self::Response, Self::Error> {
+            match msg {
+                OrderProbeMsg::Ping => Ok(()),
+                OrderProbeMsg::StopCleanly => {
+                    ctx.stop();
+                    Ok(())
+                }
+                OrderProbeMsg::Crash => {
+                    ctx.fail("forced crash for RestForOne check");
+                    Err("forced crash".to_string())
+                }
+            }
+        }
+
+        async fn on_stop(&mut self, _ctx: &mut ActorContext<Self>) {
+            self.stop_log.lock().unwrap().push(self.name.to_string());
+        }
+    }
+
+    let stop_log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let make_spec = |name: &'static str, restart_type: RestartType| {
+        let log = stop_log.clone();
+        StatefulActorBuilder::new(name, move |_ctx| OrderProbeActor {
+            name,
+            stop_log: log.clone(),
+        })
+        .restart_type(restart_type)
+        .build_child_spec()
+    };
+
+    let root = Supervisor::new("root");
+    let svc_sup = Supervisor::builder("ordered-svc")
+        .strategy(SupervisionStrategy::RestForOne)
+        .restart_policy(RestartPolicy::default().initial_backoff(Duration::from_millis(10)))
+        .spawn(&root)
+        .await
+        .expect("Failed to spawn service supervisor");
+    let mut sup_watch = root
+        .watch_child_status("ordered-svc")
+        .await
+        .expect("Failed to watch ordered-svc");
+
+    let alpha = StatefulActorBuilder::new("alpha", {
+        let log = stop_log.clone();
+        move |_| OrderProbeActor {
+            name: "alpha",
+            stop_log: log.clone(),
+        }
+    })
+    .restart_type(RestartType::Transient)
+    .spawn(&svc_sup)
+    .await
+    .unwrap();
+    let beta = StatefulActorBuilder::new("beta", {
+        let log = stop_log.clone();
+        move |_| OrderProbeActor {
+            name: "beta",
+            stop_log: log.clone(),
+        }
+    })
+    .restart_type(RestartType::Permanent)
+    .spawn(&svc_sup)
+    .await
+    .unwrap();
+    let gamma = StatefulActorBuilder::new("gamma", {
+        let log = stop_log.clone();
+        move |_| OrderProbeActor {
+            name: "gamma",
+            stop_log: log.clone(),
+        }
+    })
+    .restart_type(RestartType::Permanent)
+    .spawn(&svc_sup)
+    .await
+    .unwrap();
+
+    // Helper closure isn't needed for async steps; keep each reboot check explicit and deterministic.
+    // 1. stop_child("alpha") + restart_child("alpha"), then reboot svc_sup -> order stays [alpha, beta, gamma].
+    svc_sup.stop_child("alpha").await.unwrap();
+    svc_sup.restart_child("alpha").await.unwrap();
+    alpha.call(OrderProbeMsg::Ping).await.unwrap();
+
+    svc_sup.simulate_crash().await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        sup_watch.wait_for(|s| matches!(s, ChildStatus::Running { instance_id } if *instance_id >= 2)),
+    )
+    .await
+    .expect("Timed out waiting for ordered-svc reboot #1")
+    .expect("Watch closed");
+    alpha.call(OrderProbeMsg::Ping).await.unwrap();
+    beta.call(OrderProbeMsg::Ping).await.unwrap();
+    gamma.call(OrderProbeMsg::Ping).await.unwrap();
+
+    let snap = svc_sup.snapshot().await.unwrap();
+    let names: Vec<&str> = snap.children.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, vec!["alpha", "beta", "gamma"]);
+
+    // 2. stop_child("beta") + start_child("beta"), then reboot svc_sup -> order stays [alpha, beta, gamma].
+    svc_sup.stop_child("beta").await.unwrap();
+    svc_sup
+        .start_child(make_spec("beta", RestartType::Permanent))
+        .await
+        .unwrap();
+    beta.call(OrderProbeMsg::Ping).await.unwrap();
+
+    svc_sup.simulate_crash().await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        sup_watch.wait_for(|s| matches!(s, ChildStatus::Running { instance_id } if *instance_id >= 3)),
+    )
+    .await
+    .expect("Timed out waiting for ordered-svc reboot #2")
+    .expect("Watch closed");
+    alpha.call(OrderProbeMsg::Ping).await.unwrap();
+    beta.call(OrderProbeMsg::Ping).await.unwrap();
+    gamma.call(OrderProbeMsg::Ping).await.unwrap();
+
+    let snap = svc_sup.snapshot().await.unwrap();
+    let names: Vec<&str> = snap.children.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, vec!["alpha", "beta", "gamma"]);
+
+    // 3. Transient clean exit on "alpha" + restart_child("alpha"), then reboot svc_sup ->
+    // order stays [alpha, beta, gamma], and crashing "beta" under RestForOne only restarts [beta, gamma].
+    let mut alpha_watch = svc_sup.watch_child_status("alpha").await.unwrap();
+    alpha.call(OrderProbeMsg::StopCleanly).await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        alpha_watch.wait_for(|s| *s == ChildStatus::Stopped),
+    )
+    .await
+    .expect("Timed out waiting for transient alpha clean stop")
+    .expect("Watch closed");
+
+    svc_sup.restart_child("alpha").await.unwrap();
+    alpha.call(OrderProbeMsg::Ping).await.unwrap();
+
+    svc_sup.simulate_crash().await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        sup_watch.wait_for(|s| matches!(s, ChildStatus::Running { instance_id } if *instance_id >= 4)),
+    )
+    .await
+    .expect("Timed out waiting for ordered-svc reboot #3")
+    .expect("Watch closed");
+    alpha.call(OrderProbeMsg::Ping).await.unwrap();
+    beta.call(OrderProbeMsg::Ping).await.unwrap();
+    gamma.call(OrderProbeMsg::Ping).await.unwrap();
+
+    let snap = svc_sup.snapshot().await.unwrap();
+    let names: Vec<&str> = snap.children.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, vec!["alpha", "beta", "gamma"]);
+    let mut gamma_watch = svc_sup.watch_child_status("gamma").await.unwrap();
+    let alpha_inst_before = match svc_sup
+        .watch_child_status("alpha")
+        .await
+        .unwrap()
+        .current()
+    {
+        ChildStatus::Running { instance_id } => instance_id,
+        other => panic!("Expected alpha running after reboot #3, got {other:?}"),
+    };
+    let gamma_inst_before = match gamma_watch.current() {
+        ChildStatus::Running { instance_id } => instance_id,
+        other => panic!("Expected gamma running after reboot #3, got {other:?}"),
+    };
+
+    beta.cast(OrderProbeMsg::Crash).await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        gamma_watch.wait_for(
+            |s| matches!(s, ChildStatus::Running { instance_id } if *instance_id > gamma_inst_before),
+        ),
+    )
+    .await
+    .expect("Timed out waiting for downstream gamma RestForOne restart")
+    .expect("Watch closed");
+    beta.call(OrderProbeMsg::Ping).await.unwrap();
+    assert_eq!(
+        svc_sup
+            .watch_child_status("alpha")
+            .await
+            .unwrap()
+            .current(),
+        ChildStatus::Running {
+            instance_id: alpha_inst_before
+        },
+        "Upstream alpha must not restart when beta crashes after supervisor reboot"
+    );
+
+    // 4. Reverse-registration graceful shutdown order must still be [gamma, beta, alpha].
+    stop_log.lock().unwrap().clear();
+    root.shutdown().await.unwrap();
+    assert_eq!(
+        *stop_log.lock().unwrap(),
+        vec!["gamma", "beta", "alpha"]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_resource_client_refresh_due_serves_zero_hop_without_mailbox_stampede() {
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+
+    let root = Supervisor::new("f06-refresh-due-root");
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let fail_next = Arc::new(AtomicBool::new(false));
+    let gen2_entered = Arc::new(tokio::sync::Notify::new());
+    let gen2_release = Arc::new(tokio::sync::Notify::new());
+
+    let c_calls = calls.clone();
+    let c_fail = fail_next.clone();
+    let c_entered = gen2_entered.clone();
+    let c_release = gen2_release.clone();
+
+    let client = ResourceActor::builder("res-f06")
+        .worker(move |ctx: WorkerContext| {
+            let calls = c_calls.clone();
+            let fail = c_fail.clone();
+            let entered = c_entered.clone();
+            let release = c_release.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                if ctx.generation == 2 {
+                    entered.notify_one();
+                    release.notified().await;
+                }
+                if fail.load(Ordering::SeqCst) {
+                    return Err("upstream 503".to_string());
+                }
+                Ok::<_, String>(TimedResource::with_ttl(
+                    format!("token-v{}", ctx.generation),
+                    Duration::from_secs(10),
+                ))
+            }
+        })
+        .channel_capacity(1)
+        .expiry_buffer(Duration::from_secs(4))
+        .failure_cooldown(Duration::from_secs(2))
+        .proactive_refresh(false)
+        .spawn(&root)
+        .await
+        .expect("Failed to spawn res-f06");
+
+    // 1. Cold start -> "token-v1" (TTL 10s, RefreshDue begins at 6s).
+    assert_eq!(client.get().await.unwrap(), "token-v1");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    // 2. Advance into RefreshDue window (7s elapsed, 3s validity remaining).
+    tokio::time::advance(Duration::from_secs(7)).await;
+    assert!(matches!(
+        client.cache_state(),
+        CacheState::RefreshDue { .. }
+    ));
+
+    // Poll get() once synchronously with a noop waker: the very first caller in RefreshDue must
+    // still receive "token-v1" immediately in 0 hops while firing TriggerBackgroundRefresh.
+    {
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let fut = std::pin::pin!(client.get());
+        match fut.poll(&mut cx) {
+            Poll::Ready(Ok(val)) => assert_eq!(val, "token-v1"),
+            other => panic!("First RefreshDue get() must resolve in 0 hops, got {other:?}"),
+        }
+    }
+
+    // Yield until generation 2 enters the worker barrier and sits in flight.
+    gen2_entered.notified().await;
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+    // 3. While gen 2 is blocked in flight, 64 concurrent get() calls must all resolve synchronously
+    // in 0 hops with zero mailbox queuing (1-slot mailbox remains empty) and zero extra workers.
+    for _ in 0..64 {
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let fut = std::pin::pin!(client.get());
+        match fut.poll(&mut cx) {
+            Poll::Ready(Ok(val)) => assert_eq!(val, "token-v1"),
+            other => panic!("RefreshDue hit while worker in flight must resolve in 0 hops, got {other:?}"),
+        }
+    }
+    let mut join_set = tokio::task::JoinSet::new();
+    for _ in 0..32 {
+        let c = client.clone();
+        join_set.spawn(async move { c.get().await });
+    }
+    while let Some(res) = join_set.join_next().await {
+        assert_eq!(res.unwrap().unwrap(), "token-v1");
+    }
+    let snap = root.snapshot().await.unwrap();
+    assert_eq!(
+        snap.child("res-f06").unwrap().queue_stats.unwrap().queued,
+        0
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+    // 4. Release generation 2 -> cache refreshes to "token-v2" (Fresh).
+    gen2_release.notify_one();
+    for _ in 0..20 {
+        if matches!(client.cache_state(), CacheState::Fresh { .. }) {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(matches!(client.cache_state(), CacheState::Fresh { .. }));
+    assert_eq!(client.get().await.unwrap(), "token-v2");
+
+    // 5. Enter next RefreshDue window where background worker generation 3 fails -> verify 32
+    // calls during failure_cooldown stay 0-hop and do NOT re-invoke the worker.
+    fail_next.store(true, Ordering::SeqCst);
+    tokio::time::advance(Duration::from_secs(7)).await;
+    assert!(matches!(
+        client.cache_state(),
+        CacheState::RefreshDue { .. }
+    ));
+
+    assert_eq!(client.get().await.unwrap(), "token-v2");
+    for _ in 0..20 {
+        if calls.load(Ordering::SeqCst) >= 3 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    // Let ResourceActor::run process handle_refresh_complete(Err) and publish throttle deadline.
+    for _ in 0..5 {
+        tokio::task::yield_now().await;
+    }
+
+    for _ in 0..32 {
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let fut = std::pin::pin!(client.get());
+        match fut.poll(&mut cx) {
+            Poll::Ready(Ok(val)) => assert_eq!(val, "token-v2"),
+            other => panic!("RefreshDue hit during failure cooldown must resolve in 0 hops, got {other:?}"),
+        }
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+    // 6. Advance just past the 2s failure cooldown while "token-v2" is still usable (9.05s < 10s),
+    // recover upstream, and confirm the next 0-hop get() triggers generation 4 cleanly.
+    fail_next.store(false, Ordering::SeqCst);
+    tokio::time::advance(Duration::from_millis(2050)).await;
+    assert!(matches!(
+        client.cache_state(),
+        CacheState::RefreshDue { .. }
+    ));
+    {
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let fut = std::pin::pin!(client.get());
+        match fut.poll(&mut cx) {
+            Poll::Ready(Ok(val)) => assert_eq!(val, "token-v2"),
+            other => panic!("Post-cooldown RefreshDue get() must resolve in 0 hops, got {other:?}"),
+        }
+    }
+    for _ in 0..20 {
+        if calls.load(Ordering::SeqCst) >= 4 && matches!(client.cache_state(), CacheState::Fresh { .. }) {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
+    assert_eq!(client.get().await.unwrap(), "token-v4");
 
     root.shutdown().await.unwrap();
 }

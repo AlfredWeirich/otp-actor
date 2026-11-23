@@ -58,6 +58,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   - Added `TimedResource::{is_still_usable_at, is_usable_stale_at}` so `ResourceClient::get()` and `ResourceEndpoint::cache_state()` perform at most one `Instant::now()` call (and zero clock calls for perpetual resources with no refresh threshold).
 
 ### Fixed
+- **Zero-Hop `ResourceClient::get()` & Single-Flight Trigger During `RefreshDue` (`src/actor/generic_actor.rs`, Finding `F-06`):**
+  - Kept `ResourceClient::get()` on the 0-hop `watch` cache fast path for usable `CacheState::RefreshDue` entries instead of falling back to 1-hop `oneshot` + mailbox roundtrips for the entire `expiry_buffer` window.
+  - Added lock-free `refresh_pending` (`AtomicBool`) and `throttle_until_ns` (`AtomicU64`) endpoint state with a fire-and-forget `ResourceCommand::TriggerBackgroundRefresh`, eliminating mailbox stampedes while a background refresh is in flight or throttled by `failure_cooldown`, `failure_backoff_delay`, or retry delay.
+  - Verified with new regression test `test_resource_client_refresh_due_serves_zero_hop_without_mailbox_stampede`.
+- **Immediate Slot Reuse After `stop_child` on Exited/Stopped Tasks (`src/actor/supervisor.rs`, Finding `F-01`):**
+  - Included `ChildPhase::Stopping` in `ChildPhase::is_active_or_terminating` alongside `Stopped` and `Failed(_)` so `start_child` never falsely rejects with `SupervisorError::ChildAlreadyExists` when an exited task's `Stopping -> Stopped` transition is still queued behind `StartChild`.
+  - Updated `Supervisor::trigger_child_shutdown` to inspect `*entry.term_rx.borrow()` immediately: children with no active task (`Failed(_)`, backoff-sleeping `Restarting`, or already exited tasks) transition directly to `ChildPhase::Stopped` (clearing `abort_handle` and `sender`) rather than waiting indefinitely in `ChildPhase::Stopping` for a non-existent `JoinSet` exit.
+  - Verified by `test_stop_child_on_failed_and_backoff_restarting_children_allows_immediate_start_child`.
+- **Canonical `child_order` Preservation in `child_specs` Across Stop/Restart (`src/actor/supervisor.rs`, Finding `F-02`):**
+  - Replaced append-only `child_specs.push(...)` calls in `StartChild` and `handle_restart_child` with `Supervisor::upsert_child_spec`, inserting restored or re-registered `ChildSpec` entries at their canonical `child_order` index.
+  - Extended `handle_restart_child` spec restoration to all strategy-coupled targets (`OneForAll` and `RestForOne` siblings as well as the directly restarted child).
+  - Preserves `RestForOne` dependency ordering and reverse-registration graceful shutdown order across parent supervisor reboots, verified by `test_child_specs_preserve_registration_order_after_stop_restart_and_supervisor_reboot`.
 - **Non-Blocking Remote `try_cast`, Configurable `default_cast_timeout` & Phase-1 Drain Rejection (`src/remote/{endpoint,client,server}.rs`, Finding `F-21`):**
   - Updated `ByteEndpoint::cast_bytes` so `timeout == Some(Duration::ZERO)` invokes `ActorClient::try_cast` directly (returning `Kind::MailboxFull` immediately without blocking), and updated `RemoteActorClient::cast_timeout` / `AnyActorClient::cast_timeout` for symmetric `Duration::ZERO` semantics.
   - Added `ActorNodeService::with_default_cast_timeout` and `ActorNodeBuilder::default_cast_timeout` so operators can configure server-side fallback cast backpressure (including `Some(Duration::ZERO)` for non-blocking load-shedding).

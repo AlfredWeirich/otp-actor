@@ -1,5 +1,15 @@
 # otp-actor — Fault-Tolerant OTP Actors, 0-ms Self-Healing & gRPC Remoting for Tokio
 
+**Code Review vom 23.11.2026 mit gemini Argon:** 
+## 1. Executive Summary & Gesamtbewertung
+`otp-actor` ist ein außergewöhnlich sauber strukturiertes, modernes Rust-Actor-Framework (Edition 2024, MSRV 1.88), das Erlang/OTP-Konzepte (`Supervisor`, `OneForOne` / `OneForAll` / `RestForOne`, `RestartType`, `ShutdownPolicy`, `gen_server`-artiger `StatefulActor` sowie ein spezialisierter `ResourceActor`) mit hoher Idiomatik auf Tokio abbildet.
+
+**Besondere architektonische Stärken:**
+1. **Zero-Cost Trait-Design:** Konsequente Nutzung nativer `impl Future`-Rückgabetypen in `StatefulActor` und `Worker` ohne `#[async_trait]`-Heap-Allokationen (`Box::pin`) im Nachrichten-Hot-Path.
+2. **Strikte Trennung von Control Plane und Data Plane:** 0-Hop `watch`-Cache-Reads beim `ResourceClient`, 1-Hop Bounded-Channels beim `ActorClient` und reaktives 0-ms Rebinding über `watch::Receiver<SlotState>` ohne Polling-Schleifen.
+3. **Sicherheit gegen Allocation-Bombs & Log-Injection:** `BoundedVec` bricht `postcard`-Serialisierung exakt bei `MAX_REMOTE_PAYLOAD_BYTES` (4 MiB) ab; `sanitize_label` nutzt einen Zero-Allocation `Cow::Borrowed`-Fast-Path für valide ASCII/UTF-8-Namen.
+4. **Vorbildliche SemVer-Vorsorge:** Nahezu alle öffentlichen Structs und Enums sind mit `#[non_exhaustive]` versehen, und in Produktionspfaden wird konsequent `PoisonError::into_inner` statt `.unwrap()` verwendet.
+
 **Code Review vom 22.11.2026 mit gemini Argon:** Das Framework `otp-actor` (v0.3.3) weist sowohl im lokalen Actor-/Supervision-Kern als auch in der gRPC-Remoting-Schicht eine sehr saubere, hochperformante Architektur auf.
 > **Latest Release:** `v0.3.3` — see [Release_note_0.3.3.md](Release_note_0.3.3.md) for what's new and upgrade notes.
 >
@@ -146,7 +156,7 @@ flowchart TD
 ```
 
 - **Data plane** —
-  - **In-process:** `ResourceClient::get()` checks a local **0-hop `tokio::sync::watch` cache snapshot** first; on cold starts or near expiry it sends straight to the actor's mailbox over a direct 1-hop `mpsc` channel. `ActorClient::call()` / `ask()` / `cast()` communicate directly with the actor's bounded `mpsc` mailbox.
+  - **In-process:** `ResourceClient::get()` checks a local **0-hop `tokio::sync::watch` cache snapshot** first (covering both `Fresh` and `RefreshDue` entries, while triggering at most one non-blocking background refresh); only on cold starts, hard expiry, or stale-while-error recovery without a usable fresh snapshot does it send to the actor's mailbox over a direct 1-hop `mpsc` channel. `ActorClient::call()` / `ask()` / `cast()` communicate directly with the actor's bounded `mpsc` mailbox.
   - **Remote (`--features remote`):** `RemoteActorClient` sends requests over multiplexed HTTP/2 gRPC to `ActorNodeService`, where `ActorClient<A>` (implementing the type-erased `ByteEndpoint` trait) decodes the `postcard` payload and forwards it directly into the local actor's mailbox.
   - In both cases, **no supervisor is ever in the message request path**.
 - **Control plane** — `Supervisor`s spawn child futures directly into a single-task `JoinSet<TaskResult>`, detect exits/panics via `join_next_with_id()`, execute restart strategies (`OneForOne`, `OneForAll`, `RestForOne`) at *any* depth, and maintain an internal reactive `watch::Sender<SlotState>` per child slot. When a direct `mpsc` channel closes after a crash, clients (and child `SupervisorHandle`s) reactively await the replacement over their `watch` channel—rebinding in 0 ms with **zero polling** (and re-resolving via the managing `SupervisorHandle` only if the parent supervisor itself was restarted).
@@ -453,8 +463,11 @@ Passed to every worker invocation:
 
 ```mermaid
 flowchart TD
-    Get["client.get()"] --> WatchCheck{"0-hop watch snapshot<br/>fresh & valid?"}
-    WatchCheck -- yes --> WatchHit(["reply in 0 hops<br/>(no mailbox roundtrip)"])
+    Get["client.get()"] --> WatchCheck{"0-hop watch snapshot<br/>still usable?"}
+    WatchCheck -- yes --> WatchDue{"inside expiry buffer and<br/>no refresh pending/throttled?"}
+    WatchDue -- yes --> TryBg["non-blocking try_send<br/>TriggerBackgroundRefresh"]
+    WatchDue -- no --> WatchHit(["reply in 0 hops<br/>(no mailbox roundtrip)"])
+    TryBg --> WatchHit
     WatchCheck -- no --> HasRes{"actor cache state?"}
     HasRes -- "usable" --> Serve["reply immediately<br/>(clone of cached value)"]
     Serve --> Soon{"inside expiry buffer<br/>and no refresh running?"}
@@ -474,7 +487,7 @@ flowchart TD
 
 Key properties:
 
-- **0-hop cache reads.** Fresh snapshots are published to a lock-free `tokio::sync::watch` channel, so steady-state `client.get()` calls avoid both mailbox queuing and `oneshot` allocation.
+- **0-hop cache reads.** Usable snapshots (both `Fresh` and `RefreshDue`) are served from a lock-free `tokio::sync::watch` channel, so steady-state `client.get()` calls avoid both mailbox queuing and `oneshot` allocation even while a background refresh or failure cooldown is active.
 - **Single-flight.** At most one worker runs per actor at any time. Concurrent callers during a cold start are parked and all answered by the same result.
 - **Cache hits never block.** A valid cached value is returned immediately; refreshes happen in the background.
 - **Generation guard.** Every worker run gets a new `generation`. Results (or timeouts/panics) from superseded generations are ignored, so a slow, old fetch can never overwrite a newer value.
@@ -1277,8 +1290,8 @@ let prom_text = format_prometheus_metrics(&status);
 | `get_actor_client::<A>(name)` | Returns a typed `ActorClient<A>` for a supervised `StatefulActor`. Fails with `ChildTypeMismatch` if `A` does not match the actor. |
 | `get_supervisor(name)` | Returns a resilient child `SupervisorHandle` for a supervised child `Supervisor`. |
 | `start_child(spec)` | Starts and supervises a new child (`ResourceActor`, `StatefulActor`, or child `Supervisor`). |
-| `restart_child(name)` | Manually recovers a failed or stopped child (and dependent siblings under `OneForAll` / `RestForOne`), gracefully awaiting termination of any running instance before spawning the replacement. |
-| `stop_child(name)` | Gracefully stops a supervised child according to its `ShutdownPolicy` and disables auto-restart on supervisor reboot. |
+| `restart_child(name)` | Manually recovers a failed or stopped child (and dependent siblings under `OneForAll` / `RestForOne`), restoring its spec in canonical registration order and gracefully awaiting termination of any running instance before spawning the replacement. |
+| `stop_child(name)` | Gracefully stops a supervised child (`Running`, backoff-`Restarting`, or `Failed`) according to its `ShutdownPolicy`, removes its spec from automatic supervisor reboot while keeping its registration slot, and allows immediate reuse via `start_child`. |
 | `delete_child(name)` | Gracefully stops (if running) and completely removes a child's specification and state from the supervisor. |
 | `snapshot()` | Captures a point-in-time `SupervisorSnapshot` bounded by `DEFAULT_SNAPSHOT_TIMEOUT` (2 s). Returns ordered child snapshots (`ChildStatus`, `instance_id`, `RestartType`, `restarts_in_window`) and helpers (`all_running()`, `any_failed()`, etc.). |
 | `snapshot_timeout(d)` | Like `snapshot()`, bounded by an explicit `Duration` → `SupervisorError::Timeout(d)`. |
@@ -1295,7 +1308,7 @@ let prom_text = format_prometheus_metrics(&status);
 
 | Method | Description |
 | --- | --- |
-| `get()` | Returns the resource. Fresh hits are served in **0 hops** directly from the `watch` snapshot without crossing the actor mailbox. On cold start, expiry, or crash, transparently falls back to the 1-hop mailbox and re-binds reactively via `SlotState` (up to 3 attempts), propagating terminal supervisor errors (e.g. `ChildNotFound`, `MaxRestartsExceeded`) immediately. |
+| `get()` | Returns the resource. Both `Fresh` and `RefreshDue` hits are served in **0 hops** directly from the `watch` snapshot without `oneshot` allocation or mailbox waiting, triggering at most one non-blocking `TriggerBackgroundRefresh` when no refresh is already pending or throttled. On cold start, hard expiry, stale-while-error recovery, or crash, transparently falls back to the 1-hop mailbox and re-binds reactively via `SlotState` (up to 3 attempts), propagating terminal supervisor errors (e.g. `ChildNotFound`, `MaxRestartsExceeded`) immediately. |
 | `get_timeout(d)` | Like `get()` with a client-side deadline → `ResourceError::Timeout(Duration)`. |
 | `cache_state()` | Synchronously classifies the locally cached resource as a `CacheState` (`Empty`, `Fresh`, `RefreshDue`, `StaleUsable`, `Expired`, `Invalidated`) with timing metadata. Reads the 0-hop `watch` cache only: no mailbox hop, no supervisor contact, no refresh, and the value is never exposed. After a crash before the next `get()` rebinds, reports `Invalidated`. |
 | `force_refresh()` | Immediately starts a new fetch, superseding any in-flight one, invalidating the 0-hop cache, and clearing failure state / cooldown. Transparently re-binds if the channel was closed by a prior crash. |
@@ -1424,8 +1437,8 @@ The output is intentionally verbose (emoji-tagged log lines such as `🔥 Eager 
 ## Testing
 
 ```bash
-cargo test                                            # core suite + doc-tests (109 + 4 = 113)
-cargo test --all-features                             # core, remote gRPC, unit & doc-tests (109 + 13 + 4 + 4 = 130)
+cargo test                                            # core suite + doc-tests (112 + 4 = 116)
+cargo test --all-features                             # core, remote gRPC, unit & doc-tests (112 + 13 + 4 + 4 = 133)
 cargo test --test actor_supervision_test              # core integration suite only
 cargo test --test remote_grpc_test --features remote  # remote gRPC suite only
 cargo test test_strategy_rest_for_one -- --nocapture  # a single test with logs
@@ -1435,13 +1448,13 @@ cargo test test_strategy_rest_for_one -- --nocapture  # a single test with logs
 
 > **Remote test suite ([`tests/remote_grpc_test.rs`](tests/remote_grpc_test.rs)):** 13 tests (10 end-to-end TCP/HTTP2 integration tests + 3 in-process gRPC service unit tests) covering request/response `call`, `ask`/`ask_timeout`, `cast`, `cast_timeout` (including non-blocking `Duration::ZERO` `try_cast` load-shedding), domain error round-tripping, location transparency (`AnyActorClient`, `AnyNodeMonitor`), `ActorNodeAdmin` (`Health` & `Status` RPCs including degraded snapshots when a subtree hangs), crash recovery over an active channel, wire protocol version checks, request authorization hooks, untrusted label sanitization, timeout clamping & headroom budgeting, trailing-byte rejection, Phase-1 draining rejection, and coordinated 2-phase graceful shutdown.
 
-The integration suite in [`tests/actor_supervision_test.rs`](tests/actor_supervision_test.rs) covers 109 deterministic tests:
+The integration suite in [`tests/actor_supervision_test.rs`](tests/actor_supervision_test.rs) covers 112 deterministic tests:
 
 | Topic | Tests |
 | --- | --- |
-| Builder & caching | `test_builder_and_eager_prewarm`, `test_proactive_timer_refresh`, `test_stale_while_error_serves_expired_cache`, `test_force_refresh_bypasses_failure_cooldown`, `test_ttl_duration_max_no_panic`, `test_force_refresh_aborts_in_flight_worker`, `test_ttl_shorter_than_expiry_buffer_does_not_storm_refresh_on_get`, `test_large_jitter_and_zero_ttl_do_not_cause_refresh_storm`, `test_default_failure_cooldown_fast_fails_second_call`, `test_stale_while_error_background_refresh_throttled_when_cooldown_zero`, `test_resource_fast_path_single_timestamp_boundary_and_perpetual_get`, `test_resource_actor_zero_clones_on_prewarm_and_exact_waiter_clones`, `test_config_builders_and_debug_impls_for_public_types` |
-| Strategies & recursive tree | `test_strategy_one_for_all`, `test_strategy_rest_for_one`, `test_top_level_supervisor_supports_rest_for_one_strategy`, `test_three_level_nested_supervisor_hierarchy_and_subtree_recovery`, `test_rest_for_one_overlapping_backoffs_and_failed_downstream_recovery`, `test_sibling_isolation_during_crash`, `test_root_supervisor_shutdown_aborts_entire_tree`, `test_one_for_all_and_restart_child_graceful_on_stop_without_overlap`, `test_one_for_all_crash_and_restart_child_terminate_siblings_sequentially_in_reverse_order`, `test_rest_for_one_crash_and_max_restarts_terminate_downstream_sequentially_in_reverse_order`, `test_duplicate_service_supervisor_does_not_boot_children`, `test_supervisor_child_order_remains_deduplicated_across_stop_restart_and_delete`, `test_single_task_child_future_runs_in_supervisor_join_set_and_recovers_on_panic` |
-| Restart types & graceful shutdown | `test_restart_type_permanent_restarts_on_normal_exit`, `test_restart_type_transient_stops_on_normal_exit_but_restarts_on_crash`, `test_restart_type_temporary_never_restarts_even_on_crash`, `test_stop_child_completes_in_flight_worker_gracefully`, `test_stop_child_prevents_overlapping_start_child_while_on_stop_running`, `test_shutdown_policy_timeout_aborts_hung_actor`, `test_root_supervisor_graceful_shutdown_cascade`, `test_sequential_graceful_shutdown_in_reverse_registration_order`, `test_stopped_and_deleted_children_do_not_resurrect_on_supervisor_restart`, `test_root_supervisor_drop_aborts_services_even_with_active_handles`, `test_request_shutdown_from_actor_handler_does_not_deadlock`, `test_child_supervisor_shutdown_and_request_shutdown_rebind_after_supervisor_restart` |
+| Builder & caching | `test_builder_and_eager_prewarm`, `test_proactive_timer_refresh`, `test_stale_while_error_serves_expired_cache`, `test_force_refresh_bypasses_failure_cooldown`, `test_ttl_duration_max_no_panic`, `test_force_refresh_aborts_in_flight_worker`, `test_ttl_shorter_than_expiry_buffer_does_not_storm_refresh_on_get`, `test_large_jitter_and_zero_ttl_do_not_cause_refresh_storm`, `test_default_failure_cooldown_fast_fails_second_call`, `test_stale_while_error_background_refresh_throttled_when_cooldown_zero`, `test_resource_fast_path_single_timestamp_boundary_and_perpetual_get`, `test_resource_client_refresh_due_serves_zero_hop_without_mailbox_stampede`, `test_resource_actor_zero_clones_on_prewarm_and_exact_waiter_clones`, `test_config_builders_and_debug_impls_for_public_types` |
+| Strategies & recursive tree | `test_strategy_one_for_all`, `test_strategy_rest_for_one`, `test_top_level_supervisor_supports_rest_for_one_strategy`, `test_three_level_nested_supervisor_hierarchy_and_subtree_recovery`, `test_rest_for_one_overlapping_backoffs_and_failed_downstream_recovery`, `test_sibling_isolation_during_crash`, `test_root_supervisor_shutdown_aborts_entire_tree`, `test_one_for_all_and_restart_child_graceful_on_stop_without_overlap`, `test_one_for_all_crash_and_restart_child_terminate_siblings_sequentially_in_reverse_order`, `test_rest_for_one_crash_and_max_restarts_terminate_downstream_sequentially_in_reverse_order`, `test_duplicate_service_supervisor_does_not_boot_children`, `test_supervisor_child_order_remains_deduplicated_across_stop_restart_and_delete`, `test_single_task_child_future_runs_in_supervisor_join_set_and_recovers_on_panic`, `test_child_specs_preserve_registration_order_after_stop_restart_and_supervisor_reboot` |
+| Restart types & graceful shutdown | `test_restart_type_permanent_restarts_on_normal_exit`, `test_restart_type_transient_stops_on_normal_exit_but_restarts_on_crash`, `test_restart_type_temporary_never_restarts_even_on_crash`, `test_stop_child_completes_in_flight_worker_gracefully`, `test_stop_child_prevents_overlapping_start_child_while_on_stop_running`, `test_shutdown_policy_timeout_aborts_hung_actor`, `test_root_supervisor_graceful_shutdown_cascade`, `test_sequential_graceful_shutdown_in_reverse_registration_order`, `test_stopped_and_deleted_children_do_not_resurrect_on_supervisor_restart`, `test_root_supervisor_drop_aborts_services_even_with_active_handles`, `test_request_shutdown_from_actor_handler_does_not_deadlock`, `test_child_supervisor_shutdown_and_request_shutdown_rebind_after_supervisor_restart`, `test_stop_child_on_failed_and_backoff_restarting_children_allows_immediate_start_child` |
 | Stateful actors (`StatefulActor`) | `test_stateful_actor_call_and_cast_with_crash_recovery`, `test_handle_cast_call_message_ask_and_send_after`, `test_try_cast_mailbox_full_and_cast_timeout`, `test_try_cast_rebinds_synchronously_after_restart`, `test_try_cast_returns_unavailable_while_restarting_and_supervisor_error_on_terminal_states`, `test_stateful_actor_lifecycle_hooks_on_start_and_on_stop`, `test_mixed_supervision_resource_actor_and_stateful_actor_one_for_all`, `test_stateful_actor_ctx_stop_drains_all_queued_messages`, `test_stateful_actor_graceful_shutdown_drains_messages_queued_after_shutdown_envelope`, `test_stateful_actor_handler_timeout_fails_fast_and_restarts_cleanly`, `test_stateful_actor_non_clone_message_rebind_and_call_retry_mid_handler`, `test_stateful_actor_ctx_fail_and_handler_timeout_rescue_buffered_non_clone_calls`, `test_stateful_actor_simulate_crash_rescues_buffered_non_clone_calls`, `test_stateful_actor_on_start_failure_triggers_supervisor_recovery` |
 | Timers, streams & scoped tasks | `test_actor_context_send_interval_ticks_abort_and_lifecycle_cancel`, `test_actor_context_send_interval_with_non_clone_and_skips_missed_ticks_under_backpressure`, `test_actor_context_send_interval_cancels_on_panic_and_ignores_zero_or_max_duration`, `test_actor_context_forward_receiver_no_permit_starvation_backpressure_and_cleanup`, `test_actor_context_spawn_scoped_panic_isolation_and_no_cross_instance_leak` |
 | Runtime introspection & telemetry | `test_restart_tracker_restarts_in_window_ages_out_without_new_crash`, `test_supervisor_snapshot_ordered_children_helpers_and_flapping`, `test_supervisor_snapshot_timeout_during_backoff_and_fast_fail_on_shutdown`, `test_supervisor_watch_child_status_allows_stopped_and_failed_and_observes_transitions`, `test_actor_client_queue_stats_backpressure_and_post_crash_pre_rebind_caveat`, `test_supervisor_snapshot_tree_nested_hierarchy_helpers_find_and_restarting_subtree`, `test_supervisor_snapshot_tree_timeout_isolates_stuck_subtree_and_reports_stopped_and_failed`, `test_resource_client_cache_state_lifecycle_fresh_refresh_due_stale_and_expired`, `test_resource_client_cache_state_perpetual_no_stale_window_and_invalidation`, `test_local_node_monitor_health_and_degraded_recovery`, `test_local_node_monitor_status_metrics_queue_cache_and_restarts`, `test_format_prometheus_metrics_exposition_and_label_escaping`, `test_format_prometheus_metrics_nested_supervisor_path_escaping`, `test_stateful_actor_metrics_latency_uses_tokio_virtual_time`, `test_tracing_spans_propagate_to_actors_workers_and_scoped_tasks` |
