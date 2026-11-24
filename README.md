@@ -1,17 +1,6 @@
 # otp-actor — Fault-Tolerant OTP Actors, 0-ms Self-Healing & gRPC Remoting for Tokio
 
-**Code Review vom 23.11.2026 mit gemini Argon:** 
-## 1. Executive Summary & Gesamtbewertung
-`otp-actor` ist ein außergewöhnlich sauber strukturiertes, modernes Rust-Actor-Framework (Edition 2024, MSRV 1.88), das Erlang/OTP-Konzepte (`Supervisor`, `OneForOne` / `OneForAll` / `RestForOne`, `RestartType`, `ShutdownPolicy`, `gen_server`-artiger `StatefulActor` sowie ein spezialisierter `ResourceActor`) mit hoher Idiomatik auf Tokio abbildet.
-
-**Besondere architektonische Stärken:**
-1. **Zero-Cost Trait-Design:** Konsequente Nutzung nativer `impl Future`-Rückgabetypen in `StatefulActor` und `Worker` ohne `#[async_trait]`-Heap-Allokationen (`Box::pin`) im Nachrichten-Hot-Path.
-2. **Strikte Trennung von Control Plane und Data Plane:** 0-Hop `watch`-Cache-Reads beim `ResourceClient`, 1-Hop Bounded-Channels beim `ActorClient` und reaktives 0-ms Rebinding über `watch::Receiver<SlotState>` ohne Polling-Schleifen.
-3. **Sicherheit gegen Allocation-Bombs & Log-Injection:** `BoundedVec` bricht `postcard`-Serialisierung exakt bei `MAX_REMOTE_PAYLOAD_BYTES` (4 MiB) ab; `sanitize_label` nutzt einen Zero-Allocation `Cow::Borrowed`-Fast-Path für valide ASCII/UTF-8-Namen.
-4. **Vorbildliche SemVer-Vorsorge:** Nahezu alle öffentlichen Structs und Enums sind mit `#[non_exhaustive]` versehen, und in Produktionspfaden wird konsequent `PoisonError::into_inner` statt `.unwrap()` verwendet.
-
-**Code Review vom 22.11.2026 mit gemini Argon:** Das Framework `otp-actor` (v0.3.3) weist sowohl im lokalen Actor-/Supervision-Kern als auch in der gRPC-Remoting-Schicht eine sehr saubere, hochperformante Architektur auf.
-> **Latest Release:** `v0.3.3` — see [Release_note_0.3.3.md](Release_note_0.3.3.md) for what's new and upgrade notes.
+> **Current Version:** `0.4.0` — see [CHANGELOG.md](CHANGELOG.md) for what's new and upgrade notes.
 >
 > **Note:** This crate is based on code developed in a large production system since 2024 and is now being extracted step by step into a standalone crate.
 
@@ -182,11 +171,11 @@ flowchart TD
 | Dynamic Child | [`examples/dynamic_child.rs`](examples/dynamic_child.rs) | Dynamically spawning sibling child actors at runtime via `ctx.supervisor()`. |
 | Dynamic Supervisor | [`examples/dynamic_supervisor.rs`](examples/dynamic_supervisor.rs) | Dynamically provisioning isolated `OneForAll` child `Supervisor` subtrees at runtime. |
 | Remote All-in-One Showcase | [`examples/remote/all_in_one.rs`](examples/remote/all_in_one.rs) | Full remote lifecycle: hosting, gRPC client calls, crash self-healing, client-initiated `ctx.stop()`, and 2-phase shutdown. |
-| Remote Server Node (Rechner B) | [`examples/remote/server.rs`](examples/remote/server.rs) | Standalone daemon hosting actors under OTP supervision over network gRPC (default: `http://127.0.0.1:50051`, override via `REMOTE_ADDR`). |
-| Remote Client (Rechner A) | [`examples/remote/client.rs`](examples/remote/client.rs) | Lightweight client invoking remote actors with location transparency and testing crash recovery. |
+| Remote Server Node | [`examples/remote/server.rs`](examples/remote/server.rs) | Standalone daemon hosting actors under OTP supervision over network gRPC (default: `http://127.0.0.1:50051`, override via `REMOTE_ADDR`). |
+| Remote Client | [`examples/remote/client.rs`](examples/remote/client.rs) | Lightweight client invoking remote actors with location transparency and testing crash recovery. |
 | Remote Telemetry Monitor | [`examples/remote/monitor.rs`](examples/remote/monitor.rs) | Shows `ActorNodeAdmin` (`Health`/`Status`), Bearer-token `Authorizer`, `AnyNodeMonitor` (`Local` vs. `Remote`), `RemoteMetricsSnapshot`, and remote Prometheus output (`--example remote_monitor`). |
-| Integration tests | [`tests/actor_supervision_test.rs`](tests/actor_supervision_test.rs) | 89 tests covering recursive supervision, 0-hop caching, stateful actors, timers & stream forwarding, `ActorScope`, runtime introspection (`snapshot`, `snapshot_tree`, `watch_child_status`, `queue_stats`, `cache_state`), local telemetry (`LocalNodeMonitor`, `format_prometheus_metrics`), restart types, graceful shutdown, timeouts, backpressure, and factory panic isolation. |
-| Remote gRPC tests | [`tests/remote_grpc_test.rs`](tests/remote_grpc_test.rs) | 11 tests covering TCP/HTTP2 transport, location transparency (`AnyActorClient`, `AnyNodeMonitor`), `ActorNodeAdmin` (`Health`/`Status`), crash recovery, protocol versioning, request authorization, label sanitization, timeouts, and 2-phase drainage. |
+| Integration tests | [`tests/actor_supervision_test.rs`](tests/actor_supervision_test.rs) | 118 tests covering recursive supervision, 0-hop caching, stateful actors, timers & stream forwarding, `ActorScope`, runtime introspection (`snapshot`, `snapshot_tree`, `watch_child_status`, `queue_stats`, `cache_state`), local telemetry (`LocalNodeMonitor`, `format_prometheus_metrics`), restart types, graceful shutdown, timeouts, backpressure, and factory panic isolation. |
+| Remote gRPC tests | [`tests/remote_grpc_test.rs`](tests/remote_grpc_test.rs) | 15 tests covering TCP/HTTP2 transport, location transparency (`AnyActorClient`, `AnyNodeMonitor`), `ActorNodeAdmin` (`Health`/`Status`), crash recovery, protocol versioning, request authorization, label sanitization, timeouts, and 2-phase drainage. |
 
 ---
 
@@ -238,16 +227,16 @@ cargo test
 cargo run --example remote_all_in_one --features remote
 
 # Run in two separate terminals (or across two machines):
-# Terminal 1 (Rechner B / Server Node):
+# Terminal 1 (Server Node):
 cargo run --example remote_server --features remote
 
-# Terminal 2 (Rechner A / Client):
+# Terminal 2 (Client):
 cargo run --example remote_client --features remote
 
 # Run the remote telemetry & AnyNodeMonitor showcase
 cargo run --example remote_monitor --features remote
 
-# Run all 101 core & remote tests (+ 4 doc-tests = 105 total)
+# Run all 141 core, remote, unit & doc-tests (118 + 15 + 4 + 4)
 cargo test --all-features
 
 # Optimized build
@@ -261,10 +250,10 @@ To use the crate from another project in the same workspace or from crates.io, a
 
 ```toml
 [dependencies]
-otp-actor = "0.3.3"
+otp-actor = "0.4.0"
 # Optional features:
-# otp-actor = { version = "0.3.3", features = ["remote"] }
-# otp-actor = { version = "0.3.3", features = ["chaos_test"] }
+# otp-actor = { version = "0.4.0", features = ["remote"] }
+# otp-actor = { version = "0.4.0", features = ["chaos_test"] }
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -756,7 +745,7 @@ When built with `--features remote`, the crate enables distributed actor communi
 
 ```toml
 [dependencies]
-otp-actor = { version = "0.3.3", features = ["remote"] }
+otp-actor = { version = "0.4.0", features = ["remote"] }
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 ```
@@ -1477,7 +1466,7 @@ The integration suite in [`tests/actor_supervision_test.rs`](tests/actor_supervi
 .
 ├── Cargo.toml
 ├── README.md
-├── Release_note_0.3.*.md               # release notes per version (latest: Release_note_0.3.3.md)
+├── CHANGELOG.md                        # version history and upgrade notes
 ├── build.rs                            # compiles actor_node.proto when `--features remote` is active
 ├── proto
 │   └── actor_node.proto                # universal Protobuf wire contract (otp_actor.remote.v1)
