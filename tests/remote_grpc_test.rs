@@ -1569,3 +1569,292 @@ async fn test_actor_node_builder_tower_layer_and_remote_error_eq() {
     node1.shutdown().await.unwrap();
     root.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn test_bearer_token_convenience_methods_provider_rotation_and_metadata_composition() {
+    use otp_actor::actor::HealthState;
+    use otp_actor::remote::proto::remote_error::Kind;
+    use otp_actor::remote::proto::{ActorNode, ActorNodeAdmin, CallRequest, HealthRequest};
+    use otp_actor::remote::{
+        ActorNodeAdminService, ActorNodeService, AnyNodeMonitor, REMOTE_PROTOCOL_VERSION,
+        RemoteNodeMonitor,
+    };
+    use tonic::transport::Endpoint;
+
+    let root = Supervisor::new("bearer-root");
+    let svc = Supervisor::builder("auth-svc").spawn(&root).await.unwrap();
+    let calc = StatefulActorBuilder::from_default::<CalculatorActor>("calc")
+        .spawn(&svc)
+        .await
+        .unwrap();
+
+    let registry = ActorNodeRegistry::new();
+    registry.register("auth-svc", "calc", calc.clone());
+
+    // 1. Node 1: static shared-secret helper `ActorNodeBuilder::bearer_token`
+    let node1 = ActorNodeHandle::builder("127.0.0.1:0".parse().unwrap(), registry.clone())
+        .supervisor(root.clone())
+        .bearer_token("shared-secret")
+        .start()
+        .await
+        .unwrap();
+    let endpoint1 = format!("http://{}", node1.local_addr());
+
+    // Client-side validation rejects empty and invalid-ASCII/newline tokens upfront on all client/monitor types
+    let raw_client = RemoteActorClient::<CalculatorActor>::connect(&endpoint1, "auth-svc", "calc")
+        .await
+        .unwrap();
+    assert!(raw_client.clone().with_bearer_token("").is_err());
+    assert!(raw_client.clone().with_bearer_token("bad\ntoken").is_err());
+    assert!(
+        AnyActorClient::from_local(calc.clone())
+            .with_bearer_token("")
+            .is_err()
+    );
+    assert!(
+        AnyActorClient::from_local(calc.clone())
+            .with_bearer_token("ok-local-token")
+            .is_ok()
+    );
+    assert!(
+        AnyActorClient::from_remote(raw_client.clone())
+            .with_bearer_token("bad\ntoken")
+            .is_err()
+    );
+
+    let raw_monitor = RemoteNodeMonitor::connect(&endpoint1).await.unwrap();
+    assert!(raw_monitor.clone().with_bearer_token("").is_err());
+    assert!(raw_monitor.clone().with_bearer_token("bad\ntoken").is_err());
+    assert!(
+        AnyNodeMonitor::local(root.clone())
+            .with_bearer_token("")
+            .is_err()
+    );
+    assert!(
+        AnyNodeMonitor::local(root.clone())
+            .with_bearer_token("ok-local-token")
+            .is_ok()
+    );
+    assert!(
+        AnyNodeMonitor::from_remote(raw_monitor.clone())
+            .with_bearer_token("bad\ntoken")
+            .is_err()
+    );
+
+    // Unauthenticated and wrong-token RPCs are rejected with `Unauthenticated`
+    let unauth_err = raw_client.call(CalcMsg::Get).await.unwrap_err();
+    assert_eq!(
+        unauth_err.transport_status().map(tonic::Status::code),
+        Some(tonic::Code::Unauthenticated)
+    );
+    let wrong_client = raw_client
+        .clone()
+        .with_bearer_token("wrong-secret")
+        .unwrap();
+    let wrong_err = wrong_client.call(CalcMsg::Get).await.unwrap_err();
+    assert_eq!(
+        wrong_err.transport_status().map(tonic::Status::code),
+        Some(tonic::Code::Unauthenticated)
+    );
+    assert_eq!(node1.remote_metrics().auth_rejected_total, 2);
+
+    // Valid static token succeeds across RemoteActorClient, RemoteNodeMonitor, and AnyNodeMonitor::connect_with
+    let authed_client = raw_client.with_bearer_token("shared-secret").unwrap();
+    authed_client.cast(CalcMsg::Add(7)).await.unwrap();
+    assert_eq!(authed_client.call(CalcMsg::Add(3)).await.unwrap(), 10);
+
+    let authed_monitor = raw_monitor.with_bearer_token("shared-secret").unwrap();
+    assert_eq!(authed_monitor.health().await.unwrap().state, HealthState::Healthy);
+
+    let any_monitor = AnyNodeMonitor::connect_with(Endpoint::from_shared(endpoint1).unwrap())
+        .await
+        .unwrap()
+        .with_bearer_token("shared-secret")
+        .unwrap();
+    assert_eq!(any_monitor.health().await.unwrap().state, HealthState::Healthy);
+
+    // 2. Node 2: `ActorNodeBuilder::bearer_authorizer` (per-service RBAC) + Tower layer requiring `x-trace-id`
+    let trace_layer = tonic::service::InterceptorLayer::new(|req: tonic::Request<()>| {
+        match req.metadata().get("x-trace-id") {
+            Some(v) if v == "req-42" => Ok(req),
+            _ => Err(tonic::Status::invalid_argument("missing x-trace-id")),
+        }
+    });
+    let node2 = ActorNodeHandle::builder("127.0.0.1:0".parse().unwrap(), registry.clone())
+        .supervisor(root.clone())
+        .layer(trace_layer)
+        .bearer_authorizer(|token, svc_name, _actor_name| match (svc_name, token) {
+            ("auth-svc", "svc-v1" | "svc-v2") => Ok(()),
+            ("__admin", "ops-admin") => Ok(()),
+            _ => Err(tonic::Status::permission_denied(
+                "token not authorized for service",
+            )),
+        })
+        .start()
+        .await
+        .unwrap();
+    let endpoint2 = format!("http://{}", node2.local_addr());
+
+    // Metadata composition works in BOTH orders: `with_request_metadata` -> `with_bearer_token` and vice versa
+    let order_a = RemoteActorClient::<CalculatorActor>::connect(&endpoint2, "auth-svc", "calc")
+        .await
+        .unwrap()
+        .with_request_metadata(|m| {
+            m.insert("x-trace-id", "req-42".parse().unwrap());
+        })
+        .with_bearer_token("svc-v1")
+        .unwrap();
+    assert_eq!(order_a.call(CalcMsg::Get).await.unwrap(), 10);
+
+    let order_b = AnyActorClient::<CalculatorActor>::connect(&endpoint2, "auth-svc", "calc")
+        .await
+        .unwrap()
+        .with_bearer_token("svc-v2")
+        .unwrap()
+        .with_request_metadata(|m| {
+            m.insert("x-trace-id", "req-42".parse().unwrap());
+        });
+    assert_eq!(order_b.call(CalcMsg::Add(5)).await.unwrap(), 15);
+
+    // Service token cannot call `__admin`, and admin token cannot call `auth-svc`
+    let svc_on_admin = RemoteNodeMonitor::connect(&endpoint2)
+        .await
+        .unwrap()
+        .with_request_metadata(|m| {
+            m.insert("x-trace-id", "req-42".parse().unwrap());
+        })
+        .with_bearer_token("svc-v1")
+        .unwrap();
+    assert_eq!(
+        svc_on_admin
+            .health()
+            .await
+            .unwrap_err()
+            .transport_status()
+            .map(tonic::Status::code),
+        Some(tonic::Code::PermissionDenied)
+    );
+
+    let admin_ok = AnyNodeMonitor::connect(&endpoint2)
+        .await
+        .unwrap()
+        .with_bearer_token("ops-admin")
+        .unwrap()
+        .with_request_metadata(|m| {
+            m.insert("x-trace-id", "req-42".parse().unwrap());
+        });
+    assert_eq!(admin_ok.health().await.unwrap().state, HealthState::Healthy);
+
+    let admin_on_svc = RemoteActorClient::<CalculatorActor>::connect(&endpoint2, "auth-svc", "calc")
+        .await
+        .unwrap()
+        .with_request_metadata(|m| {
+            m.insert("x-trace-id", "req-42".parse().unwrap());
+        })
+        .with_bearer_token("ops-admin")
+        .unwrap();
+    assert_eq!(
+        admin_on_svc
+            .call(CalcMsg::Get)
+            .await
+            .unwrap_err()
+            .transport_status()
+            .map(tonic::Status::code),
+        Some(tonic::Code::PermissionDenied)
+    );
+
+    // 3. Dynamic token rotation via `with_bearer_token_provider`
+    let current_token = Arc::new(std::sync::Mutex::new(Some("svc-v1".to_string())));
+    let rotating_client =
+        RemoteActorClient::<CalculatorActor>::connect(&endpoint2, "auth-svc", "calc")
+            .await
+            .unwrap()
+            .with_request_metadata(|m| {
+                m.insert("x-trace-id", "req-42".parse().unwrap());
+            })
+            .with_bearer_token_provider({
+                let tok = current_token.clone();
+                move || tok.lock().unwrap().clone()
+            });
+    assert_eq!(rotating_client.call(CalcMsg::Add(1)).await.unwrap(), 16);
+
+    *current_token.lock().unwrap() = Some("svc-v2".to_string());
+    assert_eq!(rotating_client.call(CalcMsg::Add(4)).await.unwrap(), 20);
+
+    *current_token.lock().unwrap() = None;
+    assert_eq!(
+        rotating_client
+            .call(CalcMsg::Get)
+            .await
+            .unwrap_err()
+            .transport_status()
+            .map(tonic::Status::code),
+        Some(tonic::Code::Unauthenticated)
+    );
+
+    // Invalid metadata characters returned by provider log a warning and do not panic
+    *current_token.lock().unwrap() = Some("bad\ntoken".to_string());
+    assert_eq!(
+        rotating_client
+            .call(CalcMsg::Get)
+            .await
+            .unwrap_err()
+            .transport_status()
+            .map(tonic::Status::code),
+        Some(tonic::Code::Unauthenticated)
+    );
+
+    // 4. Direct service-level helpers on `ActorNodeService` and `ActorNodeAdminService`
+    let node_svc = ActorNodeService::new(registry.clone()).with_bearer_token("direct-secret");
+    let mut bad_call = tonic::Request::new(CallRequest {
+        service_name: "auth-svc".into(),
+        actor_name: "calc".into(),
+        payload: Default::default(),
+        timeout_ms: None,
+        protocol_version: REMOTE_PROTOCOL_VERSION,
+    });
+    bad_call
+        .metadata_mut()
+        .insert("authorization", "Bearer wrong".parse().unwrap());
+    assert_eq!(
+        node_svc.call(bad_call).await.unwrap_err().code(),
+        tonic::Code::Unauthenticated
+    );
+    let mut good_call = tonic::Request::new(CallRequest {
+        service_name: "missing-svc".into(),
+        actor_name: "calc".into(),
+        payload: Default::default(),
+        timeout_ms: None,
+        protocol_version: REMOTE_PROTOCOL_VERSION,
+    });
+    good_call
+        .metadata_mut()
+        .insert("authorization", "Bearer direct-secret".parse().unwrap());
+    let resp = node_svc.call(good_call).await.unwrap().into_inner();
+    assert!(matches!(
+        resp.result,
+        Some(otp_actor::remote::proto::call_response::Result::FrameworkError(err))
+            if err.kind == Kind::ServiceNotFound as i32
+    ));
+
+    let admin_svc = ActorNodeAdminService::new(registry, None).with_bearer_authorizer(
+        |token, svc_name, actor_name| {
+            if svc_name == "__admin" && actor_name == "health" && token == "admin-ok" {
+                Ok(())
+            } else {
+                Err(tonic::Status::permission_denied("admin denied"))
+            }
+        },
+    );
+    let mut good_health = tonic::Request::new(HealthRequest {
+        protocol_version: REMOTE_PROTOCOL_VERSION,
+    });
+    good_health
+        .metadata_mut()
+        .insert("authorization", "Bearer admin-ok".parse().unwrap());
+    assert!(admin_svc.health(good_health).await.unwrap().into_inner().alive);
+
+    node2.shutdown().await.unwrap();
+    node1.shutdown().await.unwrap();
+    root.shutdown().await.unwrap();
+}

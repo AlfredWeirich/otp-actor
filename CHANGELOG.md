@@ -12,6 +12,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [0.4.3] - 2026-11-26
+
+`otp-actor` **0.4.3** is a non-breaking feature and documentation release on top of `0.4.2` adding SemVer-compatible Bearer-token authentication helpers for remote gRPC nodes, clients, and monitors.
+
+### Added
+- **Bearer-Token Convenience Helpers & Composable Metadata Injection (`src/remote/{client,monitor,server,mod}.rs`):**
+  - Added [`extract_bearer_token`](src/remote/server.rs) (case-insensitive `"Bearer "` scheme parsing with `Status::unauthenticated` errors that never echo token material) and constant-time comparison helpers.
+  - Added `ActorNodeBuilder::{bearer_authorizer, bearer_token}`, `ActorNodeService::{with_bearer_authorizer, with_bearer_token}`, and `ActorNodeAdminService::{with_bearer_authorizer, with_bearer_token}` protecting both `ActorNode` and `ActorNodeAdmin` RPCs.
+  - Added `RemoteActorClient::{with_bearer_token, with_bearer_token_provider}`, `RemoteNodeMonitor::{with_bearer_token, with_bearer_token_provider}`, `AnyActorClient::{with_request_metadata, with_bearer_token, with_bearer_token_provider}`, and `AnyNodeMonitor::{connect_with, with_request_metadata, with_bearer_token, with_bearer_token_provider}`.
+  - Updated `with_request_metadata` on remote clients and monitors to compose hooks in registration order instead of overwriting previously attached metadata or Bearer injectors.
+  - Verified with `test_extract_bearer_token_and_constant_time_eq` and `test_bearer_token_convenience_methods_provider_rotation_and_metadata_composition`.
+
+### Changed
+- **Examples & Documentation ([`examples/remote/monitor.rs`](examples/remote/monitor.rs), [`README.md`](README.md), [`Cargo.toml`](Cargo.toml)):**
+  - Updated `examples/remote/monitor.rs` to use `ActorNodeBuilder::bearer_token`, `RemoteActorClient::with_bearer_token`, and `RemoteNodeMonitor::with_bearer_token`.
+  - Expanded [`README.md`](README.md) with clearer walkthroughs for `StatefulActor` (`on_stop`, `CallMessage` / `ask`, `Supervisor` setup), timers/streams (`handle_cast` target, `forward_receiver`, `spawn_scoped`), a Mermaid `CacheState` lifecycle diagram for `ResourceActor`, `SupervisionStrategy` definition, a complete two-tier `RestartTracker` + `Supervisor` example, and a production gRPC security guide (TLS/mTLS, Bearer-token helpers, Tower layers, and reverse-proxy / Zero-Trust gateway notes).
+  - Bumped crate version to `0.4.3`.
+
+### Compatibility
+- 100% backwards-compatible with `0.4.2` (additive APIs only; wire protocol unchanged).
+
+---
+
 ## [0.4.2] - 2026-11-25
 
 `otp-actor` **0.4.2** is a documentation-only patch release on top of `0.4.1`.
@@ -296,7 +319,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   - `trigger_service_crash()` → `supervisor.simulate_crash()` / `parent.trigger_child_crash(name)` *(requires `chaos_test`)*
   - `ActorNodeHandle::start(addr, reg, Option<RootSupervisorHandle>)` → `ActorNodeHandle::start(addr, reg, Option<SupervisorHandle>)`
 
-[Unreleased]: https://github.com/AlfredWeirich/otp-actor/compare/v0.4.2...HEAD
+[Unreleased]: https://github.com/AlfredWeirich/otp-actor/compare/v0.4.3...HEAD
+[0.4.3]: https://github.com/AlfredWeirich/otp-actor/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/AlfredWeirich/otp-actor/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/AlfredWeirich/otp-actor/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/AlfredWeirich/otp-actor/compare/v0.3.3...v0.4.0

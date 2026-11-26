@@ -109,7 +109,7 @@
   - [Supported actor types over gRPC](#supported-actor-types-over-grpc)
   - [Architectural overview](#architectural-overview)
   - [Wire contract & RPCs](#wire-contract--rpcs)
-  - [Code example: building a remote node](#code-example-building-a-remote-node)
+  - [Code example: building a remote server node](#code-example-building-a-remote-server-node)
   - [Code example: calling from a remote client](#code-example-calling-from-a-remote-client)
   - [Client-initiated stopping and lifecycle semantics](#client-initiated-stopping-and-lifecycle-semantics)
 - [Client API Reference](#client-api-reference)
@@ -118,7 +118,8 @@
 - [Testing & Code Quality](#testing--code-quality)
 - [Project Layout](#project-layout)
 - [Release Profile](#release-profile)
-- [Known Limitations & Design Notes](#known-limitations--design-notes)
+- [Design Trade-offs & Production Notes](#design-trade-offs--production-notes)
+  - [Securing remote gRPC nodes (TLS/mTLS, Bearer tokens & Tower layers)](#securing-remote-grpc-nodes-tlsmtls-bearer-tokens--tower-layers)
 - [License](#license)
 
 ---
@@ -159,7 +160,7 @@ cargo build
 # Run the core test suite (integration + unit + doc-tests)
 cargo test
 
-# Run all 141 core & remote tests (integration + remote gRPC + unit + doc-tests)
+# Run all 143 core & remote tests (integration + remote gRPC + unit + doc-tests)
 cargo test --all-features
 
 # Optimized release build
@@ -194,6 +195,7 @@ impl StatefulActor for Counter {
         match msg {
             Msg::Add(n) => { self.0 += n; Ok(self.0) }
             Msg::Get => Ok(self.0),
+            // panics in actor: to test supervisor
             Msg::PanicNow => panic!("boom inside instance #{}!", ctx.instance_id()),
         }
     }
@@ -324,13 +326,16 @@ flowchart TD
 Like `Worker`, `StatefulActor` uses native `impl Future` return types (zero `#[async_trait]` / `Box::pin` heap allocations):
 
 ```rust
+use std::time::Duration;
 use otp_actor::{ActorContext, CallMessage, RestartType, StatefulActor, StatefulActorBuilder};
 
+// 1. Private actor state: owned exclusively by the actor task (no `Mutex` needed).
 #[derive(Clone, Default)]
 struct CounterActor {
     total: i64,
 }
 
+// 2. Message protocol accepted by the actor's bounded mailbox.
 #[derive(Clone, Debug)]
 enum CounterMsg {
     Add(i64),
@@ -339,9 +344,11 @@ enum CounterMsg {
 
 impl StatefulActor for CounterActor {
     type Message = CounterMsg;
-    type Response = i64;
-    type Error = String;
+    type Response = i64;   // Unified reply type returned by `client.call(...)`
+    type Error = String;   // Domain error returned to callers (does NOT crash the actor)
 
+    // Required request-response handler (`client.call` / `client.ask`).
+    // Messages are processed sequentially on `&mut self`, so state mutations are race-free.
     async fn handle(
         &mut self,
         msg: Self::Message,
@@ -356,7 +363,9 @@ impl StatefulActor for CounterActor {
         }
     }
 
-    // Optional separate cast handler (defaults to calling `handle` and discarding the reply):
+    // Optional fire-and-forget handler (`client.cast` / `client.try_cast`).
+    // Defaults to calling `handle` and discarding the reply; override it when casts
+    // need a leaner path or different error handling.
     async fn handle_cast(
         &mut self,
         msg: Self::Message,
@@ -366,15 +375,23 @@ impl StatefulActor for CounterActor {
         Ok(())
     }
 
-    // Optional lifecycle hooks:
+    // Optional startup hook: runs on initial boot and after every supervisor restart
+    // before any mailbox message is processed. Returning `Err` aborts startup and
+    // triggers supervision recovery.
     async fn on_start(&mut self, _ctx: &mut ActorContext<Self>) -> Result<(), String> {
         Ok(())
     }
 
+    // Optional graceful-shutdown hook: runs once during an orderly stop (`ctx.stop()`,
+    // `stop_child`, or supervisor shutdown) *after* buffered mailbox messages have been
+    // drained—ideal for flushing state, closing connections, or releasing resources
+    // (not invoked on `ShutdownPolicy::BrutalKill` or panics).
     async fn on_stop(&mut self, _ctx: &mut ActorContext<Self>) {}
 }
 
-// Optional typed ask sub-message unpacking via CallMessage<A>:
+// 3. Optional typed request wrapper via `CallMessage<A>`:
+// Especially helpful when `Response` is an enum with many variants—callers receive
+// `Self::Reply` directly instead of manually unpacking the response enum every time.
 struct GetCount;
 impl From<GetCount> for CounterMsg {
     fn from(_: GetCount) -> Self {
@@ -387,6 +404,13 @@ impl CallMessage<CounterActor> for GetCount {
         Ok(resp)
     }
 }
+```
+
+With `CallMessage<CounterActor>` implemented, callers can pass `GetCount` directly to `ask` or `ask_timeout` and receive the unpacked `i64` reply (works identically on `ActorClient`, `RemoteActorClient`, and `AnyActorClient`):
+
+```rust
+let total: i64 = client.ask(GetCount).await?;
+let total: i64 = client.ask_timeout(GetCount, Duration::from_secs(2)).await?;
 ```
 
 Inside `handle`, `handle_cast`, `on_start`, and `on_stop`, `ctx: &mut ActorContext<Self>` provides:
@@ -403,23 +427,35 @@ Inside `handle`, `handle_cast`, `on_start`, and `on_stop`, `ctx: &mut ActorConte
 
 ### Configuring & spawning via `ActorClient`
 
-Construct a builder with `StatefulActorBuilder::from_default`, `StatefulActorBuilder::from_instance`, `StatefulActorBuilder::new(name, |instance_id| ...)`, or `StatefulActorBuilder::from_config(name, config, factory)` (backed by [`StatefulActorConfig`](src/actor/stateful_actor.rs)):
+Construct a builder with `StatefulActorBuilder::from_default`, `StatefulActorBuilder::from_instance`, `StatefulActorBuilder::new(name, |instance_id| ...)`, or `StatefulActorBuilder::from_config(name, config, factory)` (backed by [`StatefulActorConfig`](src/actor/stateful_actor.rs)).
+
+Because every actor is managed by a supervision tree, `.spawn(&supervisor)` requires a running `SupervisorHandle` created beforehand (for example via `Supervisor::new_root()`, `Supervisor::new("...")`, or a child supervisor via `Supervisor::spawn_child(...)`):
 
 ```rust
+use otp_actor::Supervisor;
+
+// Every actor must be spawned under a supervisor—create one first
+// (or reuse an existing root / child `SupervisorHandle`):
+let supervisor = Supervisor::new_root();
+
+// Register and boot the actor, returning a cloneable, self-healing `ActorClient<CounterActor>`:
 let client = StatefulActorBuilder::from_default::<CounterActor>("session-counter")
-    .restart_type(RestartType::Permanent)
-    .shutdown_timeout(Duration::from_secs(2))
+    .restart_type(RestartType::Permanent)          // always restart on exit or crash
+    .shutdown_timeout(Duration::from_secs(2))      // wait up to 2 s for drain + `on_stop()`
     .spawn(&supervisor)
     .await?;
 
-// Fire-and-forget notification (gen_server:cast) & non-blocking backpressure check
-client.cast(CounterMsg::Add(10)).await?;
-client.try_cast(CounterMsg::Add(1))?; // Err(ActorError::MailboxFull) when saturated
+// Fire-and-forget notifications (`gen_server:cast`):
+client.cast(CounterMsg::Add(10)).await?;           // awaits mailbox capacity if full
+client.try_cast(CounterMsg::Add(1))?;              // non-blocking: Err(ActorError::MailboxFull) when saturated
 
-// Request-response (gen_server:call) & typed CallMessage ask
-let current = client.call(CounterMsg::Add(5)).await?;
-let total: i64 = client.ask(GetCount).await?;
+// Request-response (`gen_server:call`) & typed `CallMessage` unpacking (`ask`):
+let current = client.call(CounterMsg::Add(5)).await?; // waits for `handle()` reply
+let total: i64 = client.ask(GetCount).await?;         // uses `CallMessage<CounterActor>` from example above
 assert_eq!((current, total), (16, 16));
+
+// Orderly shutdown drains buffered messages and invokes `on_stop()`:
+supervisor.shutdown().await?;
 ```
 
 `StatefulActorBuilder` options:
@@ -438,46 +474,95 @@ Finish the builder with `.spawn(&supervisor)`, `.build_child_spec()`, or `.into(
 
 ### Timers, streams & scoped background tasks
 
-Instead of manually spawning detached `tokio::spawn` loops with raw `ActorClient` handles (which can outlive an actor restart and leak work or inject stale messages into a fresh incarnation), bind background tasks directly to the current actor instance via `ActorContext`:
+If you start a background loop in `on_start()` with a plain `tokio::spawn` and a self-healing `ActorClient`, that loop **keeps running even after the actor crashes and restarts**: the old task rebinds to the fresh actor instance while the new `on_start()` spawns a second loop—causing task leaks and duplicate messages.
+
+Instead, bind timers, channel forwarders, and custom loops directly to the **current actor instance** via `ActorContext`. Every message they emit arrives as a normal fire-and-forget `cast` in `handle_cast()` / `handle()`, and every task is **automatically cancelled** when that actor instance stops, fails, or panics:
 
 ```rust
+// Example actor message enum (`type Message = Msg;`):
+#[derive(Clone)]
+enum Msg {
+    Heartbeat,
+    Tick(Instant),
+    InboundEvent(String), // payload type `T` from `external_rx: mpsc::Receiver<T>` (any domain type works)
+    Item(String),         // item type yielded by an external async stream
+}
+
 async fn on_start(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), String> {
-    // Periodic ticks: first tick arrives after `period`, uses MissedTickBehavior::Skip under
-    // backpressure, and stops automatically if this actor instance exits, crashes, or panics.
+    // 1. Fixed periodic message (requires `Msg: Clone`):
+    //    Sends `Msg::Heartbeat` every 5 s (first tick after 5 s) to this actor's own mailbox
+    //    If the actor is busy, missed ticks are skipped (`MissedTickBehavior::Skip`)
+    //    instead of piling up. Stops automatically when this instance exits or crashes.
     ctx.send_interval(Duration::from_secs(5), Msg::Heartbeat);
 
-    // Non-Clone / lazy payload variant (`make_msg` runs only after reserving a mailbox permit):
+    // 2. Dynamic / non-Clone periodic message:
+    //    Calls the closure on every tick to build a fresh message (here: the current
+    //    timestamp instead of a stale timestamp cloned from startup). The closure only
+    //    runs *after* a mailbox slot is reserved, avoiding wasted work under backpressure.
+    //    (Both methods return an `AbortHandle` if you also want to cancel a timer early.)
     ctx.send_interval_with(Duration::from_secs(1), || Msg::Tick(Instant::now()));
 
     Ok(())
 }
+
+// Both timer messages arrive sequentially in this actor's own `handle_cast` (or `handle`):
+async fn handle_cast(&mut self, msg: Msg, _ctx: &mut ActorContext<Self>) -> Result<(), String> {
+    match msg {
+        Msg::Heartbeat => self.emit_heartbeat(),
+        Msg::Tick(now) => self.evict_expired_sessions(now),
+        _ => {}
+    }
+    Ok(())
+}
 ```
 
-For external channels or custom async loops:
+An actor should never block its own `handle()` loop waiting on external I/O or streams. To feed external events into an actor without blocking its mailbox, call either `ctx.forward_receiver` or `ctx.spawn_scoped` (typically inside `on_start()`):
+
+- **`ctx.forward_receiver(rx, map_msg)`** is the one-liner when you already have a `tokio::sync::mpsc::Receiver<T>`: it does **not** replace the actor's own mailbox—instead, it spawns a lightweight bridge task that reads from `rx`, converts each item with `map_msg`, and forwards it *additionally* as a `cast` into this actor's mailbox (`handle_cast` / `handle`), alongside regular `ActorClient` `call`/`cast` messages (you can even attach multiple forwarders at once).
+- **`ctx.spawn_scoped(|mut scope| async move { ... })`** is the general-purpose version for arbitrary async sources (WebSocket readers, Kafka consumers, TCP streams, Redis Pub/Sub, etc.). The `scope: ActorScope<Self>` handle lets you watch for shutdown via `scope.cancelled()` and push messages to `self` via `scope.cast(...)` / `scope.try_cast(...)`.
 
 ```rust
-// 1. Forward external mpsc streams without holding mailbox permits while idle:
+// 1. Bridge an existing `tokio::sync::mpsc::Receiver<String>` (or any domain type `T`) into this actor:
+//    - `Msg::InboundEvent` is shorthand for `|ev| Msg::InboundEvent(ev)`; each item arrives in `handle_cast` / `handle`.
+//    - Awaits `external_rx.recv()` *before* reserving a mailbox slot (no idle permit starvation),
+//      and applies natural backpressure when this actor's mailbox is full.
+//    - Exits automatically when `external_rx` closes or when this actor instance stops/crashes.
 ctx.forward_receiver(external_rx, Msg::InboundEvent);
 
-// 2. Or spawn a custom task bound to this exact instance via ActorScope<Self>:
+// 2. Run a custom async background loop bound to this exact actor instance:
+//    `ActorScope<Self>` is pinned to the current `instance_id`—unlike `ActorClient`, it never
+//    rebinds to a replacement after a crash, so stale stream items cannot leak across restarts.
 ctx.spawn_scoped(|mut scope| async move {
     loop {
         tokio::select! {
+            // `biased;` always checks cancellation first so shutdown/crash exits immediately
+            // even if `stream` has buffered items ready:
             biased;
+
+            // Resolves as soon as this actor instance stops gracefully, fails, or panics:
             _ = scope.cancelled() => break,
-            Some(item) = stream.next() => {
-                if scope.cast(Msg::Item(item)).await.is_err() {
-                    break;
+
+            // Read the next item from an external async stream (e.g. WebSocket / TCP / Kafka):
+            next_item = stream.next() => match next_item {
+                Some(item) => {
+                    // Deliver to this actor's own mailbox (`handle_cast` / `handle`).
+                    // Returns `Err(ActorError::ActorUnavailable)` if this instance just exited:
+                    if scope.cast(Msg::Item(item)).await.is_err() {
+                        break;
+                    }
                 }
+                // External stream ended cleanly -> stop the background task:
+                None => break,
             }
         }
     }
+    // Optional cleanup (e.g. close socket / flush consumer offset) runs here before task exit.
 });
 ```
 
 Key design guarantees:
 - **Zero-duration guard:** `send_interval` and `send_interval_with` ignore `Duration::ZERO` (logging a warning and returning a completed `AbortHandle`) rather than panicking.
-- **No idle permit starvation:** `send_interval_with` and `forward_receiver` wait for input *first* and only then reserve a bounded mailbox slot (`tx.reserve()`), so even `channel_capacity(1)` actors never deadlock waiting on an idle timer/stream.
+- **No idle permit starvation:** `send_interval_with` and `forward_receiver` wait for input *first* and only then reserve a bounded mailbox slot (`tx.reserve()`), so even `channel_capacity(1)` actors never deadlock waiting on an idle timer or stream.
 - **No cross-instance leaks:** Unlike `ActorClient`, `ActorScope<A>` is pinned to a single `instance_id` and intentionally **never** rebinds after a crash—returning `Err(ActorError::ActorUnavailable)` once that instance exits.
 
 For a complete, runnable blueprint combining `send_interval_with`, `forward_receiver`, and `spawn_scoped` (including verified `ActorScope` cancellation across crash recovery and shutdown), run [`examples/microservice_pipeline.rs`](examples/microservice_pipeline.rs) (`cargo run --example microservice_pipeline`).
@@ -535,11 +620,11 @@ When state must survive restarts, combine `StatefulActor` with external storage 
 
 ## Resource Actors (`ResourceActor`)
 
-[`ResourceActor`](src/actor/generic_actor.rs) is specialized for fetching, caching, and proactively refreshing expiring resources (OAuth2 tokens, database credentials, signed URLs, configuration snapshots). Steady-state reads bypass the actor mailbox completely via a **0-hop `tokio::sync::watch` cache**.
+[`ResourceActor`](src/actor/generic_actor.rs) is specialized for fetching, caching, and proactively refreshing expiring resources (OAuth2 tokens, database credentials, signed URLs, configuration snapshots). Once the cache is populated, normal steady-state reads (`Fresh` or still-usable `RefreshDue`) bypass the actor mailbox completely via a **0-hop `tokio::sync::watch` cache**—the actor mailbox is only contacted on cold starts, hard expiry, invalidation, or error recovery.
 
 ### Workers (`Worker<T, E>`)
 
-A `Worker<T, E>` produces a `TimedResource<T>` or an error `E`:
+A `Worker<T, E>` encapsulates the pure async fetch/refresh logic (such as requesting an OAuth token, rotating credentials, or loading a config snapshot), while `ResourceActor` handles everything around it—single-flight deduplication, caching, proactive background refreshes, timeouts, backoff, and panic isolation—by running the worker in an isolated background task whenever a fresh `TimedResource<T>` is needed:
 
 ```rust
 pub trait Worker<T, E>: Send + Sync + 'static {
@@ -548,22 +633,28 @@ pub trait Worker<T, E>: Send + Sync + 'static {
 }
 ```
 
-Because `execute` returns `impl Future`, no boxing is required. There are three equally valid ways to supply a worker:
+Because `execute` returns `impl Future`, no boxing is required.
+
+There are three equally valid ways to supply a worker:
 
 **1. A custom struct** (good for configuration and dependencies):
 
 ```rust
-struct GcpTokenWorker { scope: String }
+// Custom struct holding your own domain configuration or shared clients (e.g. an OAuth2 scope):
+struct GcpTokenWorker {
+    oauth_scope: String,
+}
 
 impl Worker<String, TokenError> for GcpTokenWorker {
     async fn execute(&self, ctx: WorkerContext) -> Result<TimedResource<String>, TokenError> {
-        let token = fetch_token(&self.scope, ctx.generation).await?;
+        let token = fetch_token(&self.oauth_scope, ctx.generation).await?;
         Ok(TimedResource::with_ttl(token, Duration::from_secs(3600)))
     }
 }
 
-ResourceActor::builder("gcp-storage")
-    .worker(GcpTokenWorker { scope: "gcp-storage".into() });
+ResourceActor::builder("gcp-storage").worker(GcpTokenWorker {
+    oauth_scope: "https://www.googleapis.com/auth/devstorage.read_only".into(),
+});
 ```
 
 **2. A standalone `async fn`:**
@@ -607,19 +698,31 @@ TimedResource::with_ttl(value, Duration::from_secs(300)); // expires 300 s from 
 TimedResource::perpetual(value);                          // never expires
 ```
 
-The actor reasons about three time zones for a cached resource:
+Over its lifetime, a cached resource moves through four expiry phases (matching `CacheState`):
 
-```text
- fetched                         expires_at - expiry_buffer        expires_at        expires_at + stale_while_error
-    |------------ FRESH ---------------|------- STALE-SOON -------|---- EXPIRED ----|-- hard expiry -->
-                                       ^ background refresh starts  ^ no longer "usable"   ^ no longer served
+```mermaid
+flowchart LR
+    Fresh["1. Fresh<br/>0-hop watch read<br/>(no refresh needed)"]
+    RefreshDue["2. RefreshDue<br/>0-hop watch read +<br/>background refresh starts"]
+    StaleUsable["3. StaleUsable (optional)<br/>1-hop mailbox: serves stale<br/>+ background recovery"]
+    Expired["4. Expired (hard expiry)<br/>never served;<br/>callers wait for fresh fetch"]
+
+    Fresh -- "expires_at − expiry_buffer" --> RefreshDue
+    RefreshDue -- "expires_at" --> StaleUsable
+    StaleUsable -- "expires_at + stale_while_error" --> Expired
 ```
 
-| Method | Meaning |
-| --- | --- |
-| `is_fresh(buffer)` | More than `min(buffer, ttl / 2)` left until expiry (or perpetual). |
-| `is_still_usable()` | Not yet expired. |
-| `is_usable_stale(allowance)` | Expired, but within the stale-while-error `allowance`. |
+For example, given a `300 s` TTL, `expiry_buffer = 30 s`, and `stale_while_error = 60 s`:
+1. **`Fresh` (`0 s – 270 s`):** The value is valid and far from expiry. `client.get()` returns it immediately from the 0-hop `watch` cache without touching the actor mailbox.
+2. **`RefreshDue` (`270 s – 300 s`):** The value is still valid and keeps being served in 0 hops, while the actor proactively starts a single background worker to fetch a replacement *before* `expires_at` is reached.
+3. **`StaleUsable` (`300 s – 360 s`, only if `stale_while_error > 0`):** The value has expired (for example, because the upstream service was temporarily unavailable during the proactive refresh). Instead of failing callers immediately, the actor serves the slightly expired value as a grace fallback while triggering background recovery.
+4. **`Expired` (`> 360 s`, hard expiry):** The grace window has elapsed (or `stale_while_error` is disabled). The old value is never served; callers wait in the single-flight queue for a fresh fetch (or fail fast while a failure cooldown is active).
+
+| Method | Phase(s) | Meaning |
+| --- | --- | --- |
+| `is_fresh(buffer)` | `Fresh` | More than `min(buffer, ttl / 2)` left until expiry (or perpetual). |
+| `is_still_usable()` | `Fresh`, `RefreshDue` | Not yet expired (`now < expires_at`); served directly from the 0-hop `watch` cache. |
+| `is_usable_stale(allowance)` | `StaleUsable` | Expired, but still within the optional `stale_while_error` grace window. |
 
 ### Resource lifecycle inside an actor
 
@@ -695,7 +798,18 @@ Finish the builder with `.spawn(&supervisor)`, `.build_child_spec()`, or `.into(
 
 ### Supervision strategies
 
-Configured per `Supervisor` via `SupervisionStrategy`:
+Configured per `Supervisor` via [`SupervisionStrategy`](src/actor/model.rs):
+
+```rust
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SupervisionStrategy {
+    #[default]
+    OneForOne,
+    OneForAll,
+    RestForOne,
+}
+```
 
 | Strategy | When child *X* crashes … | Typical use |
 | --- | --- | --- |
@@ -724,9 +838,23 @@ pub struct RestartPolicy {
 }
 ```
 
-Defaults: `max_restarts = 5`, `time_window = 10 s`, `initial_backoff = 50 ms`, `max_backoff = 2 s`, `backoff_multiplier = 2.0`. Configure cleanly via `RestartPolicy::new(max_restarts, time_window)` and fluent builder methods (`.max_restarts(...)`, `.time_window(...)`, `.initial_backoff(...)`, `.max_backoff(...)`, `.backoff_multiplier(...)`).
+Defaults: `max_restarts = 5`, `time_window = 10 s`, `initial_backoff = 50 ms`, `max_backoff = 2 s`, `backoff_multiplier = 2.0`.
 
-Behaviour (implemented by `RestartTracker`, exposing `.policy()`, `.consecutive_failures()`, and `.restarts_in_window()`):
+`RestartPolicy` is configured **per child** via `.restart_policy(...)` on `StatefulActorBuilder`, `ResourceActorBuilder`, or `SupervisorBuilder` (for a child `Supervisor`, applied by its parent `Supervisor`), and enforced by the managing `Supervisor` via a dedicated `RestartTracker` per child—so one crashing child never consumes a sibling's restart budget:
+
+```rust
+let policy = RestartPolicy::new(3, Duration::from_secs(30))
+    .initial_backoff(Duration::from_millis(100))
+    .max_backoff(Duration::from_secs(5))
+    .backoff_multiplier(2.0);
+
+let client = StatefulActorBuilder::from_default::<CounterActor>("counter")
+    .restart_policy(policy) // same setter exists on `ResourceActorBuilder` & `SupervisorBuilder`
+    .spawn(&supervisor)
+    .await?;
+```
+
+Behaviour (implemented by [`RestartTracker`](src/actor/model.rs), which the `Supervisor` manages automatically per child and surfaces in `ChildSnapshot` / Prometheus metrics):
 
 - Each crash is recorded; entries older than `time_window` are discarded.
 - If the number of recent restarts reaches `max_restarts`, the component is marked **permanently failed** (`ChildStatus::Failed`). Pending and future lookups then fail fast with `MaxRestartsExceeded`.
@@ -737,7 +865,117 @@ Behaviour (implemented by `RestartTracker`, exposing `.policy()`, `.consecutive_
 - Stale crash notifications from already-replaced instances are ignored via monotonic restart wave tickets.
 - Backoff delays and sibling shutdown waves are strictly serialized so old instances cleanly finish their `ShutdownPolicy` (`on_stop`) before replacement instances are spawned.
 
-Leaf actors (`StatefulActor` and `ResourceActor`) have their own `RestartPolicy` (set on their builder), and child `Supervisor`s have one too (`SupervisorBuilder::restart_policy`), used by the parent `Supervisor` when restarting the child supervisor.
+**Using `RestartTracker` standalone:** While supervised actors never need to touch `RestartTracker` directly (the `Supervisor` owns one internally per child), `RestartTracker` is public and exposes `.record_crash()`, `.policy()`, `.consecutive_failures()`, and `.restarts_in_window()`.
+
+1. **Direct API / unit-testing a policy:**
+
+```rust
+use std::time::Duration;
+use otp_actor::{RestartPolicy, RestartTracker};
+
+let policy = RestartPolicy::new(3, Duration::from_secs(30))
+    .initial_backoff(Duration::from_millis(100))
+    .max_backoff(Duration::from_secs(2))
+    .backoff_multiplier(2.0);
+
+let mut tracker = RestartTracker::new(policy);
+
+assert_eq!(tracker.record_crash(), Some(Duration::from_millis(100))); // 1st failure
+assert_eq!(tracker.record_crash(), Some(Duration::from_millis(200))); // 2nd failure
+assert_eq!(tracker.record_crash(), Some(Duration::from_millis(400))); // 3rd failure
+assert_eq!(tracker.restarts_in_window(), 3);
+assert_eq!(tracker.consecutive_failures(), 3);
+assert_eq!(tracker.policy().max_restarts, 3);
+
+// 4th failure within the 30 s window exceeds `max_restarts` -> `None` (stop retrying):
+assert_eq!(tracker.record_crash(), None);
+```
+
+2. **Two-tier resilience — `RestartTracker` inside an Actor + `Supervisor`:**
+   A scoped background reader uses a local `RestartTracker` to absorb brief connection blips without restarting the actor; only when local retries are exhausted does the actor call `ctx.fail(...)`, handing recovery over to the `Supervisor` (which enforces the actor's own `RestartPolicy` via its internal `RestartTracker`):
+
+```rust
+use std::time::Duration;
+use otp_actor::{
+    ActorContext, RestartPolicy, RestartTracker, StatefulActor, StatefulActorBuilder, Supervisor,
+};
+
+enum StreamMsg {
+    Data(String),
+    StreamFailed(String),
+}
+
+#[derive(Default)]
+struct StreamActor;
+
+impl StatefulActor for StreamActor {
+    type Message = StreamMsg;
+    type Response = ();
+    type Error = String;
+
+    async fn on_start(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), String> {
+        // Tier 1 (inside actor): local reconnect policy for brief network blips
+        let reconnect_policy = RestartPolicy::new(3, Duration::from_secs(30))
+            .initial_backoff(Duration::from_millis(100))
+            .max_backoff(Duration::from_secs(2));
+
+        ctx.spawn_scoped(move |mut scope| async move {
+            let mut reconnect = RestartTracker::new(reconnect_policy);
+            while let Err(err) = connect_and_stream(&mut scope).await {
+                match reconnect.record_crash() {
+                    Some(backoff) => {
+                        // Wait for backoff, but exit immediately if the actor stops:
+                        tokio::select! {
+                            biased;
+                            _ = scope.cancelled() => return,
+                            _ = tokio::time::sleep(backoff) => {}
+                        }
+                    }
+                    None => {
+                        // Tier 1 exhausted -> notify the actor so it can escalate to the Supervisor:
+                        let _ = scope.cast(StreamMsg::StreamFailed(err)).await;
+                        return;
+                    }
+                }
+            }
+        });
+        Ok(())
+    }
+
+    async fn handle_cast(
+        &mut self,
+        msg: StreamMsg,
+        ctx: &mut ActorContext<Self>,
+    ) -> Result<(), String> {
+        match msg {
+            StreamMsg::Data(line) => { /* process incoming item */ let _ = line; }
+            StreamMsg::StreamFailed(err) => {
+                // Escalate fatal failure to the Supervisor -> triggers Tier 2 recovery:
+                ctx.fail(format!("stream reconnects exhausted: {err}"));
+            }
+        }
+        Ok(())
+    }
+
+    async fn handle(
+        &mut self,
+        msg: StreamMsg,
+        ctx: &mut ActorContext<Self>,
+    ) -> Result<(), String> {
+        self.handle_cast(msg, ctx).await
+    }
+}
+
+// Tier 2 (Supervisor): enforces `actor_policy` automatically via its internal `RestartTracker`
+let supervisor = Supervisor::new_root();
+let actor_policy = RestartPolicy::new(5, Duration::from_secs(60))
+    .initial_backoff(Duration::from_millis(500));
+
+let _client = StatefulActorBuilder::from_default::<StreamActor>("stream-consumer")
+    .restart_policy(actor_policy)
+    .spawn(&supervisor)
+    .await?;
+```
 
 ### Child restart types (`RestartType`) and graceful shutdown (`ShutdownPolicy`)
 
@@ -788,11 +1026,11 @@ let nested = service.get_supervisor("worker-pool").await?;
 Children (`StatefulActor`, `ResourceActor`, and sub-supervisors) can also be added at runtime. The spec is remembered, so the child is re-created if the supervisor is restarted:
 
 ```rust
-let spec: ChildSpec = ResourceActor::builder("dyn-child")
+let child_spec: ChildSpec = ResourceActor::builder("dyn-child")
     .worker(worker)
     .build_child_spec();
 
-service.start_child(spec).await?;
+service.start_child(child_spec).await?;
 let client = service.get_resource_client::<String, String>("dyn-child").await?;
 ```
 
@@ -913,12 +1151,12 @@ Both actor types can participate in remote architectures, with distinct roles:
 
 ```text
  ┌─────────────────────────────────────────────────────────────────┐
- │                         Remote Node A                           │
+ │                Client Node A (remote caller only)               │
  │                                                                 │
  │   let remote = RemoteActorClient::<BankAccount>::connect(       │
  │       "http://192.168.1.50:50051",                              │
  │       "bank-service",                                           │
- │       "acc-42",                                                 │
+ │       "account-42",                                             │
  │   ).await?;                                                     │
  │   let client: AnyActorClient<BankAccount> =                     │
  │       AnyActorClient::Remote(remote);                           │
@@ -933,18 +1171,18 @@ Both actor types can participate in remote architectures, with distinct roles:
                                  │   actor_name, payload (postcard), timeout_ms }
                                  ▼
  ┌─────────────────────────────────────────────────────────────────┐
- │                         Remote Node B                           │
+ │              Server Node B (hosts actor & supervisor)           │
  │                                                                 │
- │   ActorNodeHandle / ActorNodeService (127.0.0.1:50051)          │
+ │   ActorNodeHandle / ActorNodeService (192.168.1.50:50051)       │
  │     │                                                           │
- │     ├── ActorNodeRegistry (("bank-service", "acc-42")           │
+ │     ├── ActorNodeRegistry (("bank-service", "account-42")       │
  │     │     │              -> Arc<dyn ByteEndpoint>)              │
  │     │     │                                                     │
  │     │     └── ActorClient<BankAccount> (impl ByteEndpoint)      │
  │     │           │ Decodes postcard payload (<= 4 MiB)           │
  │     ▼           ▼                                               │
  │   Supervisor "bank-service" (OneForOne, RestartType::Transient) │
- │     └── BankAccount ("acc-42", balance: 1000)                   │
+ │     └── BankAccount ("account-42", balance: 1000)               │
  └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -968,7 +1206,9 @@ Defined in [`proto/actor_node.proto`](proto/actor_node.proto) (`package otp_acto
 
 `RemoteError::Kind` covers `SERVICE_NOT_FOUND`, `ACTOR_NOT_FOUND`, `MAILBOX_FULL`, `ACTOR_UNAVAILABLE`, `TIMEOUT`, `SERIALIZATION`, `DESERIALIZATION`, `ACTOR_PANIC`, `MAX_RESTARTS_EXCEEDED`, and `INCOMPATIBLE_PROTOCOL`.
 
-### Code example: building a remote node
+### Code example: building a remote server node
+
+On the **server node**, you spawn the `Supervisor` and `StatefulActor` locally, register the resulting `ActorClient` in an `ActorNodeRegistry`, and expose it over gRPC via `ActorNodeHandle::start(...)` (or `ActorNodeBuilder`):
 
 ```rust
 use otp_actor::actor::{
@@ -1052,6 +1292,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 ### Code example: calling from a remote client
 
+On the **client node**, you do **not** run a `Supervisor` or spawn the actor locally—you only connect to the already-registered actor on the server via `RemoteActorClient` (sharing the `BankAccount` / `BankMsg` definitions via a common module or crate, as in [`examples/remote/common.rs`](examples/remote/common.rs)):
+
 ```rust
 use otp_actor::remote::{AnyActorClient, RemoteActorClient};
 use std::time::Duration;
@@ -1065,7 +1307,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     )
     .await?;
 
-    // Location-transparent client (wraps either ActorClient or RemoteActorClient)
+    // Optional location-transparent wrapper (`AnyActorClient::Local` | `AnyActorClient::Remote`):
+    // Downstream business logic only depends on `AnyActorClient<BankAccount>` and never needs to
+    // know whether the actor lives in-process (e.g. in tests/monoliths) or across gRPC.
+    // (If a caller is always remote, you can also invoke `remote.call(...)` directly.)
     let client: AnyActorClient<BankAccount> = AnyActorClient::Remote(remote);
 
     // Call with timeout deadline (reserves transport headroom automatically)
@@ -1234,24 +1479,26 @@ match client.get_timeout(Duration::from_secs(2)).await {
 
 ## Testing & Code Quality
 
+When developing or contributing from a cloned repository, run the test and lint suite below (when `otp-actor` is used as a Cargo dependency, tests and examples are never compiled into your application):
+
 ```bash
 cargo test                                            # core integration, unit & doc-tests (118 + 1 + 4 = 123)
-cargo test --all-features                             # core, remote gRPC, unit & doc-tests (118 + 15 + 4 + 4 = 141)
+cargo test --all-features                             # core, remote gRPC, unit & doc-tests (118 + 16 + 5 + 4 = 143)
 cargo test --test actor_supervision_test              # core integration suite only (118 tests)
-cargo test --test remote_grpc_test --features remote  # remote gRPC suite only (15 tests)
+cargo test --test remote_grpc_test --features remote  # remote gRPC suite only (16 tests)
 cargo test test_strategy_rest_for_one -- --nocapture  # single test with logs
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
 *(Note: `[dev-dependencies]` enables `otp-actor = { path = ".", features = ["chaos_test"] }`, so integration tests, doc-tests, and examples can call chaos hooks out of the box without exposing them in default production builds. Tests relying on backoff decay use Tokio's virtual time via `#[tokio::test(start_paused = true)]` for deterministic execution.)*
 
-> **Quality & Reviews:** Prior to `0.4`, the codebase underwent full concurrency, performance, and API-consistency reviews (see [CHANGELOG.md](CHANGELOG.md) for all resolved findings) and passes `cargo clippy --all-targets --all-features -- -D warnings` with zero warnings.
+> **Quality & Reviews:** Prior to `0.4`, the codebase underwent full concurrency, performance, and API-consistency reviews (see [CHANGELOG.md](CHANGELOG.md) for the full list of fixes) and passes `cargo clippy --all-targets --all-features -- -D warnings` with zero warnings.
 
 | Suite / Area | Count | Covered Topics |
 | --- | --- | --- |
 | [`tests/actor_supervision_test.rs`](tests/actor_supervision_test.rs) | 118 | `ResourceActor` caching, `RefreshDue` 0-hop fast path, proactive jitter, stale-while-error, failure cooldown, generation guards; `StatefulActor` `call`/`ask`/`cast`/`try_cast`, `on_start`/`on_stop`, `handler_timeout`, `ctx.stop`/`ctx.fail`; timers, `forward_receiver`, `ActorScope`; `OneForOne`/`OneForAll`/`RestForOne`, N-level subtrees, `RestartType`, `ShutdownPolicy`, `RestartTracker` aging & overflow safety, `escalate_on_failure`, factory panic isolation; `snapshot`/`snapshot_tree`, `watch_child_status`, `LocalNodeMonitor`, `ActorMetrics`, `format_prometheus_metrics`, `tracing` span propagation. |
-| [`tests/remote_grpc_test.rs`](tests/remote_grpc_test.rs) | 15 | TCP/HTTP2 `call`/`ask`/`cast`/`cast_timeout` (incl. `Duration::ZERO` `try_cast` load-shedding), domain error round-tripping, `AnyActorClient`, `AnyNodeMonitor`, `ActorNodeAdmin` (`Health`/`Status` incl. degraded snapshots), `Tower` middleware layers (`ActorNodeBuilder::layer`), `RemoteActorError` `PartialEq`/`Eq`, crash recovery, protocol versioning, `Authorizer`, label sanitization, headroom budgeting, Phase-1 drain rejection, and 2-phase shutdown. |
-| Unit tests (`src/**`) | 4 | Core & remote (`--features remote`) unit checks (including `postcard` `BoundedVec` bounds and label sanitization). |
+| [`tests/remote_grpc_test.rs`](tests/remote_grpc_test.rs) | 16 | TCP/HTTP2 `call`/`ask`/`cast`/`cast_timeout` (incl. `Duration::ZERO` `try_cast` load-shedding), domain error round-tripping, `AnyActorClient`, `AnyNodeMonitor`, `ActorNodeAdmin` (`Health`/`Status` incl. degraded snapshots), `Tower` middleware layers (`ActorNodeBuilder::layer`), Bearer-token helpers & rotation (`bearer_token`, `bearer_authorizer`, `with_bearer_token`, `with_bearer_token_provider`), `RemoteActorError` `PartialEq`/`Eq`, crash recovery, protocol versioning, `Authorizer`, label sanitization, headroom budgeting, Phase-1 drain rejection, and 2-phase shutdown. |
+| Unit tests (`src/**`) | 5 | Core & remote (`--features remote`) unit checks (including `postcard` `BoundedVec` bounds, label sanitization, and Bearer-token extraction / constant-time comparison). |
 | Doc-tests (`src/lib.rs`, `src/actor/mod.rs`) | 4 | Compiled and executed examples for both `ResourceActor` and `StatefulActor`. |
 
 ---
@@ -1303,49 +1550,16 @@ cargo clippy --all-targets --all-features -- -D warnings
 │       └── monitor.rs                  # remote telemetry & AnyNodeMonitor showcase (`--example remote_monitor`)
 └── tests
     ├── actor_supervision_test.rs       # 118 core integration tests
-    └── remote_grpc_test.rs             # 15 gRPC remote tests (`--features remote`)
+    └── remote_grpc_test.rs             # 16 gRPC remote tests (`--features remote`)
 ```
 
-The public API is re-exported from the crate root and `otp_actor::actor`:
-
-```rust
-use otp_actor::{
-    // stateful actors & clients (StatefulActor)
-    ActorClient, ActorContext, ActorError, ActorScope, CallMessage, QueueStats, StatefulActor,
-    StatefulActorBuilder, StatefulActorConfig,
-    // resource actors & clients (ResourceActor)
-    CacheState, DEFAULT_FAILURE_COOLDOWN, DEFAULT_WORKER_TIMEOUT, ResourceActor,
-    ResourceActorBuilder, ResourceActorConfig, ResourceClient, ResourceError, TimedResource,
-    Worker, WorkerContext,
-    // supervision model
-    DEFAULT_SHUTDOWN_TIMEOUT, DEFAULT_SNAPSHOT_TIMEOUT, EXPIRY_BUFFER, RestartPolicy,
-    RestartTracker, RestartType, ShutdownPolicy, SupervisionStrategy, SupervisorError, TaskResult,
-    // unified recursive supervisor & runtime introspection
-    ChildFuture, ChildSnapshot, ChildSpec, ChildStatus, ChildStatusWatcher, ShutdownSignalFn,
-    SpawnContext, SubtreeSnapshot, Supervisor, SupervisorBuilder, SupervisorHandle,
-    SupervisorSnapshot, SupervisorTreeSnapshot, UntypedActorFactory, UntypedSender,
-    // operational telemetry & Prometheus exposition
-    ActorMetrics, ActorMetricsSnapshot, ChildKind, ChildLifecycle, ChildStatusEntry, HealthState,
-    LocalNodeMonitor, NodeHealth, NodeStatus, NodeSummary, RegisteredEndpointStatus,
-    RemoteMetricsSnapshot, StatusOptions, SubtreeStatusEntry, SupervisorStatusNode,
-    format_prometheus_metrics,
-};
-
-// With `--features remote`:
-use otp_actor::remote::{
-    ActorNodeAdminClient, ActorNodeAdminServer, ActorNodeAdminService, ActorNodeBuilder,
-    ActorNodeClient, ActorNodeHandle, ActorNodeRegistry, ActorNodeServer, ActorNodeService,
-    AnyActorClient, AnyNodeMonitor, Authorizer, ByteEndpoint, DEFAULT_DRAIN_TIMEOUT,
-    DEFAULT_REMOTE_CALL_TIMEOUT, MAX_REMOTE_REQUEST_TIMEOUT, REMOTE_PROTOCOL_VERSION,
-    RemoteActorClient, RemoteActorError, RemoteMonitorError, RemoteNodeError, RemoteNodeMonitor,
-};
-```
+All core types are re-exported from both the crate root (`otp_actor::*`) and `otp_actor::actor::*`; remote types live under `otp_actor::remote::*` (`--features remote`). For the complete, always up-to-date API reference, see [docs.rs/otp-actor](https://docs.rs/otp-actor).
 
 ---
 
 ## Release Profile
 
-`Cargo.toml` ships an aggressive release profile:
+This repository's `Cargo.toml` defines the following `[profile.release]` for examples and standalone builds (Cargo ignores `[profile.*]` sections in dependencies—when using `otp-actor` from your own application, make sure your root crate keeps `panic = "unwind"` rather than `panic = "abort"` so supervisor panic isolation works):
 
 | Setting | Value | Why |
 | --- | --- | --- |
@@ -1358,18 +1572,129 @@ use otp_actor::remote::{
 
 ---
 
-## Known Limitations & Design Notes
+## Design Trade-offs & Production Notes
 
-- **In-process & distributed execution.** Core actors run in-process over 0-hop `watch` cache snapshots and high-throughput Tokio `mpsc` channels with zero network overhead. When cross-process or cross-host communication is needed, `--features remote` adds HTTP/2 gRPC actor nodes and location-transparent clients (`AnyActorClient`).
-- **Remote wire format & transport security.** Remote payloads are encoded with bounded `postcard` (<= 4 MiB) inside a versioned Protobuf envelope (`protocol_version = 1`), so client and server nodes should share matching Rust message schemas (not intended for schema-evolving polyglot contracts). `ActorNodeHandle::start` binds plaintext HTTP/2 TCP by default; use `ActorNodeHandle::builder` (with `.server(...)`, `.layer(...)` / `.start_with_layer(...)`, `.start_with_interceptor(...)`, and `.authorizer(...)`) or `ActorNodeHandle::start_with` (passing a TLS- and/or Tower-layered `tonic::transport::Server<L>`) alongside `RemoteActorClient::connect_with` / `with_request_metadata` (or a service mesh) when traversing untrusted networks.
-- **Secret redaction in `Debug`.** `TimedResource<T>` redacts its inner `value` (`"<redacted>"`) in `fmt::Debug` output so cached tokens or credentials are never accidentally leaked into logs.
-- **Hybrid failure signaling (`TaskResult` + panic isolation).** Supervision is triggered both by controlled error exits (`TaskResult::Err`) and by uncaught task/factory panics (`JoinError::is_panic()` / `catch_unwind`) when compiled with `panic = "unwind"`.
-- **Restarts reset in-memory actor state (by design).** Actors and child supervisors are re-created from their configured factories with clean initial state to prevent crash loops caused by corrupted state (see [State lifecycle on restart & persistence patterns](#state-lifecycle-on-restart--persistence-patterns)). Use `on_start` to rehydrate state from external persistence if durable state is needed.
-- **Structured logging with `tracing`.** Actors, supervisors, and client handles (`SupervisorHandle`, `ActorClient`, `ResourceClient`, `RemoteActorClient`) emit structured tracing spans (`#[tracing::instrument]`) and events (`info!`, `warn!`, `error!`, `debug!`), while immutable handle names use `Arc<str>` for zero-allocation handle cloning.
-- **Graceful & hard shutdown.** `supervisor.shutdown()` sequentially terminates child supervisors and child actors in reverse registration order via watch shutdown signals and `ShutdownPolicy` deadlines; dropping all handles to a top-level `Supervisor` aborts remaining supervised tasks via `JoinSet` / `AbortHandle`.
-- **Demo-friendly defaults.** `EXPIRY_BUFFER` is 2 seconds so expiry effects are visible quickly in examples; in production you would typically configure a larger margin such as 5 minutes.
-- **Mock backends.** The demo's "GCP" and "database" workers are simulated—no network access or credentials are needed or used.
-- **Chaos hooks are feature-gated.** `simulate_crash()` and `trigger_child_crash()` require `#[cfg(any(test, feature = "chaos_test"))]`. They are available automatically in tests and examples via `[dev-dependencies]` and excluded from normal release builds unless `--features chaos_test` is enabled explicitly.
+- **Point-to-point remoting (no cluster/gossip/Raft):** `--features remote` connects clients directly to a known node address (`RemoteActorClient::connect`). Actors are spawned and registered on the server node; clients do not spawn actors remotely, and there is no built-in service discovery or cluster consensus.
+- **Rust-to-Rust wire format (`postcard`, <= 4 MiB):** Remote payloads are encoded with bounded `postcard` inside a versioned Protobuf envelope (`protocol_version = 1`). Client and server must share matching Rust message/response/error definitions (this is not intended for schema-evolving polyglot contracts).
+- **Restarts reset in-memory actor state (by design):** Actors and child supervisors are re-created from their configured factories with clean initial state to prevent crash loops caused by corrupted state (see [State lifecycle on restart & persistence patterns](#state-lifecycle-on-restart--persistence-patterns)). Rehydrate durable state in `on_start` if needed.
+- **Panic isolation requires `panic = "unwind"`:** If your root application compiles with `panic = "abort"`, an uncaught panic terminates the process instead of being isolated and recovered by the supervisor.
+- **Demo-friendly `EXPIRY_BUFFER` default (`2 s`):** Short by default so expiry/refresh behavior is immediately visible in examples; in production with long-lived tokens (e.g. 1 h TTL), configure a larger `.expiry_buffer(...)` such as `30 s – 5 min`.
+
+### Securing remote gRPC nodes (TLS/mTLS, Bearer tokens & Tower layers)
+
+`ActorNodeHandle::start(addr, registry, Some(root))` is intentionally minimal for local development: it binds **gRPC calls over plaintext HTTP/2 (`http://`)** with **no encryption** and **no access control**. That is fine on `127.0.0.1` or behind a TLS-terminating reverse proxy / Zero-Trust gateway or service mesh (such as [`praeco-rs`](https://crates.io/crates/praeco-rs), Envoy, Istio, or Linkerd), but on untrusted networks you should combine **transport encryption (TLS/mTLS)** with **request-level authorization (Bearer tokens / Tower middleware)**:
+
+1. **Transport encryption (TLS / mTLS):**
+   Enable a `tonic` TLS backend in your application's `Cargo.toml` (e.g. `tonic = { version = "0.14", features = ["tls-ring"] }` or `"tls-aws-lc"`).
+   - **Server:** Configure `tonic::transport::Server::builder().tls_config(server_tls)?` and pass it into `ActorNodeHandle::builder(addr, registry).server(...)`. For **mTLS** (mutual TLS, where the server also verifies client certificates), add `.client_ca_root(ca_cert)` on `ServerTlsConfig`.
+   - **Client:** Configure a `tonic::transport::Endpoint` (`https://...`) with `.tls_config(client_tls)?` (plus `.identity(client_identity)` for mTLS) and connect via `RemoteActorClient::connect_with(endpoint, service, actor)` (or `RemoteNodeMonitor::connect_with(endpoint)`).
+
+2. **Access control with Bearer tokens (`bearer_authorizer` / `bearer_token` + `with_bearer_token`):**
+   - **Server:** Use `.bearer_authorizer(|token, service_name, actor_name| ...)` on `ActorNodeBuilder` (or `.bearer_token("shared-secret")` for constant-time single-secret validation). Both validate `authorization: Bearer <token>` **before** every RPC is routed and protect **both** `ActorNode` (`Call`/`Cast`) and `ActorNodeAdmin` (`service_name == "__admin"`, `actor_name == "health" | "status"`). If you also inspect `tonic::Extensions` (for example mTLS client-certificate OIDs) inside a full `.authorizer(...)`, call [`extract_bearer_token(metadata)`](src/remote/server.rs) directly.
+   - **Client:** Attach `.with_bearer_token("...")?` (for static tokens, validated once upfront) or `.with_bearer_token_provider(|| ...)` (for rotating OAuth2/JWT tokens, e.g., read from a local `ResourceActor` or shared cache) on `RemoteActorClient`, `AnyActorClient`, `RemoteNodeMonitor`, or `AnyNodeMonitor`. Both compose cleanly with `.with_request_metadata(...)` in any order.
+   - *Tip:* Always pair Bearer tokens with **TLS/mTLS** (or a service mesh / [`praeco-rs`](https://crates.io/crates/praeco-rs)) so tokens are never sent in plaintext.
+
+3. **Additional Tower middleware (`.layer(...)` / `.start_with_layer(...)`):**
+   Attach any `tower_layer::Layer` to `ActorNodeBuilder` for cross-cutting concerns such as rate limiting, request timeouts, or extracting verified client certificate attributes/OIDs into `tonic::Extensions` (which your `Authorizer` receives as its `extensions` parameter).
+
+**Server node (TLS/mTLS + Bearer-token `bearer_authorizer` + optional Tower layer):**
+
+```rust
+use std::net::SocketAddr;
+use otp_actor::remote::{ActorNodeHandle, ActorNodeRegistry};
+use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
+
+let server_cert = tokio::fs::read("certs/server.pem").await?;
+let server_key  = tokio::fs::read("certs/server.key").await?;
+let ca_cert     = tokio::fs::read("certs/ca.pem").await?; // only needed for mTLS
+
+let tls = ServerTlsConfig::new()
+    .identity(Identity::from_pem(server_cert, server_key))
+    .client_ca_root(Certificate::from_pem(ca_cert)); // enforce client certs (mTLS)
+
+let tls_server = Server::builder().tls_config(tls)?;
+
+let node = ActorNodeHandle::builder("0.0.0.0:50051".parse::<SocketAddr>()?, registry)
+    .supervisor(root)
+    .server(tls_server) // enables TLS / mTLS for gRPC instead of plaintext HTTP/2
+    // .layer(my_tower_rate_limit_layer) // optional Tower middleware (e.g. rate limiting)
+    // For a single shared secret use `.bearer_token("shared-secret")`, or `.authorizer(...)`
+    // with `extract_bearer_token(metadata)` when you also inspect `tonic::Extensions` (e.g. mTLS OIDs):
+    .bearer_authorizer(|token, service_name, _actor_name| {
+        // In production, verify a JWT / OAuth2 token here (static strings shown for brevity):
+        match (service_name, token) {
+            ("__admin", "ops-admin-secret") => Ok(()),
+            ("bank-service", "svc-bank-secret") => Ok(()),
+            (_, "ops-admin-secret" | "svc-bank-secret") => {
+                Err(tonic::Status::permission_denied("token not authorized for this service"))
+            }
+            _ => Err(tonic::Status::unauthenticated("invalid Bearer token")),
+        }
+    })
+    .start()
+    .await?;
+```
+
+**Client node (HTTPS / mTLS + automatic Bearer header on every RPC):**
+
+```rust
+use otp_actor::remote::RemoteActorClient;
+use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
+
+let ca_cert     = tokio::fs::read("certs/ca.pem").await?;
+let client_cert = tokio::fs::read("certs/client.pem").await?; // only needed for mTLS
+let client_key  = tokio::fs::read("certs/client.key").await?; // only needed for mTLS
+
+let client_tls = ClientTlsConfig::new()
+    .domain_name("node-b.internal")
+    .ca_certificate(Certificate::from_pem(ca_cert))
+    .identity(Identity::from_pem(client_cert, client_key)); // present client cert (mTLS)
+
+let endpoint = Endpoint::from_shared("https://node-b.internal:50051")?
+    .tls_config(client_tls)?;
+
+let client = RemoteActorClient::<BankAccount>::connect_with(
+    endpoint,
+    "bank-service",
+    "account-42",
+)
+.await?
+// Automatically attaches `authorization: Bearer svc-bank-secret` to every RPC:
+.with_bearer_token("svc-bank-secret")?;
+```
+
+**Rotating Bearer tokens (short-lived OAuth2 / JWTs without reconnecting):**
+
+When tokens rotate at runtime, read the latest token synchronously via `.with_bearer_token_provider(...)` on the client and validate each incoming token dynamically via `.bearer_authorizer(...)` on the server:
+
+```rust
+// Server side: validate each incoming token dynamically (e.g. JWT signature + expiry + scope)
+let node = ActorNodeHandle::builder(addr, registry)
+    .supervisor(root)
+    .bearer_authorizer(|token, service_name, _actor_name| {
+        let claims = verify_jwt_signature_and_exp(token)
+            .map_err(|_| tonic::Status::unauthenticated("invalid or expired JWT"))?;
+        if claims.allowed_services.contains(service_name) {
+            Ok(())
+        } else {
+            Err(tonic::Status::permission_denied("service not permitted"))
+        }
+    })
+    .start()
+    .await?;
+
+// Client side: pull the latest cached token before every RPC (e.g. refreshed in the background)
+let (token_tx, token_rx) = tokio::sync::watch::channel(Some("jwt-v1".to_string()));
+let client = RemoteActorClient::<BankAccount>::connect_with(endpoint, "bank-service", "account-42")
+    .await?
+    .with_bearer_token_provider(move || token_rx.borrow().clone());
+
+client.call(BankMsg::GetBalance).await?;        // sends `Bearer jwt-v1`
+token_tx.send(Some("jwt-v2".to_string()))?;     // background rotation — no reconnect needed
+client.call(BankMsg::GetBalance).await?;        // automatically sends `Bearer jwt-v2`
+```
+
+For a directly runnable Bearer-token walkthrough (`bearer_token` + `with_bearer_token` across both `ActorNode` and `ActorNodeAdmin`), see [`examples/remote/monitor.rs`](examples/remote/monitor.rs).
 
 ---
 

@@ -40,6 +40,66 @@ pub type Authorizer = Arc<
         + Sync,
 >;
 
+/// Extracts a non-empty Bearer token from the gRPC `authorization` metadata header.
+///
+/// Accepts the standard `"Bearer <token>"` format (matching the `"Bearer "` scheme prefix
+/// case-insensitively per RFC 6750). Returns `Err(Status::unauthenticated(...))` if the header
+/// is absent, non-ASCII, uses another scheme, or carries an empty token. Never echoes token
+/// material in error messages.
+pub fn extract_bearer_token(metadata: &tonic::metadata::MetadataMap) -> Result<&str, Status> {
+    let raw = metadata
+        .get("authorization")
+        .ok_or_else(|| Status::unauthenticated("missing authorization metadata"))?
+        .to_str()
+        .map_err(|_| Status::unauthenticated("invalid authorization metadata encoding"))?;
+
+    let token = if let Some(rest) = raw.strip_prefix("Bearer ") {
+        rest
+    } else if raw.len() > 7 && raw.as_bytes()[..7].eq_ignore_ascii_case(b"bearer ") {
+        &raw[7..]
+    } else {
+        return Err(Status::unauthenticated("expected Bearer authorization scheme"));
+    };
+
+    if token.is_empty() {
+        return Err(Status::unauthenticated("empty Bearer token"));
+    }
+    Ok(token)
+}
+
+#[inline(never)]
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    std::hint::black_box(diff) == 0
+}
+
+fn make_bearer_authorizer<F>(verify: F) -> Authorizer
+where
+    F: Fn(&str, &str, &str) -> Result<(), Status> + Send + Sync + 'static,
+{
+    Arc::new(move |metadata, _extensions, service_name, actor_name| {
+        let token = extract_bearer_token(metadata)?;
+        verify(token, service_name, actor_name)
+    })
+}
+
+fn make_static_bearer_authorizer(expected: String) -> Authorizer {
+    let expected_bytes: Arc<[u8]> = Arc::from(expected.into_bytes());
+    make_bearer_authorizer(move |token, _service_name, _actor_name| {
+        if constant_time_eq(token.as_bytes(), &expected_bytes) {
+            Ok(())
+        } else {
+            Err(Status::unauthenticated("invalid Bearer token"))
+        }
+    })
+}
+
 #[derive(Debug, Default)]
 struct RemoteNodeMetricsInner {
     grpc_in_flight: AtomicUsize,
@@ -211,6 +271,21 @@ impl ActorNodeService {
     pub fn with_authorizer(mut self, authorizer: Authorizer) -> Self {
         self.authorizer = Some(authorizer);
         self
+    }
+
+    /// Attaches a Bearer-token validator invoked with `(token, service_name, actor_name)`.
+    #[must_use]
+    pub fn with_bearer_authorizer<F>(self, verify: F) -> Self
+    where
+        F: Fn(&str, &str, &str) -> Result<(), Status> + Send + Sync + 'static,
+    {
+        self.with_authorizer(make_bearer_authorizer(verify))
+    }
+
+    /// Requires a matching static `authorization: Bearer <expected>` token using constant-time comparison.
+    #[must_use]
+    pub fn with_bearer_token(self, expected: impl Into<String>) -> Self {
+        self.with_authorizer(make_static_bearer_authorizer(expected.into()))
     }
 
     pub(crate) fn with_draining(mut self, draining: Arc<AtomicBool>) -> Self {
@@ -463,6 +538,21 @@ impl ActorNodeAdminService {
     pub fn with_authorizer(mut self, authorizer: Authorizer) -> Self {
         self.authorizer = Some(authorizer);
         self
+    }
+
+    /// Attaches a Bearer-token validator invoked with `(token, "__admin", "health" | "status")`.
+    #[must_use]
+    pub fn with_bearer_authorizer<F>(self, verify: F) -> Self
+    where
+        F: Fn(&str, &str, &str) -> Result<(), Status> + Send + Sync + 'static,
+    {
+        self.with_authorizer(make_bearer_authorizer(verify))
+    }
+
+    /// Requires a matching static `authorization: Bearer <expected>` token using constant-time comparison.
+    #[must_use]
+    pub fn with_bearer_token(self, expected: impl Into<String>) -> Self {
+        self.with_authorizer(make_static_bearer_authorizer(expected.into()))
     }
 
     pub(crate) fn with_draining(mut self, draining: Arc<AtomicBool>) -> Self {
@@ -805,6 +895,25 @@ impl<L> ActorNodeBuilder<L> {
     pub fn authorizer(mut self, authorizer: Authorizer) -> Self {
         self.authorizer = Some(authorizer);
         self
+    }
+
+    /// Attaches a Bearer-token validator protecting both `ActorNode` and `ActorNodeAdmin` RPCs.
+    ///
+    /// Extracts the `authorization: Bearer <token>` header via [`extract_bearer_token`] and invokes
+    /// `verify(token, service_name, actor_name)` (where admin calls pass `service_name = "__admin"`).
+    #[must_use]
+    pub fn bearer_authorizer<F>(self, verify: F) -> Self
+    where
+        F: Fn(&str, &str, &str) -> Result<(), Status> + Send + Sync + 'static,
+    {
+        self.authorizer(make_bearer_authorizer(verify))
+    }
+
+    /// Requires every incoming `ActorNode` and `ActorNodeAdmin` RPC to present a matching static
+    /// `authorization: Bearer <expected>` header (verified with constant-time byte comparison).
+    #[must_use]
+    pub fn bearer_token(self, expected: impl Into<String>) -> Self {
+        self.authorizer(make_static_bearer_authorizer(expected.into()))
     }
 
     /// Sets the Phase-1 graceful drain timeout (defaults to [`DEFAULT_DRAIN_TIMEOUT`]).
@@ -1157,5 +1266,63 @@ impl Drop for ActorNodeHandle {
         if let Some(handle) = self.server_task.take() {
             handle.abort();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_bearer_token_and_constant_time_eq() {
+        let empty = tonic::metadata::MetadataMap::new();
+        assert_eq!(
+            extract_bearer_token(&empty).unwrap_err().code(),
+            tonic::Code::Unauthenticated
+        );
+
+        let mut wrong_scheme = tonic::metadata::MetadataMap::new();
+        wrong_scheme.insert("authorization", "Basic dXNlcjpwYXNz".parse().unwrap());
+        assert_eq!(
+            extract_bearer_token(&wrong_scheme).unwrap_err().code(),
+            tonic::Code::Unauthenticated
+        );
+
+        let mut no_space = tonic::metadata::MetadataMap::new();
+        no_space.insert("authorization", "BearerNoSpace".parse().unwrap());
+        assert_eq!(
+            extract_bearer_token(&no_space).unwrap_err().code(),
+            tonic::Code::Unauthenticated
+        );
+
+        let mut empty_token = tonic::metadata::MetadataMap::new();
+        empty_token.insert("authorization", "Bearer ".parse().unwrap());
+        assert_eq!(
+            extract_bearer_token(&empty_token).unwrap_err().code(),
+            tonic::Code::Unauthenticated
+        );
+
+        let mut standard = tonic::metadata::MetadataMap::new();
+        standard.insert("authorization", "Bearer secret-123".parse().unwrap());
+        assert_eq!(extract_bearer_token(&standard).unwrap(), "secret-123");
+
+        let mut lowercase = tonic::metadata::MetadataMap::new();
+        lowercase.insert("authorization", "bearer secret-123".parse().unwrap());
+        assert_eq!(extract_bearer_token(&lowercase).unwrap(), "secret-123");
+
+        let mut mixed = tonic::metadata::MetadataMap::new();
+        mixed.insert("authorization", "BEARER secret-123".parse().unwrap());
+        assert_eq!(extract_bearer_token(&mixed).unwrap(), "secret-123");
+
+        let mut nested = tonic::metadata::MetadataMap::new();
+        nested.insert("authorization", "Bearer Bearer inner".parse().unwrap());
+        assert_eq!(extract_bearer_token(&nested).unwrap(), "Bearer inner");
+
+        assert!(constant_time_eq(b"secret-123", b"secret-123"));
+        assert!(constant_time_eq(b"", b""));
+        assert!(!constant_time_eq(b"secret-123", b"secret-12"));
+        assert!(!constant_time_eq(b"secret-123", b"Xecret-123"));
+        assert!(!constant_time_eq(b"secret-123", b"secXet-123"));
+        assert!(!constant_time_eq(b"secret-123", b"secret-12X"));
     }
 }

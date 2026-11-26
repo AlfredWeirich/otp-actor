@@ -16,7 +16,6 @@
 mod common;
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common::{AccountMsg, BankAccountActor};
@@ -59,12 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let server_node = ActorNodeHandle::builder(bind_addr, registry)
         .supervisor(root.clone())
         .started_at(app_started_at)
-        .authorizer(Arc::new(|metadata, _ext, _svc, _actor| {
-            match metadata.get("authorization") {
-                Some(v) if v == "Bearer demo-token" => Ok(()),
-                _ => Err(tonic::Status::unauthenticated("missing or invalid token")),
-            }
-        }))
+        .bearer_token("demo-token")
         .start()
         .await?;
     let endpoint_url = format!("http://{}", server_node.local_addr());
@@ -74,9 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let remote_actor =
         RemoteActorClient::<BankAccountActor>::connect(&endpoint_url, "banking-service", "account-42")
             .await?
-            .with_request_metadata(|m| {
-                m.insert("authorization", "Bearer demo-token".parse().unwrap());
-            });
+            .with_bearer_token("demo-token")?;
     assert_eq!(remote_actor.call(AccountMsg::Deposit(250)).await?, 750);
     remote_actor.cast(AccountMsg::Deposit(50)).await?;
     tokio::time::sleep(Duration::from_millis(30)).await;
@@ -85,9 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let missing_actor =
         RemoteActorClient::<BankAccountActor>::connect(&endpoint_url, "banking-service", "unknown")
             .await?
-            .with_request_metadata(|m| {
-                m.insert("authorization", "Bearer demo-token".parse().unwrap());
-            });
+            .with_bearer_token("demo-token")?;
     assert!(matches!(
         missing_actor.call(AccountMsg::GetBalance).await,
         Err(RemoteActorError::ActorNotFound(_))
@@ -98,9 +88,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let remote_monitor = AnyNodeMonitor::from_remote(
         RemoteNodeMonitor::connect(&endpoint_url)
             .await?
-            .with_request_metadata(|m| {
-                m.insert("authorization", "Bearer demo-token".parse().unwrap());
-            }),
+            .with_bearer_token("demo-token")?,
     );
 
     let local_health = local_monitor.health().await?;

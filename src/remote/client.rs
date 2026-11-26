@@ -13,7 +13,38 @@ use crate::remote::error::RemoteActorError;
 use crate::remote::proto::call_response::Result as CallResult;
 use crate::remote::proto::{ActorNodeClient, CallRequest, CastRequest};
 
-type MetadataInjector = Arc<dyn Fn(&mut tonic::metadata::MetadataMap) + Send + Sync>;
+pub(crate) type MetadataInjector = Arc<dyn Fn(&mut tonic::metadata::MetadataMap) + Send + Sync>;
+
+/// Chains `next` after any existing [`MetadataInjector`] so multiple metadata hooks
+/// (such as correlation IDs and bearer tokens) compose cleanly regardless of call order.
+pub(crate) fn compose_metadata_injector<F>(
+    existing: Option<MetadataInjector>,
+    next: F,
+) -> MetadataInjector
+where
+    F: Fn(&mut tonic::metadata::MetadataMap) + Send + Sync + 'static,
+{
+    match existing {
+        None => Arc::new(next),
+        Some(prev) => Arc::new(move |metadata| {
+            prev(metadata);
+            next(metadata);
+        }),
+    }
+}
+
+/// Validates a non-empty Bearer token and builds a `"Bearer <token>"` gRPC metadata value.
+pub(crate) fn parse_bearer_metadata_value(
+    token: &str,
+) -> Result<
+    tonic::metadata::MetadataValue<tonic::metadata::Ascii>,
+    tonic::metadata::errors::InvalidMetadataValue,
+> {
+    if token.is_empty() {
+        return tonic::metadata::MetadataValue::try_from("\n");
+    }
+    tonic::metadata::MetadataValue::try_from(format!("Bearer {token}"))
+}
 
 /// Maximum transport and serialization headroom reserved between the server execution budget
 /// (`timeout_ms`) and the client's overall deadline so structured server responses (such as
@@ -105,13 +136,66 @@ impl<A: StatefulActor> RemoteActorClient<A> {
     }
 
     /// Attaches a per-request metadata hook invoked before every `call` and `cast`
-    /// (for example to inject `authorization` bearer tokens or correlation headers).
+    /// (for example to inject correlation headers or custom metadata).
+    ///
+    /// Multiple calls compose in registration order rather than overwriting previous hooks.
     #[must_use]
     pub fn with_request_metadata<F>(mut self, injector: F) -> Self
     where
         F: Fn(&mut tonic::metadata::MetadataMap) + Send + Sync + 'static,
     {
-        self.metadata_injector = Some(Arc::new(injector));
+        self.metadata_injector = Some(compose_metadata_injector(
+            self.metadata_injector.take(),
+            injector,
+        ));
+        self
+    }
+
+    /// Attaches a static `authorization: Bearer <token>` header to every `call` and `cast`.
+    ///
+    /// Validates the token upfront so empty tokens or invalid gRPC metadata characters fail
+    /// immediately without panicking. Composes cleanly with [`Self::with_request_metadata`].
+    pub fn with_bearer_token(
+        mut self,
+        token: impl AsRef<str>,
+    ) -> Result<Self, tonic::metadata::errors::InvalidMetadataValue> {
+        let header = parse_bearer_metadata_value(token.as_ref())?;
+        self.metadata_injector = Some(compose_metadata_injector(
+            self.metadata_injector.take(),
+            move |metadata| {
+                metadata.insert("authorization", header.clone());
+            },
+        ));
+        Ok(self)
+    }
+
+    /// Attaches a dynamic Bearer token provider invoked before every `call` and `cast`.
+    ///
+    /// Useful for rotating OAuth2/JWT tokens (e.g., read from a local `ResourceActor` or cache).
+    /// When the provider returns `None`, no `authorization` header is added by this hook.
+    /// Composes cleanly with [`Self::with_request_metadata`].
+    #[must_use]
+    pub fn with_bearer_token_provider<F>(mut self, provider: F) -> Self
+    where
+        F: Fn() -> Option<String> + Send + Sync + 'static,
+    {
+        self.metadata_injector = Some(compose_metadata_injector(
+            self.metadata_injector.take(),
+            move |metadata| {
+                if let Some(token) = provider() {
+                    match parse_bearer_metadata_value(&token) {
+                        Ok(header) => {
+                            metadata.insert("authorization", header);
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                "Ignoring dynamic bearer token with invalid gRPC metadata characters"
+                            );
+                        }
+                    }
+                }
+            },
+        ));
         self
     }
 
@@ -369,6 +453,47 @@ impl<A: StatefulActor> AnyActorClient<A> {
         Ok(Self::Remote(
             RemoteActorClient::connect_with(endpoint, service_name, actor_name).await?,
         ))
+    }
+
+    /// Attaches a per-request metadata hook for remote calls (no-op on [`AnyActorClient::Local`]).
+    #[must_use]
+    pub fn with_request_metadata<F>(self, injector: F) -> Self
+    where
+        F: Fn(&mut tonic::metadata::MetadataMap) + Send + Sync + 'static,
+    {
+        match self {
+            Self::Local(client) => Self::Local(client),
+            Self::Remote(client) => Self::Remote(client.with_request_metadata(injector)),
+        }
+    }
+
+    /// Attaches a static `authorization: Bearer <token>` header on remote calls.
+    ///
+    /// Validates the token upfront even for [`AnyActorClient::Local`] so invalid tokens fail fast
+    /// consistently across local tests and remote production deployments.
+    pub fn with_bearer_token(
+        self,
+        token: impl AsRef<str>,
+    ) -> Result<Self, tonic::metadata::errors::InvalidMetadataValue> {
+        match self {
+            Self::Local(client) => {
+                let _ = parse_bearer_metadata_value(token.as_ref())?;
+                Ok(Self::Local(client))
+            }
+            Self::Remote(client) => Ok(Self::Remote(client.with_bearer_token(token)?)),
+        }
+    }
+
+    /// Attaches a dynamic Bearer token provider on remote calls (no-op on [`AnyActorClient::Local`]).
+    #[must_use]
+    pub fn with_bearer_token_provider<F>(self, provider: F) -> Self
+    where
+        F: Fn() -> Option<String> + Send + Sync + 'static,
+    {
+        match self {
+            Self::Local(client) => Self::Local(client),
+            Self::Remote(client) => Self::Remote(client.with_bearer_token_provider(provider)),
+        }
     }
 
     /// Returns the name of the target actor.

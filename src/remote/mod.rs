@@ -26,4 +26,5 @@ pub use registry::ActorNodeRegistry;
 pub use server::{
     ActorNodeAdminService, ActorNodeBuilder, ActorNodeHandle, ActorNodeService, Authorizer,
     DEFAULT_DRAIN_TIMEOUT, DEFAULT_REMOTE_CALL_TIMEOUT, MAX_REMOTE_REQUEST_TIMEOUT,
+    extract_bearer_token,
 };

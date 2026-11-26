@@ -1,7 +1,6 @@
 //! Location-transparent node health and operational telemetry monitors over gRPC.
 
 use std::convert::Infallible;
-use std::sync::Arc;
 use std::time::Duration;
 use tonic::transport::{Channel, Endpoint};
 
@@ -9,7 +8,10 @@ use crate::actor::{
     HealthState, LocalNodeMonitor, NodeHealth, NodeStatus, StatusOptions, SupervisorError,
     SupervisorHandle, format_prometheus_metrics,
 };
-use crate::remote::client::{duration_to_wire_ms, server_budget_for_deadline};
+use crate::remote::client::{
+    MetadataInjector, compose_metadata_injector, duration_to_wire_ms, parse_bearer_metadata_value,
+    server_budget_for_deadline,
+};
 use crate::remote::endpoint::{MAX_GRPC_FRAME_BYTES, REMOTE_PROTOCOL_VERSION, decode_payload};
 use crate::remote::error::RemoteActorError;
 use crate::remote::proto::status_response::Result as StatusResult;
@@ -20,8 +22,6 @@ use crate::remote::proto::{ActorNodeAdminClient, HealthRequest, StatusRequest};
 /// Uses [`Infallible`] as the actor-domain error parameter because node-level health and status
 /// queries never carry per-actor domain errors (`RemoteActorError::Actor`).
 pub type RemoteMonitorError = RemoteActorError<Infallible>;
-
-type MetadataInjector = Arc<dyn Fn(&mut tonic::metadata::MetadataMap) + Send + Sync>;
 
 /// Remote client handle querying operational health and status from an [`super::ActorNodeHandle`]
 /// via the `ActorNodeAdmin` gRPC service.
@@ -64,12 +64,64 @@ impl RemoteNodeMonitor {
     }
 
     /// Attaches a per-request metadata hook invoked before every `health` and `status` RPC.
+    ///
+    /// Multiple calls compose in registration order rather than overwriting previous hooks.
     #[must_use]
     pub fn with_request_metadata<F>(mut self, injector: F) -> Self
     where
         F: Fn(&mut tonic::metadata::MetadataMap) + Send + Sync + 'static,
     {
-        self.metadata_injector = Some(Arc::new(injector));
+        self.metadata_injector = Some(compose_metadata_injector(
+            self.metadata_injector.take(),
+            injector,
+        ));
+        self
+    }
+
+    /// Attaches a static `authorization: Bearer <token>` header to every `health` and `status` RPC.
+    ///
+    /// Validates the token upfront so empty tokens or invalid gRPC metadata characters fail
+    /// immediately without panicking. Composes cleanly with [`Self::with_request_metadata`].
+    pub fn with_bearer_token(
+        mut self,
+        token: impl AsRef<str>,
+    ) -> Result<Self, tonic::metadata::errors::InvalidMetadataValue> {
+        let header = parse_bearer_metadata_value(token.as_ref())?;
+        self.metadata_injector = Some(compose_metadata_injector(
+            self.metadata_injector.take(),
+            move |metadata| {
+                metadata.insert("authorization", header.clone());
+            },
+        ));
+        Ok(self)
+    }
+
+    /// Attaches a dynamic Bearer token provider invoked before every `health` and `status` RPC.
+    ///
+    /// Useful for rotating OAuth2/JWT tokens. When the provider returns `None`, no `authorization`
+    /// header is added by this hook. Composes cleanly with [`Self::with_request_metadata`].
+    #[must_use]
+    pub fn with_bearer_token_provider<F>(mut self, provider: F) -> Self
+    where
+        F: Fn() -> Option<String> + Send + Sync + 'static,
+    {
+        self.metadata_injector = Some(compose_metadata_injector(
+            self.metadata_injector.take(),
+            move |metadata| {
+                if let Some(token) = provider() {
+                    match parse_bearer_metadata_value(&token) {
+                        Ok(header) => {
+                            metadata.insert("authorization", header);
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                "Ignoring dynamic bearer token with invalid gRPC metadata characters"
+                            );
+                        }
+                    }
+                }
+            },
+        ));
         self
     }
 
@@ -212,9 +264,55 @@ impl AnyNodeMonitor {
         Ok(Self::Remote(RemoteNodeMonitor::connect(endpoint).await?))
     }
 
+    /// Connects using a pre-configured Tonic [`Endpoint`] and wraps it in [`AnyNodeMonitor::Remote`].
+    pub async fn connect_with(endpoint: Endpoint) -> Result<Self, tonic::transport::Error> {
+        Ok(Self::Remote(RemoteNodeMonitor::connect_with(endpoint).await?))
+    }
+
     /// Creates a remote [`AnyNodeMonitor`] from an existing [`RemoteNodeMonitor`].
     pub fn from_remote(monitor: RemoteNodeMonitor) -> Self {
         Self::Remote(monitor)
+    }
+
+    /// Attaches a per-request metadata hook for remote RPCs (no-op on [`AnyNodeMonitor::Local`]).
+    #[must_use]
+    pub fn with_request_metadata<F>(self, injector: F) -> Self
+    where
+        F: Fn(&mut tonic::metadata::MetadataMap) + Send + Sync + 'static,
+    {
+        match self {
+            Self::Local(local) => Self::Local(local),
+            Self::Remote(remote) => Self::Remote(remote.with_request_metadata(injector)),
+        }
+    }
+
+    /// Attaches a static `authorization: Bearer <token>` header on remote `health`/`status` RPCs.
+    ///
+    /// Validates the token upfront even for [`AnyNodeMonitor::Local`] so invalid tokens fail fast
+    /// consistently across local tests and remote production deployments.
+    pub fn with_bearer_token(
+        self,
+        token: impl AsRef<str>,
+    ) -> Result<Self, tonic::metadata::errors::InvalidMetadataValue> {
+        match self {
+            Self::Local(local) => {
+                let _ = parse_bearer_metadata_value(token.as_ref())?;
+                Ok(Self::Local(local))
+            }
+            Self::Remote(remote) => Ok(Self::Remote(remote.with_bearer_token(token)?)),
+        }
+    }
+
+    /// Attaches a dynamic Bearer token provider on remote RPCs (no-op on [`AnyNodeMonitor::Local`]).
+    #[must_use]
+    pub fn with_bearer_token_provider<F>(self, provider: F) -> Self
+    where
+        F: Fn() -> Option<String> + Send + Sync + 'static,
+    {
+        match self {
+            Self::Local(local) => Self::Local(local),
+            Self::Remote(remote) => Self::Remote(remote.with_bearer_token_provider(provider)),
+        }
     }
 
     fn map_supervisor_error(err: SupervisorError) -> RemoteMonitorError {
